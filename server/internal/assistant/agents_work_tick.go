@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/nwverse/persona/server/internal/db"
-	"github.com/nwverse/persona/server/internal/i18n"
 	"github.com/nwverse/persona/server/internal/prompts"
 	"github.com/nwverse/persona/server/internal/proto"
 )
@@ -248,7 +247,7 @@ func (s *Service) workWake(ctx context.Context, v *workView, k [2]string, now ti
 		budget := s.triageCfg(ctx).AccountExhaustionMaxRetries
 		if !accountExhaustionRetryAllowed(c, e.Retries, budget) {
 			e.WakeAt, e.Work.WakeAt = nil, nil
-			e.Work.Line = clip(oneLine(workT(s.lang(ctx), "model_error", i18n.Args{"error": c.TurnError})), 60)
+			e.Work.Line = stoppedTransientLine(s.lang(ctx), c, c.TurnError)
 			s.logf("work %s/%s: not continued: account pool exhausted (budget %d, sent %d)", k[0], short(k[1]), budget, e.Retries)
 			s.putWork(ctx, e)
 			return
@@ -576,7 +575,15 @@ func (s *Service) backfillWork(ctx context.Context, v *workView, now time.Time) 
 			k := [2]string{d.ID, c.SessionID}
 			s.work.mu.Lock()
 			tried, ok := s.work.tried[k]
+			e, had := s.work.entries[k]
+			retired := had && workRetiredForTurn(e.Work, c.UpdatedAt)
 			s.work.mu.Unlock()
+			if retired {
+				// A retired turn (a detached retry, retireDetachedRetry) is never triaged again. Checked here, not only in
+				// triageTurn: a goroutine that starts after a new turn ends the retirement would triage this old snapshot,
+				// hold the session's triage, skip the new turn's triage and then drop its own as stale.
+				continue
+			}
 			if ok && sameTurn(c, tried.turn) && now.Sub(tried.at) < workRetryTriage {
 				continue // tried on this turn a moment ago (a failed model call is not retried every pass)
 			}

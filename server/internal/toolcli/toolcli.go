@@ -17,6 +17,10 @@
 // Output is for a program: one line of JSON on stdout, or text for a person. A failure is one line of JSON on stderr
 // ({error, kind, retry_after}), or "<name>: …" with --format text, and an exit code by its kind; a mistake in the
 // command line is one too (kind usage), found before anything is called.
+//
+// A call may wait for its answer as long as a write waits for the owner on the phone (callTimeout), except a tool that
+// only reads (assistantwire.ReadToolWaits): it gets readTimeout, then fails as unavailable, saying what did not answer
+// (#14400). Started in a folder that does not answer, a call goes on from "/" (internal/startdir/settle).
 package toolcli
 
 import (
@@ -32,6 +36,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/lazyre"
 	"github.com/nwverse/persona/server/internal/nodeclient"
 	"github.com/nwverse/persona/server/internal/proto"
@@ -45,16 +50,50 @@ const (
 	exitUnavailable = 3 // the node, the hub or the connector cannot be reached or is not signed in
 	exitRateLimited = 4 // the connector waits out a rate limit (retry_after seconds)
 	exitDeclined    = 5 // the user (or connector_gate) did not allow the write
+	// exitUnanswered: the write's card ended without the user's own answer (it expired, was withdrawn): nothing was
+	// written, and the user did not decline it.
+	exitUnanswered = 6
 	// exitInterrupted: Ctrl-C / SIGTERM (as personad ask): the node hung up and the card came off the phone; nothing
 	// is wrong with the node or the hub.
 	exitInterrupted = 130
 )
 
 var kinds = map[int]string{exitFailed: "failed", exitUsage: "usage", exitUnavailable: "unavailable", exitRateLimited: "rate_limited",
-	exitDeclined: "declined", exitInterrupted: "interrupted"}
+	exitDeclined: "declined", exitUnanswered: proto.ToolErrorUnanswered, exitInterrupted: "interrupted"}
 
 // callTimeout covers a write waiting for the user on the phone (the card lasts 15 minutes).
 const callTimeout = 30 * time.Minute
+
+// readTimeout is how long a tool that only reads (assistantwire.ReadToolWaits) may take, on top of what it waits by
+// design. A read changes nothing, so when the node, the hub or the computer it asks does not answer, its caller is
+// better told soon, and can try again, than held for callTimeout. It is far longer than a read takes (about a second
+// for a long transcript from another computer) and shorter than an Agent's own command timeout (2 minutes in Claude
+// Code), so the Agent gets this error rather than a command its harness killed. A variable for tests.
+var readTimeout = 30 * time.Second
+
+// deadline is how long a call of tool may wait for its answer, and whether the tool only reads.
+func deadline(tool string) (time.Duration, bool) {
+	if wait, ok := assistantwire.ReadToolWaits[tool]; ok {
+		return readTimeout + wait, true
+	}
+	return callTimeout, false
+}
+
+// timedOut: the call ended because its deadline passed. The connection to the node has the same deadline as ctx
+// (nodeclient), so its read can fail a moment before ctx says so.
+func timedOut(ctx context.Context, err error) bool {
+	return errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
+}
+
+// noAnswer is the failure of a call of tool that got no answer within wait: what did not answer, and whether the call
+// can simply be made again.
+func noAnswer(tool string, wait time.Duration, read bool) string {
+	msg := fmt.Sprintf("%s got no answer within %s: the Persona node on this machine, the hub or the computer the call went to did not answer in time", tool, wait)
+	if read {
+		return msg + "; a read changes nothing, so it can be tried again"
+	}
+	return msg + "; it may still have run, so check before trying again"
+}
 
 // stdinMost is the most a command line reads from stdin (a message's text).
 const stdinMost = 1 << 20
@@ -96,7 +135,7 @@ const (
 	usageCLI  = "personad tool --cli <connector> [--format json|text] <words…>"
 	usage     = "personad tool: a connector's tools from the assistant's shell, through the Persona hub\n  " + usageTool + "\n  " + usageCLI +
 		"\n  from an Agent's pane: its own tools (task_spawn, todo_decisions, a task leader's task_plan, …), as its MCP server calls them" +
-		"\n  a2a_sessions, a2a_send, a2a_get, a2a_report, a2a_cancel: communicate through Persona A2A" +
+		"\n  a2a_sessions, a2a_read, a2a_send, a2a_get, a2a_report, a2a_cancel: communicate through Persona A2A" +
 		"\n  personad tool secret_store --from-file <private metadata manifest | ->: phone-approved encrypted writes from local field files"
 )
 
@@ -136,8 +175,14 @@ func Main(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io
 	if mistake := argsMistake(toolArgs); mistake != "" {
 		return out.fail(exitUsage, mistake, 0)
 	}
+	wait, read := deadline(args[0])
+	ctx, stop := context.WithTimeout(ctx, wait)
+	defer stop()
 	res, err := call(ctx, args[0], toolArgs)
 	if err != nil {
+		if timedOut(ctx, err) {
+			return out.fail(exitUnavailable, noAnswer(args[0], wait, read), 0)
+		}
 		return out.unreachable(ctx, err)
 	}
 	text := firstText(res)
@@ -223,7 +268,7 @@ func commandLine(ctx context.Context, args []string, stdin io.Reader, stdout, st
 			if *p.Exit == exitOK {
 				fmt.Fprintln(stderr, strings.TrimRight(p.Stderr, "\n"))
 			} else {
-				return out.fail(*p.Exit, p.Stderr, 0)
+				return out.fail(*p.Exit, strings.TrimRight(p.Stderr, "\n"), 0)
 			}
 		}
 		return *p.Exit
@@ -301,7 +346,11 @@ func (f failer) fail(code int, msg string, retry int) int {
 		fmt.Fprintln(f.stderr, f.name+": "+msg)
 		return code
 	}
-	out := map[string]any{"error": msg, "kind": kinds[code]}
+	kind := kinds[code]
+	if kind == "" {
+		kind = "failed"
+	}
+	out := map[string]any{"error": msg, "kind": kind}
 	if retry > 0 {
 		out["retry_after"] = retry
 	}
@@ -331,7 +380,7 @@ func firstText(res proto.ToolResult) string {
 
 // byKind is the exit code of each kind of failure the hub, the node and the connectors name (proto.ToolError*).
 var byKind = map[string]int{proto.ToolErrorDeclined: exitDeclined, proto.ToolErrorUnavailable: exitUnavailable,
-	proto.ToolErrorRateLimited: exitRateLimited}
+	proto.ToolErrorRateLimited: exitRateLimited, proto.ToolErrorUnanswered: exitUnanswered}
 
 // waitFor is how the hub and the connectors say how long a rate limit lasts, for those that do not say it in
 // retry_after (an older hub, a connector's status).

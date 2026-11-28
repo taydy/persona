@@ -1,0 +1,24 @@
+Switch Assistant chats to another launcher/model; preview first unless confirmed. Busy chats queue at turn end without interruption. Execution saves originals and returns a batch ID; `restore_batch_id` restores completed items; `batch_id` reads status.{{template "shared/mcp_language" .}}
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "conversation_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "maxItems": 50,
+      "uniqueItems": true
+    },
+    "machine_id": {"type": "string"},
+    "launcher": {"type": "string"},
+    "model": {"type": "string"},
+    "effort": {"type": "string"},
+    "permission_mode": {"type": "string"},
+    "preview": {"type": "boolean"},
+    "restore_batch_id": {"type": "string"},
+    "batch_id": {"type": "string"}
+  }
+}
+```

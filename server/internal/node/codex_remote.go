@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,10 +56,20 @@ type remoteThread struct {
 	// cleared when a turn starts. Session.TurnError / TurnErrorKind, before the rollout has it.
 	failure, failureKind string
 	joined               bool
-	buffer               *strings.Builder
-	lastDelta            time.Time
-	revision             uint64
-	files                map[string][]string
+	// provisional marks an in-flight coldResume pre-registration: incoming requests and notifications for the thread
+	// are accepted, while codexOwner does not advertise ownership until thread/resume succeeds.
+	provisional bool
+	// ready is closed when an in-flight provisional coldResume finishes (success or rollback), so early approval
+	// responses wait for ownership confirmation before forwarding their reply.
+	ready chan struct{}
+	// pinnedSeq is the refreshSeq when coldResume registered or completed this thread; refreshes started with an
+	// older snapshot sequence must preserve it instead of dropping it as unloaded.
+	pinnedSeq uint64
+	buffer    *strings.Builder
+	lastDelta time.Time
+	created   time.Time // local thread/start completed while a loaded-list snapshot was in flight
+	revision  uint64
+	files     map[string][]string
 }
 
 type remoteAsk struct {
@@ -92,7 +103,31 @@ type codexRemote struct {
 	seen map[string]codexSeen
 	// readWait, refreshWait: one thread/read's timeout and a whole refresh's; 0 is codexReadWait, codexRefreshWait.
 	readWait, refreshWait time.Duration
+	// refreshSeq orders refresh snapshots against coldResume updates so a refresh started before thread/resume
+	// never drops a newly cold-activated thread.
+	refreshSeq uint64
+	// A loaded-list snapshot can outlive the startup that created its thread.
+	// Keep discarded starts out of the registry until the server drops them.
+	discardedStarts map[string]time.Time
+	// Shared paginated thread/loaded/list cache and singleflight for background joins (#13578).
+	loadedAt     time.Time
+	loadedSet    map[string]bool
+	loadedActive *codexLoadedFlight
+	// Bounded background join dispatcher for this app-server instance (#13578).
+	joinMu     sync.Mutex
+	joinQueue  []string
+	joinQueued map[string]bool
+	joinActive int
 }
+
+type codexLoadedFlight struct {
+	done chan struct{}
+	set  map[string]bool
+	err  error
+}
+
+// codexLoadedCacheTTL bounds how long background joins share one paginated thread/loaded/list snapshot.
+var codexLoadedCacheTTL = 2 * time.Second
 
 // codexSeen is what refreshes keep about a loaded thread besides its listing (#12517).
 type codexSeen struct {
@@ -208,6 +243,9 @@ func codexSocketPath(path string) (string, error) {
 	if target, err := os.Readlink(path); err != nil || target != want {
 		return "", errors.New("Unix 入口是指向别处的符号链接")
 	}
+	if _, err := os.Stat(want); err != nil {
+		return "", fmt.Errorf("Codex control socket symlink target: %w", err)
+	}
 	return want, nil
 }
 
@@ -224,6 +262,11 @@ func (c *codexRemote) run() {
 	}()
 	target, client, err := validateCodexEndpoint(c.spec.Endpoint)
 	if err != nil {
+		diag := codexDiagEndpointInvalid
+		if c.spec.Endpoint == codexControlEndpoint(c.spec.Home) && codexDaemonSocketGone(c.spec.Home) != nil {
+			diag = codexDiagSocketGone
+		}
+		c.n.codices.setRemoteDiag(c.spec.Endpoint, diag)
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
@@ -233,6 +276,11 @@ func (c *codexRemote) run() {
 		resp.Body.Close()
 	}
 	if err != nil {
+		diag := codexDiagUnreachable
+		if c.spec.Endpoint == codexControlEndpoint(c.spec.Home) && codexDaemonSocketGone(c.spec.Home) != nil {
+			diag = codexDiagSocketGone
+		}
+		c.n.codices.setRemoteDiag(c.spec.Endpoint, diag)
 		return
 	}
 	socket.SetReadLimit(64 << 20)
@@ -269,20 +317,25 @@ func (c *codexRemote) run() {
 	err = wire.call(ctx, "initialize", map[string]any{"clientInfo": map[string]any{"name": "persona", "title": "Persona", "version": c.n.Version}, "capabilities": map[string]any{"experimentalApi": true}}, &init)
 	cancel()
 	if err != nil {
+		c.n.codices.setRemoteDiag(c.spec.Endpoint, codexDiagHandshakeFailed)
 		return
 	}
 	if init.CodexHome != "" && canonicalCodexHome(init.CodexHome, c.n.home) != c.spec.Home {
+		c.n.codices.setRemoteDiag(c.spec.Endpoint, codexDiagHomeMismatch)
 		return
 	}
 	if err = wire.send(map[string]any{"jsonrpc": "2.0", "method": "initialized", "params": map[string]any{}}); err != nil {
+		c.n.codices.setRemoteDiag(c.spec.Endpoint, codexDiagHandshakeFailed)
 		return
 	}
 	if err = c.refresh(); err != nil {
+		c.n.codices.setRemoteDiag(c.spec.Endpoint, codexDiagHandshakeFailed)
 		return
 	}
 	c.mu.Lock()
 	c.ready = true
 	c.mu.Unlock()
+	c.n.codices.setRemoteDiag(c.spec.Endpoint, codexDiagNone)
 	reached = true
 	c.n.notifyCodex()
 	go c.loadModels()
@@ -290,12 +343,14 @@ func (c *codexRemote) run() {
 	defer tick.Stop()
 	for {
 		cfg := c.n.codexInventory()
+		var rejoin []string
 		for id, instance := range cfg.Joined {
 			if instance == c.spec.ID {
-				if _, _, err := c.n.codexOwner(id); err == nil {
-					_ = c.join(c.ctx, id, false)
-				}
+				rejoin = append(rejoin, id)
 			}
+		}
+		if len(rejoin) > 0 {
+			c.enqueueBackgroundJoins(rejoin)
 		}
 		select {
 		case <-c.ctx.Done():
@@ -367,7 +422,146 @@ func (c *codexRemote) loaded(ctx context.Context) ([]string, error) {
 		}
 		seen[cursor] = true
 	}
+	c.noteLoaded(ids, time.Now())
 	return ids, nil
+}
+
+func (c *codexRemote) noteLoaded(ids []string, at time.Time) {
+	set := make(map[string]bool, len(ids))
+	for _, raw := range ids {
+		set[raw] = true
+	}
+	c.mu.Lock()
+	c.loadedSet = set
+	c.loadedAt = at
+	c.mu.Unlock()
+}
+
+// loadedShared returns the loaded thread ID set for this app-server, coalescing concurrent callers into one
+// paginated thread/loaded/list query and reusing a recent snapshot for background joins (fresh=false) (#13578).
+func (c *codexRemote) loadedShared(ctx context.Context, fresh bool) (map[string]bool, error) {
+	c.mu.Lock()
+	if !fresh && c.loadedSet != nil && time.Since(c.loadedAt) < codexLoadedCacheTTL {
+		set := c.loadedSet
+		c.mu.Unlock()
+		return set, nil
+	}
+	if f := c.loadedActive; f != nil {
+		c.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.set, f.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f := &codexLoadedFlight{done: make(chan struct{})}
+	c.loadedActive = f
+	c.mu.Unlock()
+
+	go func() {
+		lctx, cancel := context.WithTimeout(c.ctx, codexRefreshWait)
+		ids, err := c.loaded(lctx)
+		cancel()
+		var set map[string]bool
+		if err == nil {
+			set = make(map[string]bool, len(ids))
+			for _, raw := range ids {
+				set[raw] = true
+			}
+		}
+		f.set, f.err = set, err
+		c.mu.Lock()
+		if c.loadedActive == f {
+			c.loadedActive = nil
+		}
+		c.mu.Unlock()
+		close(f.done)
+	}()
+
+	select {
+	case <-f.done:
+		return f.set, f.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// enqueueBackgroundJoins runs background thread joins for this app-server with bounded concurrency (#13578).
+func (c *codexRemote) enqueueBackgroundJoins(ids []string) {
+	if c == nil || len(ids) == 0 || c.ctx.Err() != nil {
+		return
+	}
+	limit := max(codexJoinConcurrency, 1)
+	c.joinMu.Lock()
+	if c.joinQueued == nil {
+		c.joinQueued = map[string]bool{}
+	}
+	for _, id := range ids {
+		if id == "" || c.joinQueued[id] {
+			continue
+		}
+		c.joinQueued[id] = true
+		c.joinQueue = append(c.joinQueue, id)
+	}
+	for c.joinActive < limit && len(c.joinQueue) > 0 {
+		c.joinActive++
+		go c.backgroundJoinWorker()
+	}
+	c.joinMu.Unlock()
+}
+
+func (c *codexRemote) backgroundJoinWorker() {
+	defer func() {
+		c.joinMu.Lock()
+		c.joinActive--
+		c.joinMu.Unlock()
+	}()
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+		c.joinMu.Lock()
+		if len(c.joinQueue) == 0 {
+			c.joinMu.Unlock()
+			return
+		}
+		id := c.joinQueue[0]
+		c.joinQueue = c.joinQueue[1:]
+		delete(c.joinQueued, id)
+		c.joinMu.Unlock()
+
+		owner, t, err := c.n.codexOwner(id)
+		if err != nil || owner != c || t.joined || !c.n.cx.startJoin(id) {
+			continue
+		}
+		jctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+		err = c.join(jctx, id, false)
+		cancel()
+		c.n.cx.endJoin(id, err)
+		if err != nil {
+			if c.ctx.Err() == nil {
+				c.n.logf("codex %s: joining it on app-server %s failed, it stays on the terminal: %v", id, c.spec.ID, err)
+			}
+			continue
+		}
+		c.n.logf("codex %s: joined on app-server %s", id, c.spec.ID)
+	}
+}
+
+type remoteThreadStatus struct {
+	Type        string   `json:"type"`
+	ActiveFlags []string `json:"activeFlags"`
+}
+
+func (s remoteThreadStatus) sessionStatus() string {
+	if slices.Contains(s.ActiveFlags, "waitingOnApproval") || slices.Contains(s.ActiveFlags, "waitingOnUserInput") {
+		return proto.StatusBlocked
+	}
+	if s.Type == "active" {
+		return proto.StatusWorking
+	}
+	return proto.StatusDone
 }
 
 type remoteThreadData struct {
@@ -378,22 +572,23 @@ type remoteThreadData struct {
 	Preview        string          `json:"preview"`
 	Cwd            string          `json:"cwd"`
 	Path           string          `json:"path"`
+	HistoryMode    string          `json:"historyMode"`
 	ParentThreadID string          `json:"parentThreadId"`
 	Ephemeral      bool            `json:"ephemeral"`
 	Source         json.RawMessage `json:"source"`
-	Status         struct {
-		Type        string   `json:"type"`
-		ActiveFlags []string `json:"activeFlags"`
-	} `json:"status"`
-	Turns []struct {
+	Turns          []struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`
 	} `json:"turns"`
+	Status remoteThreadStatus `json:"status"`
 }
 
 func (c *codexRemote) refresh() error {
+	snapshot := time.Now()
 	c.mu.Lock()
 	wait, budget := cmp.Or(c.readWait, codexReadWait), cmp.Or(c.refreshWait, codexRefreshWait)
+	c.refreshSeq++
+	snapSeq := c.refreshSeq
 	c.mu.Unlock()
 	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
@@ -413,7 +608,20 @@ func (c *codexRemote) refresh() error {
 			continue
 		}
 		t := c.threads[raw]
-		known[raw], seenRevision[raw] = t, t.revision
+		if _, discarded := c.discardedStarts[raw]; discarded {
+			known[raw] = remoteThread{}
+			continue
+		}
+		seenRevision[raw] = t.revision
+		if t.provisional {
+			// Keep provisional coldResume state out of refresh's server-confirmed copy so a rolled-back
+			// provisional thread is never resurrected as provisional or joined.
+			t.provisional = false
+			t.joined = false
+			t.pinnedSeq = 0
+			t.ready = nil
+		}
+		known[raw] = t
 		if c.seen[raw].ephemeral {
 			// Read once and found to be the app-server's own background job: never a session, so not read again
 			// while it stays loaded.
@@ -512,7 +720,13 @@ dispatch:
 			continue
 		}
 		path := rolloutPath(c.spec.Home, raw)
+		c.mu.Lock()
+		if _, discarded := c.discardedStarts[raw]; discarded {
+			c.mu.Unlock()
+			continue
+		}
 		public := c.n.registerCodex(c.spec.Home, raw, path)
+		c.mu.Unlock()
 		t.id, t.publicID, t.title, t.cwd = raw, public, firstNonEmpty(d.Name, d.Preview), d.Cwd
 		t.path = d.Path
 		if d.Model != "" { // an app-server that reports a thread's settings (older ones do not: keep what join said)
@@ -529,16 +743,11 @@ dispatch:
 		if t.files == nil {
 			t.files = map[string][]string{}
 		}
-		t.status = proto.StatusDone
-		if d.Status.Type == "active" {
-			t.status = proto.StatusWorking
-		} else {
+		t.status = d.Status.sessionStatus()
+		if d.Status.Type != "active" {
 			t.turn = ""
 			t.partial = ""
 			t.buffer = nil
-		}
-		if slices.Contains(d.Status.ActiveFlags, "waitingOnApproval") || slices.Contains(d.Status.ActiveFlags, "waitingOnUserInput") {
-			t.status = proto.StatusBlocked
 		}
 		for _, turn := range d.Turns {
 			if turn.Status == "inProgress" && turn.ID != t.ended {
@@ -557,6 +766,12 @@ dispatch:
 		c.n.logf("codex %s: thread/read failed for %d of %d threads (%d timed out, %d not read in time, %d waiting after a timeout, %d ephemeral skipped): %v", c.spec.ID, failed, len(reads), timeouts, cut, waiting, ephemeral, cmp.Or(firstErr, ctx.Err()))
 	}
 	c.mu.Lock()
+	for raw, at := range c.discardedStarts {
+		delete(next, raw)
+		if _, listed := known[raw]; !listed && snapshot.Sub(at) > budget {
+			delete(c.discardedStarts, raw)
+		}
+	}
 	slow := map[string]codexRetry{}
 	seen := make(map[string]codexSeen, len(known))
 	for raw := range known { // threads no longer loaded are forgotten
@@ -580,17 +795,42 @@ dispatch:
 	c.slow, c.seen = slow, seen
 	// Preserve events that arrived during metadata RPCs; metadata never overwrites a joined thread's current turn.
 	for raw, t := range next {
-		if old, ok := c.threads[raw]; ok && old.revision != seenRevision[raw] {
-			t.joined, t.turn, t.partial, t.files, t.status, t.revision, t.buffer, t.lastDelta = old.joined, old.turn, old.partial, old.files, old.status, old.revision, old.buffer, old.lastDelta
-			t.failure, t.failureKind, t.ended = old.failure, old.failureKind, old.ended
-			t.serviceTier, t.serviceTierRevision = old.serviceTier, old.serviceTierRevision
-			t.model, t.effort = old.model, old.effort // an effort just set (codex_effort.go) over a read from before it
-			t.path = old.path
+		if old, ok := c.threads[raw]; ok {
+			if old.revision != seenRevision[raw] || old.provisional {
+				t.joined, t.turn, t.partial, t.files, t.status, t.revision, t.buffer, t.lastDelta = old.joined, old.turn, old.partial, old.files, old.status, old.revision, old.buffer, old.lastDelta
+				t.failure, t.failureKind, t.ended = old.failure, old.failureKind, old.ended
+				t.serviceTier, t.serviceTierRevision = old.serviceTier, old.serviceTierRevision
+				t.model, t.effort = old.model, old.effort // an effort just set (codex_effort.go) over a read from before it
+				t.path, t.title = old.path, old.title
+				t.provisional, t.pinnedSeq, t.ready = old.provisional, old.pinnedSeq, old.ready
+			}
+			if old.status == proto.StatusBlocked && t.turn != "" && t.turn == old.turn {
+				t.status = proto.StatusBlocked
+			}
+			next[raw] = t
+		} else if t.provisional || t.joined || t.ready != nil {
+			// A provisional pre-registration rolled back while this refresh was in flight: keep only the
+			// server-confirmed loaded thread as non-provisional and unjoined.
+			t.provisional = false
+			t.joined = false
+			t.pinnedSeq = 0
+			t.ready = nil
 			next[raw] = t
 		}
 	}
+	// A local start after this snapshot owns the first turn and its settings. A cold resume also
+	// stays in the registry when an older loaded list omits it or the resume is still provisional.
+	for raw, old := range c.threads {
+		_, listed := next[raw]
+		if old.created.After(snapshot) || (!listed && (old.provisional || old.pinnedSeq > snapSeq)) {
+			next[raw] = old
+		}
+	}
 	for _, a := range c.asks {
-		if _, ok := next[a.thread]; !ok {
+		if t, ok := next[a.thread]; ok {
+			t.status = proto.StatusBlocked
+			next[a.thread] = t
+		} else {
 			a.cancel()
 		}
 	}
@@ -655,7 +895,7 @@ func (n *Node) codexOwner(id string) (*codexRemote, remoteThread, error) {
 		t, ok := c.threads[src.thread]
 		ready := c.ready
 		c.mu.Unlock()
-		if !ready || !ok {
+		if !ready || !ok || t.provisional {
 			continue
 		}
 		if owner != nil {
@@ -669,23 +909,228 @@ func (n *Node) codexOwner(id string) (*codexRemote, remoteThread, error) {
 	return owner, thread, nil
 }
 
+// codexSharedRemote returns an unambiguous ready shared app-server connection for home, preferring the official
+// control socket when multiple instances exist. Returns nil when none is connected or selection is ambiguous.
+func (n *Node) codexSharedRemote(home string) *codexRemote {
+	if n == nil || n.codices == nil || home == "" {
+		return nil
+	}
+	home = canonicalCodexHome(home, n.home)
+	if home == "" {
+		return nil
+	}
+	controlEndpoint := codexControlEndpoint(home)
+	n.codices.mu.Lock()
+	var candidates []*codexRemote
+	for _, c := range n.codices.remotes {
+		if c.spec.Home == home {
+			candidates = append(candidates, c)
+		}
+	}
+	n.codices.mu.Unlock()
+	var ready []*codexRemote
+	for _, c := range candidates {
+		c.mu.Lock()
+		ok := c.ready && c.wire != nil
+		c.mu.Unlock()
+		if !ok {
+			continue
+		}
+		if c.spec.Endpoint == controlEndpoint {
+			return c
+		}
+		ready = append(ready, c)
+	}
+	if len(ready) == 1 {
+		return ready[0]
+	}
+	return nil
+}
+
+// coldResume explicitly loads and subscribes an idle history thread on this shared app-server after the caller
+// verified no live writer or active writer lock holds it. Never called during session listing.
+func (c *codexRemote) coldResume(ctx context.Context, id string, src codexSource, cwd string) error {
+	defer c.joins.lock(id)()
+	c.mu.Lock()
+	ready, wire := c.ready, c.wire
+	existing, loaded := c.threads[src.thread]
+	c.mu.Unlock()
+	if !ready || wire == nil {
+		return takeoverRefusal("shared_unavailable")
+	}
+	if owner, _, err := c.n.codexOwner(id); err == nil && owner != c {
+		return takeoverRefusal("writer_busy")
+	} else if err != nil && !errors.Is(err, errCodexNoOwner) {
+		return err
+	}
+	if loaded && !existing.provisional && existing.joined {
+		return nil
+	}
+	// Pre-register the subscription before thread/resume so immediate approval requests and turn events emitted
+	// before the RPC returns are received instead of dropped, and concurrent refreshes cannot erase it.
+	var readyCh chan struct{}
+	c.mu.Lock()
+	c.refreshSeq++
+	preSeq := c.refreshSeq
+	wasLoaded := false
+	if cur, ok := c.threads[src.thread]; ok {
+		wasLoaded = !cur.provisional
+		cur.joined = true
+		cur.pinnedSeq = preSeq
+		cur.revision++
+		if cur.files == nil {
+			cur.files = map[string][]string{}
+		}
+		c.threads[src.thread] = cur
+	} else {
+		readyCh = make(chan struct{})
+		c.threads[src.thread] = remoteThread{
+			id:          src.thread,
+			publicID:    id,
+			cwd:         cwd,
+			path:        src.path,
+			status:      proto.StatusDone,
+			joined:      true,
+			provisional: true,
+			ready:       readyCh,
+			pinnedSeq:   preSeq,
+			revision:    1,
+			files:       map[string][]string{},
+		}
+	}
+	preRev := c.threads[src.thread].revision
+	c.mu.Unlock()
+
+	var readyOnce sync.Once
+	closeReady := func() {
+		if readyCh != nil {
+			readyOnce.Do(func() { close(readyCh) })
+		}
+	}
+
+	rollback := func() {
+		var cancelAsks []*remoteAsk
+		c.mu.Lock()
+		if cur, ok := c.threads[src.thread]; ok {
+			if cur.provisional || !wasLoaded {
+				delete(c.threads, src.thread)
+			} else {
+				cur.joined = false
+				cur.ready = nil
+				cur.revision++
+				c.threads[src.thread] = cur
+			}
+		}
+		for key, ask := range c.asks {
+			if ask.thread == src.thread {
+				delete(c.asks, key)
+				cancelAsks = append(cancelAsks, ask)
+			}
+		}
+		c.mu.Unlock()
+		for _, ask := range cancelAsks {
+			if c.n.peer != nil {
+				_ = c.n.peer.Notify("interaction.dismiss", map[string]any{"id": ask.interaction})
+			}
+			ask.cancel()
+		}
+		closeReady()
+	}
+
+	var reply struct {
+		Thread      remoteThreadData `json:"thread"`
+		Model       string           `json:"model"`
+		Effort      string           `json:"reasoningEffort"`
+		ServiceTier json.RawMessage  `json:"serviceTier"`
+	}
+	if err := wire.call(ctx, "thread/resume", map[string]any{"threadId": src.thread, "excludeTurns": true}, &reply); err != nil {
+		rollback()
+		if codexWriterConflict(err) != nil {
+			return takeoverRefusal("writer_busy")
+		}
+		return err
+	}
+	if reply.Thread.ID != src.thread {
+		rollback()
+		return errors.New("app-server 接入返回了不同的会话")
+	}
+	d := reply.Thread
+	c.mu.Lock()
+	c.refreshSeq++
+	doneSeq := c.refreshSeq
+	t := c.threads[src.thread]
+	eventsArrived := t.revision != preRev
+	t.id = src.thread
+	t.publicID = id
+	t.joined = true
+	t.provisional = false
+	t.ready = nil
+	t.pinnedSeq = doneSeq
+	if title := firstNonEmpty(d.Name, d.Preview); title != "" {
+		t.title = title
+	}
+	if d.Cwd != "" {
+		t.cwd = d.Cwd
+	} else if t.cwd == "" {
+		t.cwd = cwd
+	}
+	t.path = firstNonEmpty(d.Path, t.path, src.path)
+	if m := firstNonEmpty(reply.Model, d.Model); m != "" && (!eventsArrived || t.model == "") {
+		t.model, t.effort = m, firstNonEmpty(reply.Effort, d.Effort)
+	}
+	if tier := codexServiceTier(reply.ServiceTier); tier != "" && t.serviceTier == "" {
+		t.serviceTier = tier
+		t.serviceTierRevision++
+	}
+	if t.files == nil {
+		t.files = map[string][]string{}
+	}
+	if !eventsArrived {
+		t.status = proto.StatusDone
+		if d.Status.Type == "active" {
+			t.status = proto.StatusWorking
+		}
+		if slices.Contains(d.Status.ActiveFlags, "waitingOnApproval") || slices.Contains(d.Status.ActiveFlags, "waitingOnUserInput") {
+			t.status = proto.StatusBlocked
+		}
+	}
+	for _, turn := range d.Turns {
+		if turn.Status == "inProgress" && turn.ID != t.ended && t.turn == "" {
+			t.turn = turn.ID
+		}
+	}
+	t.revision++
+	c.threads[src.thread] = t
+	c.mu.Unlock()
+	closeReady()
+	c.n.codices.mu.Lock()
+	if c.n.codices.config.Joined == nil {
+		c.n.codices.config.Joined = map[string]string{}
+	}
+	c.n.codices.config.Joined[id] = c.spec.ID
+	c.n.codices.mu.Unlock()
+	c.n.rememberCodex()
+	c.n.notifyCodex()
+	return nil
+}
+
 func (c *codexRemote) join(ctx context.Context, id string, remember bool) error {
 	defer c.joins.lock(id)()
 	owner, t, err := c.n.codexOwner(id)
 	if err != nil || owner != c {
 		return refusal("codex_read_only", "无法确定原 app-server，未接入", nil)
 	}
-	if t.parent != "" {
+	if t.parent != "" && remember {
 		return refusal("codex_read_only", "这个子 Agent 由父 Agent 驱动", nil)
 	}
 	if t.joined {
 		return nil
 	}
-	ids, err := c.loaded(ctx)
-	if err != nil || !slices.Contains(ids, t.id) {
+	loadedSet, err := c.loadedShared(ctx, remember)
+	if err != nil || !loadedSet[t.id] {
 		return refusal("codex_read_only", "会话已不在原 app-server 中运行，未恢复或新建会话", nil)
 	}
-	// This is an explicit user-requested join, not a discovery or global subscription. Do not override runtime config.
+	// Subscribe to the loaded thread with its existing runtime configuration.
 	var reply struct {
 		Thread      remoteThreadData `json:"thread"`
 		Model       string           `json:"model"`
@@ -814,6 +1259,30 @@ func (n *Node) sendCodex(ctx context.Context, id, text string, images []proto.Im
 	if t.status == proto.StatusWorking || t.status == proto.StatusBlocked {
 		if _, a2a := ctx.Value(a2aIdleKey{}).(bool); a2a {
 			return a2aBusy()
+		}
+		clientID, _ := ctx.Value(sendTraceKey{}).(string)
+		if clientID == "" {
+			clientID = newUUID()
+		}
+		queueParams := map[string]any{"threadId": t.id, "input": input, "clientUserMessageId": clientID}
+		var ack struct {
+			QueuedSubmission struct {
+				ID string `json:"id"`
+			} `json:"queuedSubmission"`
+		}
+		queueErr := c.wire.call(ctx, "thread/queue/add", queueParams, &ack)
+		if queueErr == nil && ack.QueuedSubmission.ID != "" {
+			markSendQueued(ctx)
+			n.notifyCodex()
+			return nil
+		}
+		var rejected *codexError
+		if !errors.As(queueErr, &rejected) {
+			// Without an explicit rejection, steering could deliver the same message twice.
+			if queueErr == nil {
+				queueErr = errors.New("Codex returned no queued message receipt")
+			}
+			return uncertain(queueErr)
 		}
 		if t.turn == "" {
 			t.turn = c.activeTurn(ctx, t.id) // a turn already running when Persona joined (codex_daemon.go)
@@ -950,7 +1419,7 @@ func (n *Node) interruptCodexActiveTurn(ctx context.Context, id string) bool {
 	}
 	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline) && ctx.Err() == nil; {
 		c.mu.Lock()
-		idle := t.turn == ""
+		idle := c.threads[tid].turn == ""
 		c.mu.Unlock()
 		if idle {
 			break
@@ -989,6 +1458,9 @@ func (c *codexRemote) message(m codexMessage) {
 			Effort      string          `json:"effort"`
 			ServiceTier json.RawMessage `json:"serviceTier"`
 		} `json:"threadSettings"`
+		Status     remoteThreadStatus              `json:"status"`
+		ThreadName *string                         `json:"threadName"`
+		Plan       []struct{ Step, Status string } `json:"plan"`
 	}
 	if json.Unmarshal(m.Params, &ev) != nil {
 		return
@@ -1019,6 +1491,20 @@ func (c *codexRemote) message(m codexMessage) {
 	emit := false
 	refresh := false
 	switch m.Method {
+	case "thread/status/changed":
+		t.status = ev.Status.sessionStatus()
+		refresh = true
+	case "thread/closed":
+		t.ended = firstNonEmpty(t.turn, t.ended)
+		t.status, t.turn, t.partial, t.buffer = proto.StatusDone, "", "", nil
+		emit, refresh = true, true
+	case "thread/name/updated":
+		if ev.ThreadName != nil && *ev.ThreadName != "" {
+			t.title = *ev.ThreadName
+		}
+		refresh = true
+	case "thread/queue/changed", "turn/plan/updated":
+		refresh = true
 	case "thread/reverted":
 		invalidateCodexPaginated(c.spec.Home)
 		t.partial, t.failure, t.failureKind = "", "", ""
@@ -1057,13 +1543,13 @@ func (c *codexRemote) message(m codexMessage) {
 			}
 			t.files[ev.Item.ID] = paths
 		}
-		if ev.Item.Type == "agentMessage" {
+		if ev.Item.Type == "agentMessage" || ev.Item.Type == "plan" {
 			t.partial = ""
 			t.buffer = nil
 			emit = true
 			refresh = true
 		}
-	case "item/agentMessage/delta":
+	case "item/agentMessage/delta", "item/plan/delta":
 		if t.buffer == nil {
 			t.buffer = &strings.Builder{}
 		}
@@ -1083,7 +1569,7 @@ func (c *codexRemote) message(m codexMessage) {
 	case "item/completed":
 		delete(t.files, ev.Item.ID)
 		refresh = true
-		if ev.Item.Type == "agentMessage" {
+		if ev.Item.Type == "agentMessage" || ev.Item.Type == "plan" {
 			t.partial = ev.Item.Text
 			t.buffer = nil
 			delta = t.partial
@@ -1106,7 +1592,9 @@ func (c *codexRemote) message(m codexMessage) {
 	if emit {
 		c.n.emitDelta(t.publicID, delta)
 	}
-	if m.Method == "turn/started" || m.Method == "turn/completed" || m.Method == "thread/settings/updated" || m.Method == "thread/reverted" {
+	switch m.Method {
+	case "turn/started", "turn/completed", "thread/settings/updated", "thread/reverted",
+		"thread/status/changed", "thread/closed", "thread/name/updated", "thread/queue/changed", "item/plan/delta", "turn/plan/updated":
 		c.n.notifyCodex()
 	}
 }

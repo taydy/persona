@@ -86,6 +86,11 @@ final class DirectionScreensUITests: XCTestCase {
         return byID.exists ? byID : app.buttons[word("Move To…", "移到…", "移動…")].firstMatch
     }
 
+    /// The Agent menu has the compact command title in all three languages.
+    @MainActor private var agentMoveTo: XCUIElement {
+        app.buttons[word("Move To", "移到", "移動")].firstMatch
+    }
+
     /// A word of the app in the run's language.
     private func word(_ en: String, _ zh: String, _ ja: String) -> String { lang == "en" ? en : lang == "ja" ? ja : zh }
 
@@ -331,6 +336,21 @@ final class DirectionScreensUITests: XCTestCase {
         shot("page-from-title")
     }
 
+    @MainActor func testDefaultPermissionsEntry() {
+        reset()
+        launch()
+        openSidebar()
+        chat("Persona 产品").tap()
+        sleep(2)
+        openTitleMenu()
+        let item = app.buttons.matching(NSPredicate(format: "label == %@", word("Default Permissions", "默认权限", "デフォルト権限"))).firstMatch
+        XCTAssertTrue(item.waitForExistence(timeout: 5), "no Default Permissions in the direction's title menu:\n\(app.debugDescription)")
+        item.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["default-permission-mode"].firstMatch.waitForExistence(timeout: 10),
+                      "the direction entry did not open the shared default-permissions control:\n\(app.debugDescription)")
+        shot("default-permissions")
+    }
+
     // MARK: Menus, choices, toast, refusal
 
     @MainActor func testMenuChoicesAndToast() {
@@ -383,9 +403,10 @@ final class DirectionScreensUITests: XCTestCase {
         XCTAssertTrue(more.waitForExistence(timeout: 15), "no ⋯ on the Agent's chat:\n\(app.debugDescription)")
         more.tap()
         sleep(1)
-        XCTAssertTrue(moveTo.waitForExistence(timeout: 5), "no Move To… on the Agent:\n\(app.debugDescription)")
+        app.openAgentMenuMore() // Move To… is More's (#13396)
+        XCTAssertTrue(agentMoveTo.waitForExistence(timeout: 5), "no Move To on the Agent:\n\(app.debugDescription)")
         shot("agent-menu")
-        moveTo.tap()
+        agentMoveTo.tap()
         sleep(1)
         XCTAssertTrue(app.buttons[word("On Its Own", "单独放着", "単独にする")].firstMatch.waitForExistence(timeout: 5),
                       "the Agent's choices did not open:\n\(app.debugDescription)")
@@ -666,8 +687,9 @@ final class DirectionScreensUITests: XCTestCase {
         if off == "missing" {
             // A launch is a new hello, which forgets the missing routes: one Move To… learns them again (main has none).
             more.tap()
-            if moveTo.waitForExistence(timeout: 3) {
-                moveTo.tap()
+            app.openAgentMenuMore() // Move To… is More's (#13396)
+            if agentMoveTo.waitForExistence(timeout: 3) {
+                agentMoveTo.tap()
                 if app.buttons["增长"].firstMatch.waitForExistence(timeout: 5) { app.buttons["增长"].firstMatch.tap() }
                 sleep(8)
             } else {
@@ -676,7 +698,8 @@ final class DirectionScreensUITests: XCTestCase {
         }
         more.tap()
         sleep(1)
-        XCTAssertTrue(app.buttons[word("Copy Directory", "拷贝目录", "ディレクトリをコピー")].firstMatch.waitForExistence(timeout: 5),
+        app.openAgentMenuMore() // Copy Directory is More's (#13396)
+        XCTAssertTrue(app.buttons[word("Copy Path", "拷贝目录", "パスをコピー")].firstMatch.waitForExistence(timeout: 5),
                       "the Agent's menu did not open:\n\(app.debugDescription)")
         shot("off-agent-menu-\(off)")
     }

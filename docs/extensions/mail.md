@@ -1,6 +1,6 @@
 # Mail
 
-`server/internal/mail`: lets both Claude and the App send and receive the user's email. It uses standard IMAP + SMTP with no third-party relay service.
+`server/internal/modules/mail` (a feature module: `persona_without_mail` builds the manager without it; `docs/architecture/core-and-modules.md` "Provider seams"): lets both Claude and the App send and receive the user's email. It uses standard IMAP + SMTP with no third-party relay service.
 Gmail uses "Sign In with Google" (OAuth2 + XOAUTH2) and additionally supports searching with Gmail search syntax (`X-GM-RAW`). Credentials are encrypted and stored in the hub's `dataDir` (default `~/.persona`).
 
 ## Capabilities
@@ -17,9 +17,10 @@ Gmail uses "Sign In with Google" (OAuth2 + XOAUTH2) and additionally supports se
 | Reading | Fetch the full text with `BODY.PEEK`; go-message parses plain text / HTML / attachment metadata; it does **not** mark the message as read. A part marked `attachment` is an attachment even when its parameters don't parse, and so is a named file marked `inline` that is neither text nor an image (Apple Mail and iOS Mail send files that way); inline text and images stay part of the body, and the list's paperclip follows the same rule |
 | Attachment download | A stable ID tied to MIME order, metadata, and decoded content; reads are authorized by account, mailbox, and UID; a plain `BODY.PEEK` is decoded as a stream into a temp file, with HTTP Range support; doesn't mark as read and needs no extra IMAP extensions |
 | Read / starred | Only changes the two flags `\Seen` and `\Flagged` |
+| Moving one message | The Mail API moves mail on the provider using `UID MOVE` or a UIDPLUS fallback. It checks the source UIDVALIDITY and returns the destination UID and UIDVALIDITY when available for undo |
 | Sending | go-message builds the MIME, UTF-8, with Chinese subjects and names encoded per RFC 2047; supports `in_reply_to` / `references` for threading |
 | Keeping a sent copy | For non-Gmail accounts (SMTP doesn't save a copy automatically), `APPEND` to `\Sent` after sending; failure is only logged and doesn't affect the send result |
-| MCP tools | `mail_accounts`, `mail_search`, `mail_read` (lists each attachment's id), `mail_save_attachment` (saves an attachment as a file on the agent's machine, see "Saving attachments"), `mail_send`; sending always asks the user to approve on the phone first |
+| MCP tools | `mail_accounts`, `mail_search`, `mail_read` (lists each attachment's id), `mail_save_attachment` (saves an attachment as a file on the agent's machine, see "Saving attachments"), `mail_send`, and `mail_move`. Moves always require owner confirmation on the phone |
 
 HTTP routes and JSON fields match the "Mail API" section of `docs/protocol/protocol.md` exactly; passwords never appear in responses
 (`json:"-"` + a separate storage file).
@@ -133,7 +134,7 @@ the system browser opens Microsoft sign-in and authorization → back to the App
   "Sent" itself, so the hub doesn't append another copy.
 - **Refresh tokens rotate**: Microsoft issues a new one on every refresh (and the old one becomes invalid), so the hub encrypts and stores it back into `oauth_enc` right away (Google doesn't rotate).
 - Credentials: `{provider: "microsoft", client_id, refresh_token}` encrypted in `mail_accounts.oauth_enc`, same as Gmail.
-- Code: `server/internal/mail/microsoft.go`; App: `apple/Persona/Views/Mail/MailOutlookViews.swift`.
+- Code: `server/internal/modules/mail/microsoft.go`; App: `apple/Persona/Views/Mail/MailOutlookViews.swift`.
 - API: `GET` / `PUT /api/v1/mail/oauth/microsoft/config` (`{configured, client_id, source: app|config, redirect_uri}`; PUT `{client_id}`, an empty string clears it),
   `POST …/microsoft/start` (`{login_hint?}` → `{auth_url, callback_scheme, state}`), `POST …/microsoft/finish` (the callback's `{state, code}` or
   `{state, error, error_description}` → `{account}`). A callback carrying an error is still passed to the hub: it turns Microsoft's error code into what to do (see below).
@@ -253,6 +254,9 @@ the managers never put it in logs or error messages.
   Waiting in the queue uses the caller's ctx: on cancel or timeout it leaves the queue and reports `ctx.Err()`, without running or touching the connection (before #2344, abandoned requests still waited their turn, then closed the account's connection on the way out, forcing every live request behind them to reconnect). The operation's own 20 s only starts once it gets its turn, so a slow mailbox ahead doesn't eat into its time.
 - Network operations time out after 20 s. An operation logs in at most twice (#12808): when connecting fails with anything but the server's answer, or the connection ends under a step (the server hung up, a read or write failed, a reply couldn't be parsed), the connection is dropped and the operation runs once more on a new login, inside the same 20 s.
   A timeout, a caller that gave up, a NO / BAD, or any other error on a connection that is still up is not retried.
+  For moves, the reconnect can retry preparation only. A dropped reply after `MOVE` or `COPY` can leave the outcome
+  unknown. The UIDPLUS fallback may leave a copy at the destination if marking or removing the source fails. Refresh
+  both mailboxes before retrying either result; a new request can create a second copy.
   go-imap completes a command as soon as its tagged answer arrives, so a server that hangs up right after answering (QQ Mail does after a keyword `UID SEARCH`) makes the *next* command fail: over TLS the bare `use of closed network connection`. A search therefore keeps the UIDs it found, and its retry only runs `SELECT` and the fetch (when `UIDVALIDITY` is unchanged); searching again would end the new connection too.
   Every failed try writes one line: `mail: <account id>: <operation> failed at <step> (try N of 2, reconnecting | giving up): <raw error>`, plus `; the connection had ended (<why>)` when it had (go-imap's read error, or none: the server closed it). A refused login is logged when it starts or its answer changes, not on every round.
   When the last try couldn't reach the server either, the caller gets `UnreachableError` (code `mail_unreachable`, HTTP 502, localized `mail-errors.unreachable`: the mailbox couldn't be reached even after reconnecting once, try again later), never the raw transport error; `mail_search` and `mail_read` answer it in the caller's language.
@@ -290,11 +294,27 @@ download route takes.
   the next free `name (2).ext` … `name (99).ext` is used instead.
 - The node writes into its own data directory, which the agent sandbox leaves readable (only its secrets are closed).
 
+## With the mail module off
+
+A hub that turns the mail module off (the `modules` row, or a build without it) has no `/api/v1/mail/…` route and no
+mail tools, and reads no new mail. What it already stored stays the user's and stays readable through Core's routes
+(`docs/architecture/core-and-modules.md`, "A module that is off keeps what the user has"): each mail item in the Inbox
+with its subject, sender, date, preview and `context` (the header lines and up to 3,000 characters of the newest
+mail's text, `GET /api/v1/inbox/{id}`), a translation it kept, and the mail filed into the knowledge base. The full
+body, the HTML and the attachments were never stored: they are fetched from the mail server as a mail opens, so they
+are not available until the module is back. Clients show the stored text and say so in one plain line, and leave out
+the controls that would write to the mailbox; the web's is described in `docs/web/web.md` ("Modules"), the iPhone
+and iPad app's in `docs/apple/ios.md` ("Modules"), and the Android app follows in #15995.
+
 ## Known limitations
 
 - **No IDLE push**: new mail waits for the App to refresh (polling or IMAP IDLE could be added later).
 - **Sending doesn't support attachments yet**: attachments on incoming mail can be inspected and downloaded, but outgoing mail still can't carry them.
-- **No delete / move / archive**: only read and starred can be changed for now.
+- **Moves are available through the API and `mail_move`**. Mail and Inbox screens have no move controls yet. The move
+  API cannot permanently delete a message or empty Trash.
+- **Gmail's archive role returns `unsupported`**. Junk, Trash, Inbox and an explicit mailbox still use the normal move path.
+- **Undo needs `COPYUID`**. Without both destination UID and UIDVALIDITY, refresh the destination and identify the
+  message there before moving it back.
 - **Summaries only use the first 2 KB of the body**: if the body starts with a very long base64 inline image, the summary may be empty or meaningless.
 - **gzip-compressed bodies** (`Content-Encoding: gzip`) are not supported; such messages will be missing their body.
 - **Keeping a sent copy for non-Gmail accounts is best effort**: an `APPEND` failure is only logged; some providers don't allow APPEND to `Sent`.

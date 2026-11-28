@@ -1,12 +1,14 @@
 package node
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nwverse/persona/server/internal/lazyre"
 	"github.com/nwverse/persona/server/internal/prompts"
@@ -191,52 +193,151 @@ func rowDelta(key, old, text string) (delta prompts.TurnSection, ok bool) {
 	return delta, true
 }
 
-// changedSection is how section s goes to a conversation that has old of it: by rows where that is shorter (the
-// two are rendered to compare), else whole, which replaces all the conversation had of it.
-func changedSection(s snapshotSection, old string) prompts.TurnSection {
-	whole := prompts.TurnSection{Text: s.text}
-	if delta, ok := rowDelta(s.key, old, s.text); ok && turnSectionLen(delta) < turnSectionLen(whole) {
-		return delta
+// inlineIDs are the sections whose items share the heading's line, joined by "；", each starting with an id of its
+// own: the open to-do index ("todo_1「title」（link）；todo_2…", or only the ids when the snapshot is short of room).
+// With 60 open to-dos it is hundreds of characters, and it changed on most messages (a title, a flag, the snapshot
+// switching between ids only and ids with titles): it was told again whole each time. Of these only the items that
+// came or went are told (inlineDelta); the count of all of them is a section of its own ("- 开放待办：共 N 件").
+const openTodoIndexKey = "- 开放待办索引"
+
+var inlineIDs = map[string]func(item string) string{
+	openTodoIndexKey: inlineTodo,
+}
+
+// inlineTodoID is the id an index item starts with.
+var inlineTodoID = lazyre.New(`^todo_[0-9A-Za-z_]+`)
+
+func inlineTodo(item string) string { return inlineTodoID.FindString(item) }
+
+// inlineItems are a one-line section's heading (up to its first "："), its items by id, their ids in order, and the
+// text after them with no id (the index's "其余用 todo_list 查"). ok is false when an item between them has no id, or
+// an id comes twice: a title holding "；" splits an item, and then the section is told whole.
+func inlineItems(text string, id func(string) string) (head string, items map[string]string, ids []string, ok bool) {
+	head, rest, found := strings.Cut(text, "：")
+	if !found || strings.Contains(text, "\n") {
+		return "", nil, nil, false
 	}
-	return whole
+	items = map[string]string{}
+	parts := strings.Split(rest, "；")
+	for i, p := range parts {
+		k := id(p)
+		if k == "" {
+			if i == len(parts)-1 && i > 0 {
+				break // the trailer
+			}
+			return "", nil, nil, false
+		}
+		if _, dup := items[k]; dup {
+			return "", nil, nil, false
+		}
+		items[k] = p
+		ids = append(ids, k)
+	}
+	return head, items, ids, true
+}
+
+// inlineDelta is what changed in a one-line section of items with ids (inlineIDs) between old and text: the items that
+// are new, and while both are rendered the same way (the same heading) the ones whose text changed, with the ids of
+// those gone. Which order they are in is not told: the index has none worth a list of every id. skip: nothing came,
+// went or changed but the way it is rendered, which the conversation need not hear again. ok is false when either
+// side cannot be read by its items.
+func inlineDelta(key, old, text string) (delta prompts.TurnSection, skip, ok bool) {
+	id := inlineIDs[key]
+	if id == nil {
+		return delta, false, false
+	}
+	oldHead, had, oldIDs, oldOK := inlineItems(old, id)
+	head, has, ids, newOK := inlineItems(text, id)
+	if !oldOK || !newOK {
+		return delta, false, false
+	}
+	delta = prompts.TurnSection{Partial: true, Name: key}
+	for _, k := range ids {
+		if before, known := had[k]; !known || oldHead == head && before != has[k] {
+			delta.Rows = append(delta.Rows, "  - "+has[k])
+		}
+	}
+	for _, k := range oldIDs {
+		if _, still := has[k]; !still {
+			delta.Removed = append(delta.Removed, k)
+		}
+	}
+	return delta, len(delta.Rows) == 0 && len(delta.Removed) == 0, true
+}
+
+// changedSection is how section s goes to a conversation that has old of it: by rows where that is shorter (the
+// two are rendered to compare), else whole, which replaces all the conversation had of it. skip: it need not go at all
+// (inlineDelta).
+func changedSection(s snapshotSection, old string) (section prompts.TurnSection, skip bool) {
+	whole := prompts.TurnSection{Text: s.text}
+	if delta, skip, ok := inlineDelta(s.key, old, s.text); ok {
+		if skip {
+			return delta, true
+		}
+		if turnSectionLen(delta) < turnSectionLen(whole) {
+			return delta, false
+		}
+		return whole, false
+	}
+	if delta, ok := rowDelta(s.key, old, s.text); ok && turnSectionLen(delta) < turnSectionLen(whole) {
+		return delta, false
+	}
+	return whole, false
 }
 
 func turnSectionLen(s prompts.TurnSection) int {
 	return len(prompts.RenderTurnContext(prompts.TurnContext{Sections: []prompts.TurnSection{s}}))
 }
 
-// contextDelta is the block for a message and what the conversation will have seen once it is sent: everything when
-// seen is nil, else the sections that are new or changed (changedSection), the time always, and the names of the
-// snapshot's sections that are gone, so what the conversation has equals the snapshot again. A line before the
-// snapshot's own sections (what the conversation is, a one-time notice) is never told gone: it is not the state of
-// something, and one that is no longer repeated still holds. "" when there is no snapshot.
+// contextDelta is the block for a message and what the conversation will have seen once it is sent. A full block
+// starts over, except that the open to-do index is omitted without a baseline and otherwise goes through inlineDelta:
+// its count and todo_list guidance are already a section of their own. Other sections are sent whole; a block of
+// changes keeps the existing row and inline deltas, the time always, and the names of sections that are gone.
 func contextDelta(seen map[string]string, snapshot string) (string, map[string]string) {
+	return contextDeltaMode(seen, seen == nil, snapshot)
+}
+
+// contextDeltaMode is contextDelta with full stated separately: after a compaction seen can hold only the last open
+// to-do index, kept as a comparison baseline even though the model no longer has the old blocks. next always retains
+// the raw index so a later block of changes can still be compared with it.
+func contextDeltaMode(seen map[string]string, full bool, snapshot string) (string, map[string]string) {
 	sections := snapshotSections(snapshot)
 	if len(sections) == 0 {
 		return "", seen
 	}
 	next := make(map[string]string, len(sections))
-	c := prompts.TurnContext{Full: seen == nil}
+	c := prompts.TurnContext{Full: full}
 	for _, s := range sections {
 		old, known := seen[s.key]
 		switch {
-		case !known:
+		case full && inlineIDs[s.key] != nil:
+			// A restart has no baseline: do not call every current item new. With one, only actual changes go out.
+			if known && old != s.text {
+				if delta, skip, ok := inlineDelta(s.key, old, s.text); ok && !skip {
+					c.Sections = append(c.Sections, delta)
+				}
+			}
+		case full || !known:
 			c.Sections = append(c.Sections, prompts.TurnSection{Text: s.text})
 		case old != s.text:
-			c.Sections = append(c.Sections, changedSection(s, old))
+			if section, skip := changedSection(s, old); !skip {
+				c.Sections = append(c.Sections, section)
+			}
 		case s.key == timeSection:
 			c.Sections = append(c.Sections, prompts.TurnSection{Text: s.text})
 		}
 		next[s.key] = s.text
 	}
-	for k, v := range seen {
-		if _, still := next[k]; still {
-			continue
-		}
-		if name, listed := strings.CutPrefix(k, listMark); listed {
-			c.Gone = append(c.Gone, name)
-		} else {
-			next[k] = v
+	if !full {
+		for k, v := range seen {
+			if _, still := next[k]; still {
+				continue
+			}
+			if name, listed := strings.CutPrefix(k, listMark); listed {
+				c.Gone = append(c.Gone, name)
+			} else {
+				next[k] = v
+			}
 		}
 	}
 	slices.Sort(c.Gone)
@@ -254,8 +355,13 @@ func (n *Node) turnContext(id string, c contextAnswer) (block string, commit fun
 	}
 	n.mu.Lock()
 	seen := n.ctxSent[id]
+	full := seen == nil
+	history := seen
+	if full && n.ctxOpenTodoIndex[id] != "" {
+		history = map[string]string{openTodoIndexKey: n.ctxOpenTodoIndex[id]}
+	}
 	n.mu.Unlock()
-	block, next := contextDelta(seen, c.Text)
+	block, next := contextDeltaMode(history, full, c.Text)
 	snapshot := block != ""
 	st, _ := n.state.get(id)
 	if c.RecoveryID == "" || st.RecoveryPending != c.RecoveryID {
@@ -291,6 +397,14 @@ func (n *Node) turnContext(id string, c contextAnswer) (block string, commit fun
 			n.ctxSent = map[string]map[string]string{}
 		}
 		n.ctxSent[id] = next
+		if index := next[openTodoIndexKey]; index != "" {
+			if n.ctxOpenTodoIndex == nil {
+				n.ctxOpenTodoIndex = map[string]string{}
+			}
+			n.ctxOpenTodoIndex[id] = index
+		} else {
+			delete(n.ctxOpenTodoIndex, id)
+		}
 		n.mu.Unlock()
 	}
 }
@@ -307,6 +421,7 @@ func (n *Node) contextCompacted(id string) {
 	})
 	n.mu.Lock()
 	delete(n.ctxSent, id)
+	// ctxOpenTodoIndex survives only to compare the next full block's index; it is not context the model still has.
 	n.mu.Unlock()
 	n.forgetFallback(id)     // the refused turns are summarized away: its own model again (#3788)
 	n.clearModelRecovery(id) // the temporary switch ended with the refused turns (#7824)
@@ -359,6 +474,19 @@ type contextAnswer struct {
 // assistantContext asks the hub for the live snapshot (prompts.AssistantContext) and the view errors to report. The
 // hub answers from what it read lately and waits only briefly for a new read, so this doesn't hold the message up.
 func (n *Node) assistantContext(id string) contextAnswer {
+	return n.assistantContextFor(id, "")
+}
+
+// assistantContextFor is assistantContext with the current turn's user text (capped to 4 KiB) so the hub can attach
+// entity-triggered local memory for the main conversation without waiting on any model.
+func (n *Node) assistantContextFor(id, query string) contextAnswer {
+	return n.assistantContextForCwd(id, "", query)
+}
+
+// assistantContextForCwd is assistantContextFor with the conversation's launch directory cwd (falling back to persisted
+// session state when cwd is empty) so a new space conversation gets its space context on the very first turn, before
+// assistant.send returns or sessions.changed publishes the session (#17557).
+func (n *Node) assistantContextForCwd(id, cwd, query string) contextAnswer {
 	if n.peer == nil {
 		return contextAnswer{}
 	}
@@ -366,7 +494,20 @@ func (n *Node) assistantContext(id string) contextAnswer {
 	defer cancel()
 	st, _ := n.state.get(id)
 	res := contextAnswer{requested: true, requestedRecoveryID: st.RecoveryPending}
-	if err := n.peer.Call(ctx, "assistant.context", map[string]any{"session_id": id, "recovery_id": st.RecoveryPending, "prepare_recovery": true}, &res); err != nil {
+	params := map[string]any{"session_id": id, "recovery_id": st.RecoveryPending, "prepare_recovery": true}
+	if dir := cmp.Or(strings.TrimSpace(cwd), strings.TrimSpace(st.Cwd)); dir != "" {
+		params["cwd"] = dir
+	}
+	if q := strings.TrimSpace(query); q != "" {
+		if len(q) > 4096 {
+			q = q[:4096]
+			for len(q) > 0 && !utf8.ValidString(q) {
+				q = q[:len(q)-1]
+			}
+		}
+		params["query"] = q
+	}
+	if err := n.peer.Call(ctx, "assistant.context", params, &res); err != nil {
 		n.logger.Printf("assistant context: %v", err)
 		return contextAnswer{requested: true, requestedRecoveryID: st.RecoveryPending}
 	}

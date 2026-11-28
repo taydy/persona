@@ -66,16 +66,17 @@ func relayGrant(t *testing.T, srv *httptest.Server, token, topic string) string 
 
 var testRing = assistantwire.CallRing{ID: "call_7f3a", Title: "登录失败率 18%", ConversationID: "conv_1", Attempt: 1}
 
-// TestRingCallThroughRelay: a ring goes to the phone's PushKit token as a voip push that carries only the sealed
-// matter; the phone opens the call's id, title, manager and conversation from it.
+// TestRingCallThroughRelay: the manager rings over the bus. The push to the phone's PushKit token carries the
+// call's id, title, manager and conversation sealed for the phone.
 func TestRingCallThroughRelay(t *testing.T) {
 	h, f, priv, _ := callHub(t, true)
 	if route, _ := h.push.callRouteOfID("phone"); route.Route != pushRelay {
 		t.Fatalf("call route %+v", route)
 	}
-	res := h.push.ringCall(context.Background(), "assistant", testRing)
-	if res.Devices != 1 || res.Reason != "" {
-		t.Fatalf("ring %+v", res)
+	a := connectAssistant(t, h)
+	res, err := a.bh.CallRing(t.Context(), testRing)
+	if err != nil || res.Devices != 1 || res.Reason != "" {
+		t.Fatalf("ring %+v, %v", res, err)
 	}
 	r := f.wait(t, 1)[0]
 	if r.PushType != "voip" || r.Token != callVoIPToken || r.Topic != "app.example.voip" || r.Priority != "10" {
@@ -187,10 +188,13 @@ func TestCallRoute(t *testing.T) {
 		route, cause string
 	}{
 		{Device{}, pushNone, pushNoToken},
-		{Device{VoIPToken: callVoIPToken, VoIPError: "403 topic not served by this relay", RelayURL: "https://relay.example"}, pushNone, pushRelayFailed},
+		{Device{VoIPToken: callVoIPToken, VoIPError: "403 topic not served by this relay", RelayURL: "https://relay.example", RelayGrant: "normal"}, pushNone, pushRelayFailed},
 		{Device{VoIPToken: callVoIPToken}, pushNone, pushNoRelay},
-		{Device{VoIPToken: callVoIPToken, RelayURL: "https://relay.example", VoIPGrant: "g"}, pushNone, pushRelayFailed}, // no push key
-		{Device{VoIPToken: callVoIPToken, RelayURL: "https://relay.example", VoIPGrant: "g", PushKey: "k"}, pushRelay, ""},
+		// A URL kept only to name a refused normal registration is not a usable call route.
+		{Device{VoIPToken: callVoIPToken, RelayError: "403 topic not served", RelayURL: "https://relay.example", VoIPGrant: "voip"}, pushNone, pushNoRelay},
+		{Device{VoIPToken: callVoIPToken, RelayError: "403 topic not served", RelayURL: "https://relay.example", VoIPGrant: "voip", PushKey: "k"}, pushNone, pushNoRelay},
+		{Device{VoIPToken: callVoIPToken, RelayURL: "https://relay.example", RelayGrant: "normal", VoIPGrant: "g"}, pushNone, pushRelayFailed}, // no push key
+		{Device{VoIPToken: callVoIPToken, RelayURL: "https://relay.example", RelayGrant: "normal", VoIPGrant: "g", PushKey: "k"}, pushRelay, ""},
 	} {
 		if got := p.callRouteOf(c.d); got.Route != c.route || got.Reason != c.cause {
 			t.Errorf("callRouteOf(%+v) = %+v, want %s %s", c.d, got, c.route, c.cause)

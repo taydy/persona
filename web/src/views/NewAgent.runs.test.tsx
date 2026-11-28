@@ -26,7 +26,11 @@ let host: HTMLDivElement;
 let closes: number;
 let started: number;
 const flush = () => act(async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); });
-const tick = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+const tick = (ms = 0) => act(async () => {
+  await vi.advanceTimersByTimeAsync(0);
+  await vi.dynamicImportSettled();
+  await vi.advanceTimersByTimeAsync(ms);
+});
 const button = (text: string) => [...document.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent?.trim() === text);
 const textarea = () => document.querySelector<HTMLTextAreaElement>("textarea")!;
 const adds = () => calls.filter((c) => c.url.endsWith("/worktree/add"));
@@ -137,7 +141,7 @@ describe("New agent's Runs (#8916)", () => {
     await act(async () => {
       startCompare({
         mid: "computer", cwd: "/projects/demo", nameHint: "review", branch: "review", count: 2,
-        spec: { launcher: "claude", nameHint }, paseo: false, text: "Private team document", attachments: [],
+        spec: { launcher: "claude", nameHint }, intoWorkspace: false, text: "Private team document", attachments: [],
       });
     });
     for (let n = 1; n <= 2; n++) {

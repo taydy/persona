@@ -98,8 +98,15 @@ type tailcatDialer struct {
 // errTailcatClosed: the manager is stopping.
 var errTailcatClosed = errors.New("tailcat: the manager is stopping")
 
+// errTailcatPrivate: the hub is in office network mode, where tailcat, which relays over the internet, is never dialed.
+var errTailcatPrivate = errors.New("tailcat: the hub is in office network mode: connect this computer with Persona Link")
+
 func (d *Devices) tailcatClient() (*tunnel.Dialer, error) {
-	url := d.config().TailcatDERPMapURL
+	cfg := d.config()
+	if cfg.PrivateNetwork {
+		return nil, errTailcatPrivate
+	}
+	url := cfg.TailcatDERPMapURL
 	t := &d.tailcat
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -321,7 +328,10 @@ func (m *Machine) directWorks(ctx context.Context) error {
 	if host == "" {
 		host = m.cfg.ID
 	}
-	return exec.CommandContext(ctx, "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, "true").Run()
+	if err := validateSSHHost(host); err != nil {
+		return err
+	}
+	return exec.CommandContext(ctx, "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, "true").Run()
 }
 
 // deployTailcat sends the hub's node build over tailcat: the node installs it over itself and exits, and its

@@ -19,12 +19,15 @@ import persona.core.contracts.Session
 import persona.core.contracts.SessionInfo
 import persona.core.contracts.parseTime
 import persona.core.designsystem.*
+import persona.core.domain.sort.isBotmux
 import persona.core.designsystem.icons.PersonaIcons
 import persona.core.designsystem.icons.PhIcons
 import persona.core.domain.answer.Delegated
 import persona.core.domain.lines.tokenCount
 import persona.core.domain.sort.canSend
 import persona.core.domain.sort.listedModes
+import persona.core.domain.sort.displayTitle
+import persona.core.domain.sort.displayTitleDetail
 import persona.core.domain.sort.resumeCommand
 import java.time.Instant
 import java.time.ZoneId
@@ -181,6 +184,7 @@ internal fun ChatSessionInfoSheet(
     machine: Machine?,
     state: ChatChromeState,
     onOpenTodo: ((String) -> Unit)? = null,
+    preferHerdrTabName: Boolean = false,
     onDismiss: () -> Unit,
 ) {
     val copyText = rememberCopy()
@@ -199,8 +203,12 @@ internal fun ChatSessionInfoSheet(
     }
     JSheet(onDismiss = onDismiss, title = stringResource(R.string.chat_info_title), scrollable = true) {
         Column(verticalArrangement = Arrangement.spacedBy(Tokens.Space.xs)) {
-            Text(session.displayTitle, style = PersonaTheme.type.headline, color = PersonaTheme.palette.ink, maxLines = 2,
+            Text(session.displayTitle(preferHerdrTabName), style = PersonaTheme.type.headline, color = PersonaTheme.palette.ink, maxLines = 2,
                 overflow = TextOverflow.Ellipsis)
+            session.displayTitleDetail(preferHerdrTabName)?.let { cliTitle ->
+                Text(cliTitle, style = PersonaTheme.type.caption, color = PersonaTheme.palette.ink2, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis)
+            }
             val status = Status.entries.firstOrNull { it.name == session.agentState.name }
             Text(listOfNotNull(status?.localizedLabel, machine?.displayName ?: session.machineId, session.spaceName?.takeIf(String::isNotBlank))
                 .joinToString(" / "), style = PersonaTheme.type.caption, color = PersonaTheme.palette.ink2, maxLines = 1,
@@ -213,6 +221,8 @@ internal fun ChatSessionInfoSheet(
                     onClick = { val _ = runCatching { uriHandler.openUri(url) } })
             }
         }
+        // A BotMux session reads as in Lark, or as its raw transcript (BotmuxMessages.kt).
+        if (session.isBotmux) BotmuxModeRow(Modifier.padding(top = Tokens.Space.m))
         // The questions the assistant answered for this agent; its own conversations have none.
         if (!session.assistant) DelegatedHistorySection(session, state)
         val loaded = info
@@ -251,7 +261,7 @@ internal fun ChatSessionInfoSheet(
  * caution colour from [ContextUsage.WARN_USED] percent used; read out as one line with the share used and the window.
  */
 @Composable
-private fun ContextUsageRow(label: String, value: String, usage: ContextUsage) {
+internal fun ContextUsageRow(label: String, value: String, usage: ContextUsage) {
     val palette = PersonaTheme.palette
     val spoken = stringResource(R.string.chat_info_context_spoken, value, usage.used, usage.detail)
     Column(Modifier.clearAndSetSemantics { contentDescription = spoken }) {
@@ -270,7 +280,7 @@ private fun ContextUsageRow(label: String, value: String, usage: ContextUsage) {
  * new answer reaches the Agent as a message). Nothing while it loads or when there are none; a failure says so with Retry.
  */
 @Composable
-private fun DelegatedHistorySection(session: Session, state: ChatChromeState) {
+internal fun DelegatedHistorySection(session: Session, state: ChatChromeState) {
     val res = LocalResources.current
     var answers by remember(session.key) { mutableStateOf<List<DelegatedAnswer>?>(null) }
     var failure by remember(session.key) { mutableStateOf<String?>(null) }

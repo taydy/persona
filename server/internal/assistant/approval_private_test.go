@@ -11,6 +11,7 @@ import (
 )
 
 func TestPrivateApprovalRenewsJustMeForAnswerAndResultTurns(t *testing.T) {
+	needsRecordingModule(t) // a path of the recording module's
 	ft := newFleetTest(t)
 	preparedTestConversation(ft)
 	ft.s.justMeSent("mac", "s1")
@@ -48,6 +49,7 @@ func TestPrivateApprovalRenewsJustMeForAnswerAndResultTurns(t *testing.T) {
 }
 
 func TestPrivateApprovalQueuedResultRenewsJustMeAfterRestart(t *testing.T) {
+	needsRecordingModule(t) // a path of the recording module's
 	ft := newFleetTest(t)
 	preparedTestConversation(ft)
 	ft.s.justMeSent("mac", "s1")
@@ -88,7 +90,7 @@ func TestPrivateApprovalQueuedResultRenewsJustMeAfterRestart(t *testing.T) {
 	ft.f.known["s1"] = true
 	ft.f.mu.Unlock()
 	now := time.Now().Add(justMeMax + time.Minute)
-	restarted.justMe.now = func() time.Time { return now }
+	recClock(restarted, func() time.Time { return now })
 	if err := restarted.deliverRelay(context.Background(), "mac", "s1", queued); err != nil {
 		t.Fatal(err)
 	}
@@ -100,6 +102,7 @@ func TestPrivateApprovalQueuedResultRenewsJustMeAfterRestart(t *testing.T) {
 }
 
 func TestPrivateApprovalRecoveredJournalKeepsJustMe(t *testing.T) {
+	needsRecordingModule(t) // a path of the recording module's
 	ft := newFleetTest(t)
 	preparedTestConversation(ft)
 	ft.f.mu.Lock()
@@ -113,7 +116,7 @@ func TestPrivateApprovalRecoveredJournalKeepsJustMe(t *testing.T) {
 	// Private marker while recovering the delivery record.
 	ft.s.approvalJournalFinished(context.Background(), proto.Interaction{
 		ID: "ix_private_recovered", MachineID: "mac", SessionID: "s1", Private: true,
-	}, "cancelled", "nothing was executed")
+	}, "cancelled", "nothing was executed", true)
 	if result := waitApprovalResult(t, ft, "ix_private_recovered"); !strings.Contains(result, "nothing was executed") {
 		t.Fatalf("recovered Private approval result = %q", result)
 	}

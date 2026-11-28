@@ -15,7 +15,7 @@ import (
 // hub still sends them), and a machine it names that the hub doesn't have is not used.
 func TestOwnConfigOverTheHello(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "manager.json")
-	mine := `{"id":"x","token":"bus","assistant":{"owner":" Example ","machine":"laptop","launcher":"codex","memory_dreaming":true,"complete_agentless_todos":true,"supervision_batch_minutes":45},
+	mine := `{"id":"x","token":"bus","assistant":{"owner":" Example ","machine":"laptop","launcher":"codex","memory_dreaming":true,"complete_agentless_todos":true,"auto_approve_reversible_settings":true,"supervision_batch_minutes":45},
 		"agents":{"triage":{"max_retries":2,"account_exhaustion_max_retries":3}},"kb":{"enabled":false,"read_only":true,"text_days":30,"ai":{"model":"k"},"attachment_days_by_source":{"chat":3650,"off":0,"neg":-1}},
 		"ai":{"base_url":"https://gateway.example.com","model":"m"},
 		"inbox":{"triage_ai":{"model":"t"},"agent":{"machine":"gone"}},"hook_timeout_minutes":0}`
@@ -31,7 +31,7 @@ func TestOwnConfigOverTheHello(t *testing.T) {
 		Notify: assistantwire.NotifyTimings{LongTurnMS: 5}}
 	h := c.over(hub)
 	if h.Owner != "Example" || h.OwnerNotes != "the hub's notes" || h.Assistant.MachineID != "laptop" || h.Assistant.Launcher != "codex" ||
-		!h.Assistant.MemoryDreaming || !h.Assistant.CompleteAgentlessTodos || h.Assistant.SupervisionBatchMinutes == nil ||
+		!h.Assistant.MemoryDreaming || !h.Assistant.CompleteAgentlessTodos || !h.Assistant.AutoApproveReversibleSettings || h.Assistant.SupervisionBatchMinutes == nil ||
 		*h.Assistant.SupervisionBatchMinutes != 45 {
 		t.Fatalf("assistant %+v %q %q", h.Assistant, h.Owner, h.OwnerNotes)
 	}
@@ -49,9 +49,12 @@ func TestOwnConfigOverTheHello(t *testing.T) {
 	if h.Notify.HookTimeoutMS != 1800000 || h.Notify.LongTurnMS != 5 {
 		t.Fatalf("notify %+v", h.Notify)
 	}
-	// Nothing in manager.json: the hello as it came, with the knowledge base's defaults.
+	// Nothing in manager.json: the hello as it came, with the knowledge base's defaults. The manager-only approval
+	// switch is the exception: a hello cannot enable it, even one from a newer or modified hub.
+	fromHub := hub
+	fromHub.Assistant.AutoApproveReversibleSettings = true
 	none, _ := readOwnConfig(filepath.Join(t.TempDir(), "manager.json"))
-	if h := none.over(hub); h.OwnerNotes != "the hub's notes" || h.Models.JudgeAI.Model != "old" || h.KB == nil || h.KB.Off || h.KB.AttachmentDaysBySource != nil || h.Assistant.CompleteAgentlessTodos {
+	if h := none.over(fromHub); h.OwnerNotes != "the hub's notes" || h.Models.JudgeAI.Model != "old" || h.KB == nil || h.KB.Off || h.KB.AttachmentDaysBySource != nil || h.Assistant.CompleteAgentlessTodos || h.Assistant.AutoApproveReversibleSettings {
 		t.Fatalf("empty %+v", h)
 	}
 	// A machine the hub doesn't have keeps the hub's default.
@@ -234,5 +237,39 @@ func TestRejectedPlacementStillRestrictsConnectedWorkMachine(t *testing.T) {
 	}
 	if got := s.mcpCall(context.Background(), "computer", "session", "phone_contacts", nil, false); !got.IsError {
 		t.Fatal("existing node retained phone access")
+	}
+}
+
+// kb.speaker_turns_import defaults to false, is read once when the manager starts, and does not change if
+// manager.json is edited while running or when a new hello arrives.
+func TestSpeakerTurnsImportReadAtStart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "manager.json")
+	bOff := NewBusHub(BusOptions{ConfigFile: file, Logf: t.Logf})
+	svcOff := New(Options{Hub: bOff, Logf: t.Logf})
+	if bOff.speakerTurnsImport || svcOff.speakerTurnsImport.Load() || (recordingHost{s: svcOff}).SpeakerTurnsImport() {
+		t.Fatal("kb.speaker_turns_import defaulted to true")
+	}
+	// Editing manager.json after start and processing a hello must not flip the switch on.
+	if err := os.WriteFile(file, []byte(`{"kb":{"speaker_turns_import":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bOff.setHello(Hello{})
+	if bOff.speakerTurnsImport || svcOff.speakerTurnsImport.Load() || (recordingHost{s: svcOff}).SpeakerTurnsImport() {
+		t.Fatal("editing manager.json after start turned kb.speaker_turns_import on")
+	}
+
+	// Starting a fresh manager with kb.speaker_turns_import: true enables it, and clearing manager.json while
+	// running does not turn it off until restart.
+	bOn := NewBusHub(BusOptions{ConfigFile: file, Logf: t.Logf})
+	svcOn := New(Options{Hub: bOn, Logf: t.Logf})
+	if !bOn.speakerTurnsImport || !svcOn.speakerTurnsImport.Load() || !(recordingHost{s: svcOn}).SpeakerTurnsImport() {
+		t.Fatal("kb.speaker_turns_import: true was not read at start")
+	}
+	if err := os.WriteFile(file, []byte(`{"kb":{"speaker_turns_import":false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bOn.setHello(Hello{})
+	if !bOn.speakerTurnsImport || !svcOn.speakerTurnsImport.Load() || !(recordingHost{s: svcOn}).SpeakerTurnsImport() {
+		t.Fatal("editing manager.json after start turned kb.speaker_turns_import off")
 	}
 }

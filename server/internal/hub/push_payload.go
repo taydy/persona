@@ -97,6 +97,9 @@ func interactionPayloadIn(l i18n.Lang, ix proto.Interaction, machine string) map
 		},
 		"interaction_id": ix.ID, "machine_id": ix.MachineID, "session_id": ix.SessionID,
 	}
+	if !ix.CreatedAt.IsZero() {
+		out["interaction_created_at"] = ix.CreatedAt.UTC().Format(time.RFC3339Nano)
+	}
 	if q, ok := askQuestion(ix); ok {
 		labels := make([]string, len(q.Options))
 		for i, o := range q.Options {
@@ -288,11 +291,17 @@ func decidePayloadIn(owner, machineID, machine, sessionID, title, text string, t
 			td["lockscreen"], aps["category"] = assistantwire.OwnerAskLockscreenOpenOnly, decideOpenCategory
 		}
 	}
-	return map[string]any{
+	out := map[string]any{
 		"aps":        aps,
 		"machine_id": machineID, "session_id": sessionID,
 		"todo": td,
 	}
+	// Top-level todo_id (without interaction_id) lets iOS recall delivered to-do decision pushes on todo-ask:<id>
+	// without NotificationWithdrawal.stale ever sweeping unanswered decisions (#13916). Older apps ignore it.
+	if todo.ID != "" {
+		out["todo_id"] = todo.ID
+	}
+	return out
 }
 
 // decideOptions are the option labels a decision's push carries: whole (the extension offers a label it can show, or

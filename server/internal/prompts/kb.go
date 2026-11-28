@@ -13,6 +13,7 @@ import (
 type KBOwner struct {
 	Owner    string
 	Language string
+	Speakers bool
 }
 
 func RenderKBCompress(o KBOwner) string { return render("kb/compress", o) }
@@ -59,7 +60,7 @@ type KBProjectChat struct {
 	State, StateAt string
 }
 
-// KBProjectInput is a project's file, timeline and chats (kb/project_input).
+// KBProjectInput is a project's file, timeline, bounded direction memory and chats (kb/project_input).
 type KBProjectInput struct {
 	Language   string // Instruction language; source fields remain unchanged.
 	Pinned     string
@@ -68,8 +69,34 @@ type KBProjectInput struct {
 	Tags       []string
 	Summary    string
 	Log        []string
+	Memory     *KBProjectMemory
 	Chats      []KBProjectChat
 	Moments    []KBMoment // Moments posts judged to be about it
+}
+
+// KBProjectMemory is the bounded, newest-first direction memory supplied to a project summary rewrite.
+type KBProjectMemory struct {
+	Outcomes  []KBProjectMemoryOutcome
+	Decisions []KBProjectMemoryDecision
+	Pitfalls  []KBProjectMemoryPitfall
+}
+
+type KBProjectMemoryOutcome struct {
+	ID, Text, When, Verification string
+	Links                        []string
+	Unaccepted                   bool
+}
+
+// KBProjectMemoryDecision carries a result only when its durable record ID identifies an outcome in the bounded input.
+type KBProjectMemoryDecision struct {
+	ID, Question, Choice, Reason, Result string
+	When, Verification                   string
+	Unaccepted                           bool
+}
+
+type KBProjectMemoryPitfall struct {
+	Text, When, Verification string
+	Unaccepted               bool
 }
 
 // KBMoment is a Moments post put before a model: who, when, how many comments, its text clipped, and (when judged
@@ -188,10 +215,35 @@ type KBMinutesInput struct {
 func RenderKBMinutesInput(in KBMinutesInput) string { return render("kb/minutes_input", in) }
 
 // KBMinutesNote is an item of a part's notes: Line the transcript line it cites, or Photo the photo (Line 0 then); Who,
-// By and DueDate as the part said; Topic the title of the part's topic a point or decision is in ("" none, #6563).
+// By and DueDate as the part said; Topic the title of the part's topic a point or decision is in ("" none, #6563);
+// Speaker is the anonymous speaker marker of Line when a timeline is present ("" otherwise, #17674).
 type KBMinutesNote struct {
-	Line, Photo                   int
-	Text, Who, By, DueDate, Topic string
+	Line, Photo                            int
+	Text, Who, By, DueDate, Topic, Speaker string
+}
+
+// KBMinutesDebateAlso is an additional supporting citation in a part's disagreement notes for the merging call (#17674).
+type KBMinutesDebateAlso struct {
+	Line            int
+	Speaker, Holder string
+}
+
+// KBMinutesDebatePosition is one side of a disagreement in a part's notes for the merging call (#16728, #17674).
+type KBMinutesDebatePosition struct {
+	Line            int
+	Stance, Who     string
+	Speaker, Holder string
+	Also            []KBMinutesDebateAlso
+}
+
+// KBMinutesDebate is a disagreement in a part's notes for the merging call (#16728): each position and any outcome
+// carries the transcript line number it cites.
+type KBMinutesDebate struct {
+	Question, Topic string
+	Settled         bool
+	Positions       []KBMinutesDebatePosition
+	OutcomeText     string
+	OutcomeLine     int
 }
 
 // KBMinutesPart is a part's notes, From and To its first and last lines' clock times.
@@ -200,6 +252,7 @@ type KBMinutesPart struct {
 	From, To, Where                  string
 	Attendees                        []string
 	Points, Decisions, Actions, Open []KBMinutesNote
+	Debates                          []KBMinutesDebate
 }
 
 // KBMinutesMergeInput is a long meeting's parts' notes to merge (kb/minutes_merge_input).

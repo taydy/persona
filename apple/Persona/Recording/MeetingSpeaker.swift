@@ -244,6 +244,12 @@ struct MeetingVoiceRoute {
     /// The extension's speech contribution that reads it (#8712), in the voice its settings pick; nil: the voice
     /// extension's `speak`.
     var speech: String? = nil
+
+    func synthesize(_ text: String, lang: String?) async throws -> VoiceSpeech {
+        guard let api else { throw URLError(.notConnectedToInternet) }
+        if let speech { return try await api.speechSpeak(extensionID, contribution: speech, text: text, lang: lang) }
+        return try await api.voiceSpeak(extensionID, text: text, model: model, voice: voice, lang: lang)
+    }
 }
 
 extension MeetingSpeaker {
@@ -275,16 +281,15 @@ extension MeetingSpeaker {
 }
 
 extension MeetingSpeaker.Deps {
+    private final class LeaseBox {
+        var lease: AudioSessionBroker.Lease?
+    }
+
     /// The app's: the hub's voice extension, the recording, the phone's audio.
     static var live: Self {
-        Self(realtime: { await MeetingVoiceRoutes.shared.route() },
-             synthesize: { route, text, lang in
-                 guard let api = route.api else { throw URLError(.notConnectedToInternet) }
-                 if let speech = route.speech {
-                     return try await api.speechSpeak(route.extensionID, contribution: speech, text: text, lang: lang)
-                 }
-                 return try await api.voiceSpeak(route.extensionID, text: text, model: route.model, voice: route.voice, lang: lang)
-             },
+        let speakerLease = LeaseBox()
+        return Self(realtime: { await MeetingVoiceRoutes.shared.route() },
+             synthesize: { try await $0.synthesize($1, lang: $2) },
              player: { MeetingVoicePlayer() },
              onDevice: MeetingDeviceVoice(),
              maySpeak: { MeetingAsk.shared.deps.maySpeak($0) },
@@ -294,10 +299,13 @@ extension MeetingSpeaker.Deps {
              routeToSpeaker: {
                  // A meeting recording a system call paused: the route is the call's (docs/apple/calls.md).
                  guard !LiveCallGate.callIsLive else { return false }
-                 let session = AVAudioSession.sharedInstance()
-                 guard VoiceRoute.output(PhoneVoiceAudio.snapshot(session)).speaker else { return false }
+                 let broker = AudioSessionBroker.shared
+                 guard VoiceRoute.output(PhoneVoiceAudio.snapshot(broker)).speaker else { return false }
                  do {
-                     try session.overrideOutputAudioPort(.speaker)
+                     try broker.overrideOutputAudioPort(.speaker)
+                     if speakerLease.lease == nil {
+                         speakerLease.lease = broker.acquire(id: "recording.speaker", module: "recording", kind: .playback)
+                     }
                      return true
                  } catch {
                      Logger(subsystem: "persona", category: "meeting-speaker")
@@ -306,8 +314,10 @@ extension MeetingSpeaker.Deps {
                  }
              },
              restoreOutput: {
+                 speakerLease.lease?.release()
+                 speakerLease.lease = nil
                  guard !LiveCallGate.callIsLive else { return }
-                 try? AVAudioSession.sharedInstance().overrideOutputAudioPort(.none)
+                 try? AudioSessionBroker.shared.overrideOutputAudioPort(.none)
              })
     }
 }
@@ -329,6 +339,10 @@ extension MeetingSpeaker.Deps {
         await VoiceSupport.shared.refresh(group: group, api: api)
         guard let probe = VoiceSupport.shared.probes[group] else { return nil }
         if let speech = await speechRoute(api: api, group: group, extensions: probe.extensions, now: now) { return speech }
+        return await realtimeRoute(api: api, group: group, probe: probe, now: now)
+    }
+
+    func realtimeRoute(api: APIClient, group: String, probe: VoiceSupport.Probe, now: Date = .now) async -> MeetingVoiceRoute? {
         guard let voice = VoiceAvailability.pick(probe.extensions), case .info(let info)? = probe.info, Self.speaks(info) else { return nil }
         let key = group + "\u{0}" + voice.id
         let model: String?
@@ -354,6 +368,10 @@ extension MeetingSpeaker.Deps {
     /// The speech contribution that reads an answer now: `speechPick`'s, while its `/info` allows (`reads`).
     func speechRoute(api: APIClient, group: String, extensions: [HubExtension], now: Date = .now) async -> MeetingVoiceRoute? {
         guard let (ext, cid) = Self.speechPick(extensions) else { return nil }
+        return await speechRoute(api: api, group: group, extensionID: ext, contribution: cid, now: now)
+    }
+
+    func speechRoute(api: APIClient, group: String, extensionID ext: String, contribution cid: String, now: Date = .now) async -> MeetingVoiceRoute? {
         let key = group + "\u{0}" + ext + "/" + cid
         let info: SpeechInfo?
         if let kept = speechInfos[key], now.timeIntervalSince(kept.at) < Self.ttl {
@@ -443,8 +461,13 @@ final class MeetingDeviceVoice: NSObject, MeetingDeviceSpeech {
     }
 
     func speak(_ text: String, voice: AVSpeechSynthesisVoice?, ended: @escaping @MainActor () -> Void) {
+        speak(text, voice: voice, rate: 1, ended: ended)
+    }
+
+    func speak(_ text: String, voice: AVSpeechSynthesisVoice?, rate: Double, ended: @escaping @MainActor () -> Void) {
         let next = AVSpeechUtterance(string: text)
         next.voice = voice
+        next.rate = min(AVSpeechUtteranceMaximumSpeechRate, max(AVSpeechUtteranceMinimumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * Float(rate)))
         utterance = next
         self.ended = ended
         synthesizer.speak(next)

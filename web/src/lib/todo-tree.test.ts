@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { agentGroupLabel, agentTreeState, buildTodoTree, groupTodosByProject, nestAgents, projectOf, STALE_MS, todoTreeState, treeStateLabel, worstTreeState } from "./todo-tree";
+import { buildV2SidebarTree } from "../features/todos/board-sidebar-tree";
+import { groupTodosByProject, projectOf } from "../features/todos/project-groups";
+import { agentGroupLabel, agentTreeState, buildTodoTree, nestAgents, STALE_MS, todoTreeState, treeStateLabel, worstTreeState } from "./todo-tree";
 import { makeSessionLookup, todoStatus, type Todo } from "./todos";
 import { todoLook, waitOf } from "./todo-wait-reason";
 import { matchesFilter } from "./agent-filter";
@@ -60,7 +62,7 @@ describe("By to-do: to-dos at the top level, no repository rows (#2526, #6458)",
     const tree = buildTodoTree(all, machines, [todo("t1", [link("a")])], noMutes, NOW);
     expect(tree.loose.map((g) => [g.key, g.sessions.map((x) => x.session_id).sort()])).toEqual([["todo:none", ["bot", "hand"]]]);
     // what the group holds, for its ⓘ and its empty state (#3057, #6458); no engine name (DESIGN_SYSTEM 5.6)
-    expect(tree.loose[0].hint).toContain("没挂在任何待办上");
+    expect(tree.loose[0].hint).toContain("未关联到任何待办");
     expect(tree.loose[0].hint).toContain("终端");
     expect(tree.loose[0].hint).not.toMatch(/herdr/i);
     // where it came from stays on the row: the Terminal source mark
@@ -81,7 +83,7 @@ describe("By to-do: to-dos at the top level, no repository rows (#2526, #6458)",
     const all = [s("a", "working", "/code/p")];
     expect(buildTodoTree(all, machines, [todo("t1", [link("a")])], noMutes, NOW).loose).toEqual([]);
     const tree = buildTodoTree(all, machines, [todo("t1", [link("a")])], noMutes, NOW, { keepEmpty: true });
-    expect(tree.loose.map((g) => [g.key, g.name, g.agents.length, g.folded])).toEqual([["todo:none", "没挂待办的", 0, true]]);
+    expect(tree.loose.map((g) => [g.key, g.name, g.agents.length, g.folded])).toEqual([["todo:none", "未关联待办", 0, true]]);
     expect(tree.loose[0].hint.length).toBeGreaterThan(0);
   });
 
@@ -227,5 +229,114 @@ describe("waiting in the background in the tree (#6045)", () => {
     expect(todoTreeState("working", [waiting, busy])).toBe("working");
     expect(todoTreeState("working")).toBe("working");
     expect(todoTreeState("needs_you", [waiting])).toBe("needs_you");
+  });
+});
+
+describe("todos_v2 top-level goal folding in By to-do (#14831)", () => {
+  it("keeps branches flat in the standard tree", () => {
+    const all = [s("a", "working", "/code/p"), s("b", "idle", "/code/p")];
+    const list: Todo[] = [
+      todo("goal", [], { title: "Launch" }),
+      todo("c1", [link("a")], { title: "API", part_of: "goal" }),
+      todo("c2", [link("b")], { title: "Docs", part_of: "goal" }),
+    ];
+    const tree = buildTodoTree(all, machines, list, noMutes, NOW);
+    expect(tree.todos.map((td) => td.todoId)).toEqual(["c1", "c2"]);
+    expect(tree.todos.every((td) => td.goalProgress === undefined)).toBe(true);
+  });
+
+  it("folds non-urgent part_of subtasks (including grandchildren) under their open parent goal with done/total progress", () => {
+    const all = [s("a", "working", "/code/p"), s("b", "idle", "/code/p")];
+    const list: Todo[] = [
+      todo("goal", [], { title: "Ship v2" }),
+      todo("done1", [], { title: "Spec", part_of: "goal", done_at: fresh }),
+      todo("c1", [link("a")], { title: "Backend", part_of: "goal" }),
+      todo("gc1", [link("b")], { title: "Migration", part_of: "c1" }),
+      todo("open-no-agent", [], { title: "Checklist", part_of: "goal" }),
+    ];
+    const tree = buildV2SidebarTree(all, machines, list, noMutes, NOW, { board: null, foldChildren: true });
+    expect(tree.todos.map((td) => td.todoId)).toEqual(["goal"]);
+    const goal = tree.todos[0]!;
+    expect(goal.name).toBe("Ship v2");
+    expect(goal.goalProgress).toEqual({ done: 1, total: 4 });
+    expect(goal.state).toBe("working");
+    expect(goal.sessions.map((x) => x.session_id).sort()).toEqual(["a", "b"]);
+    expect(goal.folded).toBe(false);
+  });
+
+  it("merges folded children into a parent goal that also has its own agents and updates aggregated state", () => {
+    const all = [s("p", "idle", "/code/p"), s("c", "working", "/code/p")];
+    const list: Todo[] = [
+      todo("goal", [link("p")], { title: "Main goal" }),
+      todo("c1", [link("c")], { title: "Subtask", part_of: "goal" }),
+    ];
+    const tree = buildV2SidebarTree(all, machines, list, noMutes, NOW, { board: null, foldChildren: true });
+    expect(tree.todos).toHaveLength(1);
+    const goal = tree.todos[0]!;
+    expect(goal.todoId).toBe("goal");
+    expect(goal.state).toBe("working");
+    expect(goal.statusLabel).toBeUndefined();
+    expect(goal.goalProgress).toEqual({ done: 0, total: 1 });
+    expect(goal.sessions.map((x) => x.session_id).sort()).toEqual(["c", "p"]);
+  });
+
+  it("surfaces needs_you and active-ask child blockers at the top without duplicating them in the parent fold", () => {
+    const all = [
+      s("w", "working", "/code/p"),
+      s("n", "needs_you", "/code/p"),
+      s("ask", "idle", "/code/p", { updated_at: old }),
+    ];
+    const list: Todo[] = [
+      todo("goal", [], { title: "Release" }),
+      todo("done1", [], { title: "Prep", part_of: "goal", done_at: fresh }),
+      todo("work", [link("w")], { title: "Build", part_of: "goal" }),
+      todo("blocked", [link("n")], { title: "Approve schema", part_of: "goal" }),
+      todo("asking", [link("ask")], { title: "Pick rollout", part_of: "goal", ask: { verdict: "Roll out?", outcome: "decide", asked_at: fresh } }),
+    ];
+    const tree = buildV2SidebarTree(all, machines, list, noMutes, NOW, { board: null, foldChildren: true });
+    // Surfaced blockers appear first and unfolded (in sortTodos order), followed by the folded parent goal
+    expect(tree.todos.map((td) => td.todoId)).toEqual(["asking", "blocked", "goal"]);
+    expect(tree.todos[0]!.folded).toBe(false);
+    expect(tree.todos[1]!.folded).toBe(false);
+    const goal = tree.todos[2]!;
+    expect(goal.goalProgress).toEqual({ done: 1, total: 4 });
+    expect(goal.sessions.map((x) => x.session_id)).toEqual(["w"]);
+  });
+
+  it("keeps cyclic, self-referential, orphan, and closed-parent items unfolded and never drops them", () => {
+    const all = [
+      s("a", "working", "/code/p"),
+      s("b", "working", "/code/p"),
+      s("self", "working", "/code/p"),
+      s("orphan", "working", "/code/p"),
+      s("closed-child", "working", "/code/p"),
+    ];
+    const list: Todo[] = [
+      todo("cycA", [link("a")], { part_of: "cycB" }),
+      todo("cycB", [link("b")], { part_of: "cycA" }),
+      todo("selfT", [link("self")], { part_of: "selfT" }),
+      todo("orphanT", [link("orphan")], { part_of: "missing-parent" }),
+      todo("closedGoal", [], { done_at: fresh }),
+      todo("closedChildT", [link("closed-child")], { part_of: "closedGoal" }),
+    ];
+    const tree = buildV2SidebarTree(all, machines, list, noMutes, NOW, { board: null, foldChildren: true });
+    expect(tree.todos.map((td) => td.todoId).sort()).toEqual(["closedChildT", "cycA", "cycB", "orphanT", "selfT"]);
+    expect(tree.todos.every((td) => td.goalProgress === undefined)).toBe(true);
+  });
+
+  it("reverts immediately when todosV2 switches back to false", () => {
+    const all = [s("a", "working", "/code/p"), s("b", "working", "/code/p")];
+    const list: Todo[] = [
+      todo("goal", [], { title: "Goal" }),
+      todo("c1", [link("a")], { title: "One", part_of: "goal" }),
+      todo("c2", [link("b")], { title: "Two", part_of: "goal" }),
+    ];
+    const on = buildV2SidebarTree(all, machines, list, noMutes, NOW, { board: null, foldChildren: true });
+    expect(on.todos.map((td) => td.todoId)).toEqual(["goal"]);
+    const unfolded = buildV2SidebarTree(all, machines, list, noMutes, NOW, { board: null, foldChildren: false });
+    expect(unfolded.todos.map((td) => td.todoId)).toEqual(["c1", "c2"]);
+    const off = buildTodoTree(all, machines, list, noMutes, NOW);
+    expect(off.todos.map((td) => td.todoId)).toEqual(["c1", "c2"]);
+    expect(off).toEqual(unfolded);
   });
 });

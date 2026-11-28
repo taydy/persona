@@ -57,11 +57,6 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 	if proto.IsExternalLauncher(launcher) {
 		return nil, externalRefusal(ctx, "adapter_purpose_unsupported")
 	}
-	if resume != "" {
-		if st, ok := n.state.get(resume); ok {
-			execution.TaskInstructions = st.TaskInstructions
-		}
-	}
 	// A start named to a failed start's kept tab holds it from here, sync and async alike: newTab uses it, else it is
 	// kept again when the start returns (startremedy.go).
 	claim, claimErr := n.claimKeptTab(execution.InPane)
@@ -75,15 +70,25 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 	// The effort is checked against the agent this start actually dispatches: an explicit agentType wins over the
 	// launcher's name, so a Claude start refuses ultra even on a launcher named codex.
 	kind := n.startAgentType(launcher, agentType)
+	if kind == traexAgent && effort == "" {
+		effort = execution.Effort
+	}
 	if err := execution.check(kind); err != nil {
 		return nil, err
 	}
 	var argv []string
 	codex := false
-	if proto.FasterSpeed(execution.Speed) {
+	explicitSpeed := proto.FasterSpeed(execution.Speed) || execution.ServiceTier != ""
+	if explicitSpeed {
 		argv, codex = n.codexLauncher(ctx, launcher)
-		if err := execution.applyStartSpeed(launcher, kind, codex); err != nil {
-			return nil, err
+		if execution.ServiceTier != "" {
+			if !codex || kind == traexAgent {
+				return nil, unsupportedStartSpeed(launcher, execution.ServiceTier)
+			}
+		} else {
+			if err := execution.applyStartSpeed(launcher, kind, codex); err != nil {
+				return nil, err
+			}
 		}
 		if execution.ServiceTier != "" {
 			if err := n.checkCodexStartSpeed(ctx, launcher, execution.Model, execution.ServiceTier); err != nil {
@@ -148,17 +153,17 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 			// session.start holds n.recovery.lock(resume) (node.go), as a send to a stopped row does (ompcalls.go): a
 			// second start or send waits for this resume and finds the session running above, so no second omp runs.
 			// The guards a resume of any other agent passes (below): a session open elsewhere or owned by a runtime
-			// is not started again, and not on Orca.
+			// is not started again. And not on Orca: an omp is resumed only in herdr (ompresume.go, #13597).
 			if r := n.openElsewhereRefusal(resume); r != nil {
 				return nil, r
 			}
 			// Only a runtime still connected owns it: one that listed it and left (its omp exited) does not keep the
 			// session from its file.
 			if h, _, _ := n.runtimes.belongs(resume); h != nil {
-				return nil, refusal("runtime_session", "这个会话属于另一个工具（例如 Orca 的原生对话），请在那里继续，这次没有启动。", nil)
+				return nil, refusal("runtime_session", i18n.T(i18n.From(ctx), "rpc-errors.runtime_session"), nil)
 			}
 			if n.startKind(ctx) == proto.EngineOrca {
-				return nil, refusal("orca_resume", "Orca 上只能从手机继续 Claude 会话：其它 Agent 请在电脑上恢复，这次没有启动。", nil)
+				return nil, orcaResumeRefusal(ctx)
 			}
 			if _, err := n.resumeOmp(ctx, resume, ompResumeParams(ctx, resume, prompt)); err != nil { // ompresume.go
 				return nil, err
@@ -169,8 +174,11 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 			return nil, refusal("not_running", "接着这个 omp 会话后没等到它的会话行，这次没有发送。", nil)
 		}
 	}
-	if !proto.FasterSpeed(execution.Speed) {
+	if !explicitSpeed {
 		argv, codex = n.codexLauncher(ctx, launcher)
+	}
+	if execution.ModelAliases != nil && (resume != "" || kind != "claude" || codex) {
+		return nil, refusal("model_aliases_unsupported", "model_aliases require a new Claude Code terminal session", nil)
 	}
 	var launch host.Launcher
 	if codex && kind == "codex" && resume == "" && mode == "" && stockOrcaCodexArgv(launcher, argv) && n.startKind(ctx) == proto.EngineOrca {
@@ -209,10 +217,15 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 		if err != nil {
 			return nil, err
 		}
-		if agent != "claude" && agent != "codex" {
+		if kind == traexAgent {
+			if agent != traexAgent || resume != "" {
+				return nil, errors.New("TRAE CLI model overrides require a new session on a TRAE CLI launcher")
+			}
+		} else if agent != "claude" && agent != "codex" {
 			return nil, errors.New("普通 Agent 的启动只支持 Claude Code 或 Codex 启动器")
 		}
 	}
+	resumeWithTranscript := false
 	if resume != "" {
 		if a, ok := n.agent(resume); ok {
 			if mode == "plan" && a.Agent == "codex" {
@@ -222,23 +235,32 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 			return n.sessionFor(resume, a), nil // already running
 		}
 		// A claude still alive on the session (Claude's desktop app, another terminal, suspended there) refuses: two
-		// writers would corrupt its transcript. Otherwise a Claude session resumes in the start's host, Orca like herdr: a
-		// terminal opened in the session's worktree (#5548).
+		// writers would corrupt its transcript. Otherwise the session resumes in the start's host, Orca like herdr: a
+		// terminal opened in the session's worktree, a Claude session and, since #17044, a TRAE CLI one alike; a Codex
+		// thread was resumed above (codex_resume.go), and a TRAE CLI that still runs in a pane is the running agent.
 		if r := n.openElsewhereRefusal(resume); r != nil { // open in Claude's desktop app or a terminal (openelsewhere.go)
 			return nil, r
 		}
 		if _, _, known := n.runtimes.belongs(resume); known { // an Orca native chat and the like: its runtime's, not a terminal's
-			return nil, refusal("runtime_session", "这个会话属于另一个工具（例如 Orca 的原生对话），请在那里继续，这次没有启动。", nil)
-		}
-		if n.startKind(ctx) == proto.EngineOrca && kind != "claude" { // the start's host
-			return nil, refusal("orca_resume", "Orca 上只能从手机继续 Claude 会话：其它 Agent 请在电脑上恢复，这次没有启动。", nil)
+			return nil, refusal("runtime_session", i18n.T(i18n.From(ctx), "rpc-errors.runtime_session"), nil)
 		}
 		// An id this computer has no transcript, record or start of is not one to resume, as `claude --resume` would
 		// say: started under it, a new conversation would be listed under the id of another, which the manager tells
 		// conversations by (a health chat's: #10941). A first start that failed keeps its start or its record (#861)
 		// and starts under its id below.
-		if kind == "claude" && !codex && !n.resumeKnown(ctx, resume) {
-			return nil, resumeUnknown()
+		if kind == "claude" && !codex {
+			if !n.resumeKnown(ctx, resume) {
+				return nil, resumeUnknown()
+			}
+			n.healClaudeRefusalTranscript(resume)
+		}
+		// Healing can remove the only turn. Use the same transcript decision for the launch flags and whether
+		// to carry task instructions into the conversation (#12216).
+		resumeWithTranscript = n.transcriptPath(resume) != ""
+		if !resumeWithTranscript {
+			execution.TaskInstructions = ""
+		} else if st, ok := n.state.get(resume); ok {
+			execution.TaskInstructions = st.TaskInstructions
 		}
 	}
 
@@ -279,9 +301,7 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 		if resume != "" { // a Codex thread is resumed above: this id is not one
 			return nil, refusal(codexResumeRefused, "找不到这个 Codex 会话的记录，没法接着它：请在电脑上恢复（codex resume）。", nil)
 		}
-		// An inherited effort needs no override, which would leave the shared app-server; the record keeps it all the same.
-		runs := n.codexOwnEffort(ctx, argv, codexPaneEnv(launch), cwd, execution)
-		s, err := n.startCodex(ctx, launch, cwd, launcher, codexExecutionArgs(argv, runs), execution, prompt, ws, tabName, mode)
+		s, err := n.startCodex(ctx, launch, cwd, launcher, argv, execution, prompt, ws, tabName, mode)
 		if err == nil && strings.TrimSpace(prompt) != "" {
 			n.codexGoalAfterStart(s.SessionID, s.PaneID, execution.Goal) // its first message is in (codex_start_goal.go)
 		}
@@ -289,13 +309,17 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 	}
 	if work := workAgentKind(launcher, kind); work != "" { // workagent.go
 		if resume != "" {
-			return nil, refusal("work_agent_resume", "这个会话不能用启动器接着：pi 在它原来的标签里继续，cursor 和 agy 请在电脑上恢复。这次没有启动。", nil)
+			// Every engine alike: pi comes back through its runtime (pi.go), agy through its companion (agystopped.go).
+			return nil, refusal("work_agent_resume", i18n.T(i18n.From(ctx), "rpc-errors.work_agent_resume"), nil)
 		}
 		return n.startWorkAgent(ctx, launch, cwd, launcher, work, execution.Model, effort, mode, prompt, ws, tabName)
 	}
 	if kind != "claude" { // start_agent.go
-		if mode != "" || effort != "" {
+		if mode != "" || (effort != "" && (kind != traexAgent || resume != "")) {
 			return nil, fmt.Errorf("permission mode and effort are only supported for Claude starts")
+		}
+		if kind == traexAgent && resume == "" {
+			execution.Effort = effort
 		}
 		return n.startOtherAgent(ctx, launch, cwd, launcher, kind, prompt, resume, ws, tabName, execution)
 	}
@@ -309,10 +333,45 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 	if id == "" {
 		id = newUUID()
 	}
+	// A resume can arrive without a launcher in its RPC params. Resolve the provider before writing settings, which
+	// override parts of the environment personad launch will supply.
+	managed, err := n.readyManagedLauncher(ctx, launcher)
+	if err != nil {
+		return nil, err
+	}
+	managedRestart, _ := ctx.Value(managedRestartKey{}).(bool)
+	if managedRestart && (managed.Name == "" || managed.AgentType() != "claude") {
+		return nil, refusal(notDelivered, "The managed Claude provider is no longer available to resume this conversation.", nil)
+	}
 	// Persona's hooks: a plugin, or in --settings for a claude that loads none (hooksplugin.go).
 	settings, hooks := n.claudeStartSettings(ctx, launcher, "claude", cwd)
+	if execution.Source.Role == "" {
+		execution.Source.Role = "task_agent"
+	}
+	execution.Source = sourceSession(execution.Source, id)
+	settings, err = n.sourceClaudeSettings(ctx, launcher, cwd, settings, "", execution.Source)
+	if err != nil {
+		return nil, err
+	}
+	modelArg := n.claudeModelArg(launcher, execution.Model)
+	managed, managedHere := n.managedLauncher(launcher)
+	if resume == "" && (execution.ModelAliases != nil || managedHere && !anthropicEndpoint(managedBaseURL(managed))) {
+		var aliases proto.ModelAliases
+		if execution.ModelAliases != nil {
+			aliases = *execution.ModelAliases
+		}
+		requested := execution.Model
+		if nativeClaudeModel.MatchString(proto.TrimModelWindow(requested)) &&
+			!strings.EqualFold(proto.TrimModelWindow(requested), proto.TrimModelWindow(execution.ExplicitModel)) {
+			requested = ""
+		}
+		settings, modelArg, err = n.claudeModelAliasSettings(ctx, launcher, cwd, settings, aliases, requested)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// No tier alias on the command line for a gateway provider (#10365): its model for that tier, else its default.
-	spec := claudeLaunch{Launcher: launcher, Settings: settings, Hooks: hooks, Display: n.liveRepliesPlugin(hooks), Model: n.claudeModelArg(launcher, execution.Model),
+	spec := claudeLaunch{Source: execution.Source, Launcher: launcher, Settings: settings, Hooks: hooks, Display: n.liveRepliesPlugin(hooks), Model: modelArg, Effort: effort, managed: managedRestart,
 		Plugins: n.claudeLoadsPlugins(ctx), TaskInstructionFile: instructionFile}
 	if backend := backendLaunchFrom(ctx); backend != nil && mode != "plan" {
 		for _, repo := range backend.executor.journal.Repositories {
@@ -335,14 +394,9 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 		_ = renameSlot(ctx, launch, created.SlotID, name)
 	}
 
-	// A trailing refused turn would be merged into the first new prompt of a resume, so it is cut first: the file's
-	// last turn is then clean again. A session whose only turn was refused loses its file and starts under its id.
-	if resume != "" {
-		n.healClaudeRefusalTranscript(id)
-	}
-	// A session whose first start failed (claude never came up) has no transcript to resume: start it under its id.
+	// A session without a usable transcript starts again under its id.
 	args := "--session-id " + id
-	if resume != "" && n.transcriptPath(id) != "" {
+	if resumeWithTranscript {
 		args = "--resume " + id
 	}
 	planThen := planThenOf(mode, execution.PlanThen)
@@ -359,12 +413,13 @@ func (n *Node) start(ctx context.Context, cwd, launcher, prompt, resume, workspa
 		cmd = cdThen(cwd, cmd, shells...)
 	}
 	n.notePaneStart(launcher) // not in the agent sandbox unless a managed launcher (agentsandbox.go)
-	st := sessionState{Pane: pane, Launcher: launcher, Cwd: cwd, StartedAt: time.Now().UTC(), Model: execution.Model, ModelFingerprint: execution.Fingerprint,
+	st := sessionState{ModelSource: execution.Source, Pane: pane, Launcher: launcher, Cwd: cwd, StartedAt: time.Now().UTC(), Model: execution.Model, ModelEffort: effort, ModelFingerprint: execution.Fingerprint,
 		PlanThen: planThen, TaskInstructions: execution.TaskInstructions, TaskInstructionFile: instructionFile, TaskInstructionChannel: instructionChannel}
 	if prev, ok := n.state.get(id); ok && resume != "" {
 		if !prev.StartedAt.IsZero() { // a branch (fork.go) has none: it starts now
 			st.StartedAt = prev.StartedAt
 		}
+		st.Cwd = keepSpaceCwd(prev.Cwd, st.Cwd)
 		st.Ultracode = prev.Ultracode
 		// A switch to another launcher still waits for the next message (launcher_switch.go): a Resume on the launcher
 		// the agent ran on keeps it; the switch's own start leaves it for the switch to clear.
@@ -534,6 +589,14 @@ func (n *Node) resumeOutsideHealth(ctx context.Context, id string) bool {
 	return started
 }
 
+// keepSpaceCwd keeps a session record's folder inside its space when a resume names a directory outside that space (#12216).
+func keepSpaceCwd(prevCwd, cwd string) string {
+	if space := identity.SpaceAt(prevCwd); space != "" && identity.SpaceAt(cwd) != space {
+		return prevCwd
+	}
+	return cwd
+}
+
 // retypeStart types a start's line again into pane once its shell is at rest (settleShell), after leaving the
 // continuation prompt a cut quote left it at (Ctrl-C).
 func (n *Node) retypeStart(ctx context.Context, pane string, typed *typedStart) error {
@@ -557,7 +620,7 @@ func (n *Node) retypeStart(ctx context.Context, pane string, typed *typedStart) 
 // error: in its data (screen) for a coded one, else after its text.
 func (n *Node) startTabFailed(ctx context.Context, launch host.Launcher, created *host.Created, ws, id string, err error) error {
 	pane := created.Pane.String()
-	shown, _ := n.readPane(ctx, pane, "recent-unwrapped", 30)
+	shown, _ := n.readPane(ctx, pane, "recent-unwrapped", 2*screen.DialogLines)
 	tail := lastLines(shown, 12)
 	keep := func(e error) error {
 		if adoptedPane(ctx) != nil { // the user's own pane ("Run Agent Here"): theirs to keep, never closed later
@@ -571,7 +634,10 @@ func (n *Node) startTabFailed(ctx context.Context, launch host.Launcher, created
 	case rpcCode(err) == proto.CodeShellWaiting:
 		return keep(err)
 	case errors.As(err, &stalled):
-		return keep(refusal(proto.CodeAgentStartStalled, fmt.Sprintf("%v\n%s", err, tail), map[string]any{"screen": tail}))
+		// The whole screen, as a dialog is read (screen.DialogLines): whoever remedies the start reads what stopped it
+		// (an unrecognized dialog's question and every choice), not only its last rows.
+		whole := stalledScreen(shown)
+		return keep(refusal(proto.CodeAgentStartStalled, fmt.Sprintf("%v\n%s", err, whole), map[string]any{"screen": whole}))
 	case errors.As(err, &rejected):
 		n.closeNewTab(ctx, launch, created, ws)
 		return refusal(proto.CodeStartLineRejected, fmt.Sprintf("%v, twice; the tab is closed\n%s", err, tail),
@@ -582,6 +648,19 @@ func (n *Node) startTabFailed(ctx context.Context, launch host.Launcher, created
 		return err
 	}
 	return fmt.Errorf("%w\n%s", err, tail)
+}
+
+// stalledScreen is the last screen.DialogLines rows of a stalled start's pane, the blank rows under what it drew left
+// out (a tall pane's fresh screen is mostly blank rows below a dialog drawn from its top).
+func stalledScreen(shown string) string {
+	lines := strings.Split(strings.TrimRight(shown, "\n"), "\n")
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) > screen.DialogLines {
+		lines = lines[len(lines)-screen.DialogLines:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // checkStart validates a start's arguments and returns the directory (~ expanded, home when empty) and launcher.
@@ -669,21 +748,27 @@ func (n *Node) workspaceFor(ctx context.Context, launch host.Launcher, cwd strin
 		startErr = n.ensureHerdr(ctx, "start or resume a session") // herdrstart.go
 	}
 	wss, err := launch.Spaces(ctx)
+	if _, orca := launch.(*orcaHost); orca && err != nil && orcaUnreachable(err) {
+		return "", orcaMissing(err) // Orca's words, not herdr's (orcaengine.go)
+	}
 	if err != nil {
 		// Nothing was started or typed: say so, and what to do, instead of herdr's own words (the app showed
 		// "herdr workspace list: exec: \"herdr\": executable file not found").
-		name := n.defaultEngineName()
+		// The hub words it in the reader's language by its engine and reason (apierr's engineMissingKeys, #17057).
+		name, kind := n.defaultEngineName(), n.defaultKind()
 		if k := n.startKind(ctx); proto.EngineNames[k] != "" && k != n.defaultKind() {
-			name = proto.EngineNames[k] // a start that named its host
+			name, kind = proto.EngineNames[k], k // a start that named its host
 		}
-		msg := fmt.Sprintf("这台电脑上的 %s 没在运行（或没装），不能在这里新开或接着会话，这次没有发送。"+
-			"要从手机接着电脑上开着的会话，在那边继续；要从手机新开，先在这台电脑上装好并打开 %s。", name, name)
+		reason := engineUnavailable
 		if startErr != nil && !errors.Is(startErr, errHerdrNotInstalled) {
-			msg = fmt.Sprintf("这台电脑上的 %s 没在运行，自动启动也没成功，不能在这里新开或接着会话，这次没有发送。"+
-				"请在这台电脑上打开 %s 再试；原因见详情。", name, name)
+			reason = engineStartFailed
 		}
-		return "", refusal(engineMissing, msg,
-			map[string]any{"detail": herdrMissingDetail(err, startErr)})
+		detail := name + ": " + err.Error()
+		if _, ok := launch.(*herdrHost); ok {
+			detail = herdrMissingDetail(err, startErr)
+		}
+		return "", refusal(engineMissing, i18n.T(i18n.From(ctx), "rpc-errors.engine_"+reason, i18n.Args{"engine": name}),
+			map[string]any{"detail": detail, "engine": kind, "reason": reason})
 	}
 	base := filepath.Base(cwd)
 	for _, w := range wss {
@@ -695,11 +780,18 @@ func (n *Node) workspaceFor(ctx context.Context, launch host.Launcher, cwd strin
 }
 
 func (n *Node) sessionFor(id string, a host.Agent) *proto.Session {
+	title := a.Title
+	if isStartScriptTitle(title) {
+		title = ""
+	}
 	s := &proto.Session{
 		SessionID: id, Cwd: a.Cwd, Status: a.AgentStatus, PaneID: a.PaneID, TabID: a.TabID,
-		WorkspaceID: a.WorkspaceID, AgentName: a.Name, Title: a.Title, Agent: a.Agent, UpdatedAt: time.Now().UTC(), // just started
+		WorkspaceID: a.WorkspaceID, AgentName: a.Name, Title: title, Agent: a.Agent, UpdatedAt: time.Now().UTC(), // just started
 	}
 	_ = n.refreshHosts(context.Background())
+	if a.Agent == agyAgent {
+		n.agyPaneTitle(s, n.agyConversation(id, a.PaneID))
+	}
 	n.placeIn(s, a)
 	n.decorate(s)
 	s.PermissionMode, s.Effort = n.modesOf(id)
@@ -720,6 +812,10 @@ func (n *Node) close(ctx context.Context, id string) error {
 // automatic one (idle, task_completed: #10355), which is recorded only once the close went through, as an automatic
 // stop's is (retire.go).
 func (n *Node) closeWithCause(ctx context.Context, id string, cause proto.StopCause) (err error) {
+	return n.closeWithCauseChecked(ctx, id, cause, nil)
+}
+
+func (n *Node) closeWithCauseChecked(ctx context.Context, id string, cause proto.StopCause, before func() error) (err error) {
 	if err := n.switchingRefusal(id); err != nil { // a launcher switch, maybe on the last connection's Node
 		return err
 	}
@@ -737,20 +833,47 @@ func (n *Node) closeWithCause(ctx context.Context, id string, cause proto.StopCa
 		}()
 	}
 	a, ok := n.agent(id)
-	if !ok {
-		if st, mine := n.state.get(id); mine {
-			return n.closeAfterExit(ctx, id, st)
+	st, mine := n.state.get(id)
+	if host.ParsePane(st.Pane).Kind == host.Orca {
+		if h := n.hosts.Get(host.Orca); h != nil {
+			// An Agent that just quit can still be in the poll cache. Do not
+			// send interrupts to its shell or close it as a live Agent.
+			if err := n.refreshHosts(ctx, h); err != nil {
+				return err
+			}
+			a, ok = n.agent(id)
+			st, mine = n.state.get(id)
 		}
-		return fmt.Errorf("这个 Agent 不在这台电脑的终端里运行，没法从手机关闭")
+	}
+	if !ok {
+		if mine {
+			return n.closeAfterExit(ctx, id, st, before)
+		}
+		return failure("close_not_in_terminal", i18n.T(i18n.From(ctx), "rpc-errors.close_not_in_terminal"), nil)
 	}
 	org, ref, err := paneCap[host.Organizer](n, a.PaneID) // a host that cannot close it is not interrupted first
 	if err != nil {
 		return err
 	}
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
 	_ = n.sendKeys(ctx, a.PaneID, "ctrl+c")
 	time.Sleep(200 * time.Millisecond)
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
 	_ = n.sendKeys(ctx, a.PaneID, "ctrl+c")
 	time.Sleep(500 * time.Millisecond)
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
 	return org.Close(ctx, ref, a.WorkspaceID, a.TabID)
 }
 

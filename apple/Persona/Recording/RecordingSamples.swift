@@ -212,7 +212,8 @@ enum RecordingSamples {
     /// `room-listening` in hub transcription (#3862 phase 5), whose canned audio also goes up the audio socket, so a UI
     /// test checks the uplink against the mock hub's hub mode with no microphone; `room-hub-highlights`: `room-hub`
     /// started with the highlights too, as a hub with both starts it (the Highlights card, the hub's lines on the Full
-    /// Transcript page); `minutes` / `pending`: a finished meeting whose page opens (its minutes from the hub, or still
+    /// Transcript page); `room-hub-phone-cannot` / `room-phone-cannot`: `room-hub` / `room-listening` on an iPhone that
+    /// can't transcribe the meeting's language (#13385), with no lines of its own; `minutes` / `pending`: a finished meeting whose page opens (its minutes from the hub, or still
     /// being written); `overview`: a longer finished meeting whose page opens, for the summary card (#6563,
     /// `installOverviewMeeting`); `room-highlights`: `room-taking-part` started with the highlights too (phase 2b),
     /// 24:20 in, with a line in each of fourteen minutes (`highlightsLines`), so the hub's highlights and the transcript
@@ -230,7 +231,8 @@ enum RecordingSamples {
         // meetings it shows.
         let untitled = ["untitled", "untitled-page", "untitled-live"].contains(mode)
         // `after-…` (#8731 V3): the same made-up meetings, opened after the meeting.
-        let overview = mode == "overview" || mode == "after-overview"
+        // `debates` / `after-debates` (#16728): the five-minute sprint review for disagreements (mock hub `/mock/recording_minutes_debates`).
+        let overview = ["overview", "after-overview", "debates", "after-debates"].contains(mode)
         let others = overview ? [liveMeeting, pastMeeting, untitledMeeting, untitledNote]
             : untitled ? [liveMeeting, pastMeeting, overviewMeeting] : [overviewMeeting, untitledMeeting, untitledNote]
         for id in others where RecordingLibrary.shared.entry(id) != nil { try? RecordingLibrary.shared.remove(id) }
@@ -274,8 +276,12 @@ enum RecordingSamples {
         // one just before the tap (12:34). `room-listening` / `room-taking-part`: the meeting's own room conversation
         // attends instead (#3862), not private; `room-whiteboard` takes part and takes photos; `room-highlights` takes part
         // with the highlights (phase 2b) and its own fourteen lines.
-        let hub = mode == "room-hub" || mode == "room-hub-highlights"
-        let room = ["room-listening", "room-taking-part", "room-whiteboard", "room-talk-held", "room-highlights"].contains(mode) || hub
+        // `room-hub-phone-cannot` / `room-phone-cannot` (#13385): `room-hub` / `room-listening` on an iPhone that can't
+        // transcribe the meeting's language, so it has no lines of its own.
+        let phoneCannot = mode == "room-hub-phone-cannot" || mode == "room-phone-cannot"
+        let hub = mode == "room-hub" || mode == "room-hub-highlights" || mode == "room-hub-phone-cannot"
+        let room = ["room-listening", "room-taking-part", "room-whiteboard", "room-talk-held", "room-highlights",
+                    "room-phone-cannot"].contains(mode) || hub
         let photos = mode == "room-whiteboard"
         if ["listening", "taking-part", "answered"].contains(mode) || room {
             if room {
@@ -283,7 +289,7 @@ enum RecordingSamples {
                 // with the highlights, phase 2b, its highlights). `room-hub`: listening in, transcribed by the hub (phase
                 // 5): its uploads ask for `hub`, and once the hub's `200` says so the canned audio (`startTalkAudio`) goes
                 // up the audio socket.
-                live.attendance = RecordingAttendance.room(mode == "room-listening" || hub ? .listener : .participant, private: false,
+                live.attendance = RecordingAttendance.room(["room-listening", "room-phone-cannot"].contains(mode) || hub ? .listener : .participant, private: false,
                                                            photos: photos, liveView: true,
                                                            highlights: highlighted || mode == "room-hub-highlights",
                                                            transcription: hub ? .hub : nil)
@@ -295,12 +301,14 @@ enum RecordingSamples {
                 RecordingSentence(start: 741, end: 748, text: "上周定的长录音测试谁负责？"),
             ]))
             if highlighted { live.segments = highlightsSegments }
+            if phoneCannot { live.segments = live.segments.map { RecordingSegment(index: $0.index, start: $0.start, duration: $0.duration) } }
         }
         if photos {
             // An earlier run's photos not sent yet stay behind: this run's whiteboard is the only one.
             try? FileManager.default.removeItem(at: RecordingLibrary.shared.folder(liveMeeting).appending(path: MeetingPhotos.listFile))
         }
         try? RecordingLibrary.shared.save(live)
+        if phoneCannot { RecordingTranscription.shared.showSampleCannot(liveMeeting, .unsupportedLanguage) }
         // `stopped` (#9108): `recording` whose Live Activity went stale, as the island draws one after iOS ended the app.
         if mode == "stopped" { RecordingActivity.sampleStale = true }
         RecordingCapture.shared.showSample(liveMeeting, elapsed: elapsed, paused: mode == "paused", interrupted: mode == "interrupted")

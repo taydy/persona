@@ -3,10 +3,12 @@ package assistant
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/prompts"
 	"github.com/nwverse/persona/server/internal/proto"
 )
@@ -113,6 +115,176 @@ func TestTaskPlanRequiresABrief(t *testing.T) {
 	}
 }
 
+func TestTaskBriefContractAcrossTodoModes(t *testing.T) {
+	t.Run("memory", func(t *testing.T) { testTaskBriefContractAcrossTodoModes(t, nil) })
+	t.Run("postgres", func(t *testing.T) { testTaskBriefContractAcrossTodoModes(t, todoTestDB(t)) })
+}
+
+func testTaskBriefContractAcrossTodoModes(t *testing.T, store Store) {
+	t.Helper()
+	s, _, _ := briefServiceOn(t, store, "prepare the weekly report")
+	ctx := t.Context()
+	plan, failed := tool(t, s, "task_plan", briefTask(map[string]any{
+		"goal": "Prepare the weekly report", "done_when": []string{"A draft report is available"},
+		"work_mode": "coordinate", "completion_mode": "draft",
+	}))
+	if failed {
+		t.Fatal(plan)
+	}
+	waitFor(t, "the agent", func() bool { return len(onlyTodo(s).Agents) == 1 })
+	todo := onlyTodo(s)
+	brief, ok := s.briefOfTodo(todo.ID)
+	if !ok {
+		t.Fatal("missing brief")
+	}
+	assertBriefFields := func(brief TaskBrief, fields ...string) {
+		t.Helper()
+		raw, err := json.Marshal(brief)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range fields {
+			if !strings.Contains(string(raw), field) {
+				t.Fatalf("brief missing %s: %s", field, raw)
+			}
+		}
+	}
+	assertBriefFields(brief, `"work_mode":"coordinate"`, `"completion_mode":"draft"`,
+		`"work_mode_now":"coordinate"`, `"completion_mode_now":"draft"`)
+
+	setTodosV2Enabled(t, s, true)
+	if _, err := runJSON(t, s, "conv1", "task_scope", map[string]any{
+		"todo_id": todo.ID, "change": "Make the report ready for review", "why": "The draft is complete",
+		"work_mode": "research", "completion_mode": "ready", "expect_minutes": 50,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	changed, _ := s.briefOfTodo(todo.ID)
+	if !changed.scopeRevision().After(brief.scopeRevision()) || changed.ExpectNow != 50 {
+		t.Fatalf("the combined contract and estimate change did not advance the scope: %+v", changed)
+	}
+	event := changed.Log[len(changed.Log)-1]
+	if event.Why != "The draft is complete" || event.Kind != briefEventScope {
+		t.Fatalf("scope change was not audited: %+v", event)
+	}
+
+	setTodosV2Enabled(t, s, false)
+	for _, on := range []bool{false, true} {
+		setTodosV2Enabled(t, s, on)
+		if s.settings(ctx).todosV2On() != on {
+			t.Fatalf("todos_v2 did not switch to %t", on)
+		}
+		raw, err := s.todoView(ctx, todo.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Todo
+		if err := json.Unmarshal(raw, &got); err != nil || got.Brief == nil {
+			t.Fatalf("todos_v2=%t brief: %s (%v)", on, raw, err)
+		}
+		assertBriefFields(*got.Brief, `"work_mode":"coordinate"`, `"completion_mode":"draft"`,
+			`"work_mode_now":"research"`, `"completion_mode_now":"ready"`,
+			`"work_mode":"research"`, `"completion_mode":"ready"`)
+		if got.Brief.ID != brief.ID || !slices.Equal(got.Brief.Criteria, brief.Criteria) {
+			t.Fatalf("todos_v2=%t changed the brief or criteria: %+v", on, got.Brief)
+		}
+	}
+	if _, err := runJSON(t, s, "conv1", "task_scope", map[string]any{
+		"todo_id": todo.ID, "change": "Use the workspace delivery policy", "why": "Review is complete",
+		"completion_mode": "inherit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := s.briefOfTodo(todo.ID)
+	last := after.Log[len(after.Log)-1]
+	if after.WorkModeNow != assistantwire.WorkModeResearch || after.CompletionModeNow != assistantwire.CompletionModeInherit ||
+		last.WorkMode != "" || last.CompletionMode != assistantwire.CompletionModeInherit {
+		t.Fatalf("completion-only edit changed the work mode or recorded the wrong event: %+v", after)
+	}
+	if store != nil {
+		restored, _, _ := briefServiceOn(t, store, "")
+		if err := restored.ensureTodosLoaded(ctx); err != nil {
+			t.Fatal(err)
+		}
+		got, ok := restored.briefOfTodo(todo.ID)
+		if !ok || got.ID != after.ID || got.WorkMode != after.WorkMode || got.CompletionMode != after.CompletionMode ||
+			got.WorkModeNow != after.WorkModeNow || got.CompletionModeNow != after.CompletionModeNow ||
+			len(got.Log) != len(after.Log) || got.Log[len(got.Log)-1].CompletionMode != last.CompletionMode {
+			t.Fatalf("the stored brief did not survive a restart: %+v", got)
+		}
+	}
+}
+
+func TestTaskBriefContractToolValidationAndAdoption(t *testing.T) {
+	s, f, _ := briefService(t, "prepare the weekly report")
+	secretary(f)
+	for field, value := range map[string]string{"work_mode": "code", "completion_mode": ""} {
+		if got, failed := tool(t, s, "task_plan", briefTask(map[string]any{field: value})); !failed || !strings.Contains(got, field) {
+			t.Fatalf("task_plan %s = %s", field, got)
+		}
+		if got, failed := tool(t, s, "agent_supervise", map[string]any{
+			"machine": "box", "session_id": "sec00001", field: value,
+		}); !failed || !strings.Contains(got, field) {
+			t.Fatalf("agent_supervise %s = %s", field, got)
+		}
+	}
+	if todo := onlyTodo(s); todo.ID != "" {
+		t.Fatalf("an invalid contract made a to-do: %+v", todo)
+	}
+	if got, failed := tool(t, s, "agent_supervise", map[string]any{
+		"machine": "box", "session_id": "sec00001", "work_mode": "coordinate", "completion_mode": "verified",
+	}); failed {
+		t.Fatal(got)
+	}
+	todo := onlyTodo(s)
+	brief, ok := s.briefOfTodo(todo.ID)
+	if !ok || brief.WorkMode != assistantwire.WorkModeCoordinate || brief.WorkModeNow != brief.WorkMode ||
+		brief.CompletionMode != assistantwire.CompletionModeVerified || brief.CompletionModeNow != brief.CompletionMode {
+		t.Fatalf("adopted brief = %+v", brief)
+	}
+	if got, failed := tool(t, s, "task_scope", map[string]any{
+		"todo_id": todo.ID, "change": "Revisit the mode", "why": "The scope changed", "completion_mode": "released",
+	}); !failed || !strings.Contains(got, "completion_mode") {
+		t.Fatalf("task_scope with an invalid mode: %s", got)
+	}
+	if got, _ := s.briefOfTodo(todo.ID); len(got.Log) != len(brief.Log) || got.CompletionModeNow != brief.CompletionModeNow {
+		t.Fatalf("invalid scope change was recorded: %+v", got)
+	}
+}
+
+func TestScopeContractKeepsOwnerApproval(t *testing.T) {
+	s, f, asked := briefService(t, "Prepare a draft PR. Do not merge it.")
+	if got, failed := tool(t, s, "task_plan", briefTask(map[string]any{
+		"work_mode": "coordinate", "completion_mode": "draft",
+		"goal": "Prepare a draft PR", "done_when": []string{"A draft PR is available"},
+	})); failed {
+		t.Fatal(got)
+	}
+	waitFor(t, "the agent", func() bool { return len(onlyTodo(s).Agents) == 1 })
+	todo := onlyTodo(s)
+	before, _ := s.briefOfTodo(todo.ID)
+	args := map[string]any{
+		"todo_id": todo.ID, "change": "Require landed delivery", "why": "The review is complete",
+		"work_mode": "execute", "completion_mode": "landed", "expect_minutes": 40,
+	}
+	if _, err := runJSON(t, s, "conv1", "task_scope", args); err == nil || !strings.Contains(err.Error(), "only the owner may allow (merge") {
+		t.Fatalf("scope change ignored the owner's restriction: %v", err)
+	}
+	if got, _ := s.briefOfTodo(todo.ID); len(got.Log) != len(before.Log) || got.CompletionModeNow != before.CompletionModeNow {
+		t.Fatalf("refused scope change was applied: %+v", got)
+	}
+	f.setItems(proto.Item{ID: "m2", Seq: 2, TS: asked.Add(time.Hour), Role: "user", Kind: proto.KindText, Text: "Yes, merge the PR now."})
+	if got, failed := tool(t, s, "task_scope", args); failed {
+		t.Fatal(got)
+	}
+	after, _ := s.briefOfTodo(todo.ID)
+	event := after.Log[len(after.Log)-1]
+	if event.Approval == nil || event.Approval.MessageID != "m2" || event.Kind != briefEventScope ||
+		after.WorkModeNow != assistantwire.WorkModeExecute || after.CompletionModeNow != assistantwire.CompletionModeLanded {
+		t.Fatalf("approved scope change was not recorded: %+v", after)
+	}
+}
+
 // The plan card carries the brief before anything starts: the owner's words as the hub read them, the criteria and the
 // time; a brief the tool call supplies itself is dropped.
 func TestPlanCardCarriesTheBrief(t *testing.T) {
@@ -165,7 +337,7 @@ func TestRiskyTakeOverScopeAbortsAdoption(t *testing.T) {
 	)
 	res, err := runJSON(t, s, "conv1", "agent_supervise", map[string]any{
 		"machine": "box", "session_id": "agent-old-1",
-		"done_when": []string{"PR merged to main", "deployed to production and checked"}, "expect_minutes": 5,
+		"done_when": []string{"PR merged to main", "send the release note to the customers"}, "expect_minutes": 5,
 	})
 	if err == nil || !strings.Contains(err.Error(), "only the owner may allow") {
 		t.Fatalf("risky takeover was not refused: %s (%v)", res, err)
@@ -422,22 +594,28 @@ func TestTaskScopeIsLogged(t *testing.T) {
 	if v := onlyTodo(s).Supervision; strings.Join(v.DoneWhen, "|") != "PR merged to main" || v.ExpectMinutes != 90 {
 		t.Fatalf("ledger = %+v", v)
 	}
-	// Adding a deploy: not the supervisor's to add after a supervision message.
-	risky := map[string]any{"todo_id": todo.ID, "change": "also deploy it to production", "why": "it is ready",
+	// Adding a deploy of work the owner ordered: the supervisor's own to add (decision rights), logged without asking.
+	deploy := map[string]any{"todo_id": todo.ID, "change": "also deploy it to production", "why": "it is ready",
 		"done_when": []string{"PR merged to main", "deployed to production and checked"}}
+	if got, isErr := tool(t, s, "task_scope", deploy); isErr || !strings.Contains(got, "Logged") {
+		t.Fatalf("a deploy added by the supervisor was refused: %s", got)
+	}
+	// Speaking for the owner to other people: only the owner's, refused after a supervision message.
+	risky := map[string]any{"todo_id": todo.ID, "change": "also send the release note to the customers", "why": "it is ready",
+		"done_when": []string{"PR merged to main", "deployed to production and checked", "send the release note to the customers"}}
 	if got, isErr := tool(t, s, "task_scope", risky); !isErr || !strings.Contains(got, "only the owner may allow") || !strings.Contains(got, "ask_user") {
 		t.Fatalf("a risky change after a supervision message: %s", got)
 	}
-	if b, _ := s.briefOfTodo(todo.ID); len(b.Log) != 2 || len(b.Criteria) != 1 {
+	if b, _ := s.briefOfTodo(todo.ID); len(b.Log) != 3 || len(b.Criteria) != 2 {
 		t.Fatalf("the refused change was applied: %+v", b)
 	}
 	// The owner says yes: the turn their message starts may add the step, and the message stays on the entry.
-	f.setItems(supervision, proto.Item{ID: "m3", Seq: 3, TS: asked.Add(2 * time.Hour), Role: "user", Kind: proto.KindText, Text: "yes, deploy it to production too"})
+	f.setItems(supervision, proto.Item{ID: "m3", Seq: 3, TS: asked.Add(2 * time.Hour), Role: "user", Kind: proto.KindText, Text: "yes, send the release note to the customers too"})
 	if got, isErr := tool(t, s, "task_scope", risky); isErr {
 		t.Fatalf("the approved change: %s", got)
 	}
 	b, _ = s.briefOfTodo(todo.ID)
-	if e := b.Log[len(b.Log)-1]; e.Approval == nil || e.Approval.Text != "yes, deploy it to production too" || e.Approval.MessageID != "m3" {
+	if e := b.Log[len(b.Log)-1]; e.Approval == nil || e.Approval.Text != "yes, send the release note to the customers too" || e.Approval.MessageID != "m3" {
 		t.Fatalf("approval = %+v", e)
 	}
 	// Another conversation is not its supervisor.
@@ -450,7 +628,7 @@ func TestTaskScopeIsLogged(t *testing.T) {
 	now := time.Now()
 	open, done := s.briefDigest(context.Background(), now, s.briefDigestSince(context.Background(), now), time.UTC)
 	if len(done) != 0 || len(open) != 1 || open[0].Words != "please fix the login crash before Friday" || open[0].Date != "2026-11-03" ||
-		len(open[0].Scope) != 2 || open[0].Scope[0] != "the landscape test is no longer required" {
+		len(open[0].Scope) != 3 || open[0].Scope[0] != "the landscape test is no longer required" {
 		t.Fatalf("digest = %+v / %+v", open, done)
 	}
 	s.briefDigestTold(context.Background(), now)
@@ -478,7 +656,7 @@ func TestAgentSuperviseRescopesThroughTheLog(t *testing.T) {
 	// A turn the owner did not start: a risky criterion is refused, a plain one is logged.
 	f.setItems(proto.Item{ID: "m2", Role: "user", Kind: proto.KindText, TS: time.Now(),
 		Text: prompts.RenderSupervise(prompts.Supervise{Entries: []prompts.SuperviseEntry{{ID: todo.ID, Title: todo.Title, Kind: sigStalled}}})})
-	if got, isErr := tool(t, s, "agent_supervise", args("the table link is posted", "released to TestFlight")); !isErr || !strings.Contains(got, "only the owner may allow") {
+	if got, isErr := tool(t, s, "agent_supervise", args("the table link is posted", "send the table to the whole team")); !isErr || !strings.Contains(got, "only the owner may allow") {
 		t.Fatalf("agent_supervise with a risky criterion: %s", got)
 	}
 	if got, isErr := tool(t, s, "agent_supervise", args("the table link is posted", "last week's column is there")); isErr {
@@ -643,7 +821,7 @@ func TestContinuationUsesAuthorizedScope(t *testing.T) {
 	fresh, _ := f.starts[0]["prompt"].(string)
 	f.mu.Unlock()
 	plan := &TaskPlan{ID: "waiting-continuation", Conversation: "conv1", State: planOpen, Tasks: []PlanTask{
-		{Title: "Continue task", Prompt: "Continue the earlier work", Machine: "box", Continues: todo.ID, ContinuesWhy: "The earlier Agent stopped"},
+		{Title: "Continue task", Prompt: "Continue the earlier work", Machine: "box", Cwd: "/code/app", Continues: todo.ID, ContinuesWhy: "The earlier Agent stopped"},
 	}}
 	ctx := context.Background()
 	if err := s.planBriefs(ctx, "", plan.Conversation, plan.Tasks); err != nil {
@@ -716,7 +894,73 @@ func TestContinuationSurvivesEstimateUpdate(t *testing.T) {
 	if failed || !strings.Contains(got, "scope_revision: "+rev.Format(time.RFC3339Nano)) {
 		t.Fatalf("todo_get: %s", got)
 	}
-	if _, err = s.applyScope(t.Context(), todo, scopeChange{By: "conv1", Change: "Merge the release", DoneWhen: []string{"Merge the release"}, Expect: 42}); err == nil {
-		t.Fatal("adding a risky criterion needs owner approval")
+	if _, err = s.applyScope(t.Context(), todo, scopeChange{By: "conv1", Change: "Send the release note to the customers", DoneWhen: []string{"Send the release note to the customers"}, Expect: 42}); err == nil {
+		t.Fatal("adding an owner-only criterion needs owner approval")
+	}
+}
+
+// Decision rights (docs/designs/decision-rights-20261123.md): merging and deploying work the owner ordered is the
+// supervisor's, so a scope may add it without asking, unless the owner's words on record hold it off. Speaking for the
+// owner to others is theirs, unless their words on record already say it. A lead hands an owner's step to the main
+// conversation; only the main conversation asks the owner.
+func TestScopeRiskFollowsDecisionRights(t *testing.T) {
+	for _, c := range []struct {
+		text, known string
+		want        string
+	}{
+		{"deploy it to production", "", ""},
+		{"merge the PR and release it", "fix the crash", ""},
+		{"send the release note to the customers", "", "send"},
+		{"send the release note to the customers", "the owner: send the release note to the customers when it ships", ""},
+		{"merge the PR", "do not merge; stop at a PR", "merge"},
+		{"delete the old exports", "", "delete"},
+	} {
+		if got := strings.Join(scopeRisk(c.text, c.known), ","); got != c.want {
+			t.Errorf("scopeRisk(%q, %q) = %q, want %q", c.text, c.known, got, c.want)
+		}
+	}
+	s, _ := newQuietService(t)
+	setSettings(t, s, func(v *Settings) { v.Main, v.Leaders = "conv1", []string{"lead1"} })
+	ctx := context.Background()
+	if got := s.ownerStepRoute(ctx, "conv1"); !strings.Contains(got, "ask_user") {
+		t.Errorf("the main conversation's route: %s", got)
+	}
+	if got := s.ownerStepRoute(ctx, "lead1"); !strings.Contains(got, "main conversation") || strings.Contains(got, "ask_user") {
+		t.Errorf("a lead's route: %s", got)
+	}
+}
+
+// An estimate change is logged as an estimate, which authorizes nothing new, and still reaches the owner in the next
+// digest, as task_scope's reply says (review of #13130). An estimate set through agent_send carries no sentence for
+// the owner and adds no empty line; a lesson learns from either, as a revised estimate also hides an overrun.
+func TestEstimateChangeReachesTheDigestAndLessons(t *testing.T) {
+	s, _, _ := briefService(t, "please fix the login crash before Friday")
+	if got, isErr := tool(t, s, "task_plan", briefTask(nil)); isErr {
+		t.Fatal(got)
+	}
+	waitFor(t, "the agent", func() bool { return len(onlyTodo(s).Agents) == 1 })
+	todo := onlyTodo(s)
+	got, isErr := tool(t, s, "task_scope", map[string]any{"todo_id": todo.ID, "change": "the migration needs another hour",
+		"why": "the backfill is slower than measured", "expect_minutes": 90})
+	if isErr || !strings.Contains(got, "the owner sees it in the next digest") {
+		t.Fatalf("task_scope: %s", got)
+	}
+	b, _ := s.briefOfTodo(todo.ID)
+	if last := b.Log[len(b.Log)-1]; last.Kind != briefEventEstimate || b.ExpectNow != 90 {
+		t.Fatalf("not logged as an estimate: %+v", b)
+	}
+	if _, err := s.rescope(context.Background(), todoNow(s, todo.ID), "conv1", "conv1", "agent_send", nil, 120); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ = s.briefOfTodo(todo.ID); b.ExpectNow != 120 || b.Log[len(b.Log)-1].Kind != briefEventEstimate || b.Log[len(b.Log)-1].Change != "" {
+		t.Fatalf("agent_send's estimate: %+v", b)
+	}
+	now := time.Now()
+	open, _ := s.briefDigest(context.Background(), now, s.briefDigestSince(context.Background(), now), time.UTC)
+	if len(open) != 1 || !slices.Equal(open[0].Scope, []string{"the migration needs another hour"}) {
+		t.Fatalf("digest = %+v", open)
+	}
+	if !lessonFriction(nil, &b, time.Time{}, 0) {
+		t.Fatal("a revised estimate gave a lesson nothing to learn from")
 	}
 }

@@ -8,6 +8,9 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/nwverse/persona/server/internal/assistantwire"
+	"github.com/nwverse/persona/server/internal/db"
 )
 
 // ---- scope changes and the clock (#3822) ----
@@ -33,13 +36,19 @@ const (
 	briefCompletionJudge  = "judge"
 )
 
-// scopeRisk are the risky words text adds that were not part of the work as known: the hub's risky words (riskyWords;
-// the agent's own reversible pushes aside) that text names to be done (not after a negation) and known does not.
+// scopeRisk are the risky words text adds that were not part of the work as known: the words of a step only the owner
+// decides (ownerOnlyWords) that text names to be done (not after a negation) and known does not, and the supervisor's
+// own steps (the rest of riskyWords) that known holds off (names only after a negation).
 func scopeRisk(text, known string) []string {
 	text, known = strings.ToLower(text), strings.ToLower(known)
 	var out []string
 	for _, w := range riskyWordsIn(text) {
-		if containsAny(w, ownWriteWords) || !mentionedToDo(text, w) || mentionedToDo(known, w) {
+		if !mentionedToDo(text, w) || mentionedToDo(known, w) {
+			continue
+		}
+		// A step that is the supervisor's (merge, deploy…) is added freely, unless the owner's words on record hold it
+		// off ("do not merge; stop at a PR"): that is their decision, and only they change it.
+		if !slices.Contains(ownerOnlyWords, w) && !strings.Contains(known, w) {
 			continue
 		}
 		out = append(out, w)
@@ -47,9 +56,76 @@ func scopeRisk(text, known string) []string {
 	return out
 }
 
-// scopeChange is one change to a task's scope, as applyScope takes it. DoneWhen nil keeps the criteria, Expect 0 the
-// expected time. Approval: the owner's message that started the turn making the change, nil when there is none.
+// addedDeliverySteps lets scopeRisk see new merge or deploy obligations even if the change summary names only a mode.
+func (s *Service) addedDeliverySteps(ctx context.Context, before, after assistantwire.CompletionMode) string {
+	if after == "" {
+		return ""
+	}
+	next := s.deliveryGateForMode(ctx, after)
+	if next == deliveryGateOff {
+		return ""
+	}
+	previous := s.deliveryGateForMode(ctx, before)
+	var steps string
+	if before == "" || previous == deliveryGateOff {
+		steps += "\nmerge 合并 合入" // i18n-ignore: input for scopeRisk
+	}
+	if next == deliveryGateLive && (before == "" || previous != deliveryGateLive) {
+		steps += "\ndeploy 部署 上线" // i18n-ignore: input for scopeRisk
+	}
+	return steps
+}
+
+// ownerOnlyWords are the risky words (riskyWords) naming a step only the owner decides (decision rights,
+// docs/designs/decision-rights-20261123.md): speaking for them to other people (3), spending their money (4), deleting
+// what is theirs (5). Merging, pushing, releasing and deploying work the owner ordered belong to the supervisor: a
+// deploy with a backup and an automatic rollback is reversible, so it is not the owner's, and a task's scope may add
+// it without asking anyone.
+var ownerOnlyWords = []string{"发消息", "回复", "评论", "comment", "send", "发送", "提审", "删除", "delete", "购买", "付费", "续费", "充值"} // i18n-ignore: matched
+
+// ownerOnRecord is what the owner already said that bears on task t, for scopeRisk's known text: the decisions the
+// owner made on it and its continuation ancestors (by hand, on a card, in its thread; not an agent's, not one pulled
+// out of a reply) and the standing authorizations they granted (their actions and words). What is on record is not
+// asked again, and the owner is never asked to register it once more.
+func (s *Service) ownerOnRecord(ctx context.Context, t Todo) string {
+	var b strings.Builder
+	if st := s.todoDB(); st != nil {
+		for _, id := range s.continuationTodos(t.ID) {
+			rows, err := st.ListTodoDecisions(ctx, id, false)
+			if err != nil {
+				continue
+			}
+			for _, r := range rows {
+				switch r.Source {
+				case db.DecisionManual, db.DecisionCard, db.DecisionThread:
+					b.WriteString("\n" + r.Question + "\n" + r.Choice)
+				}
+			}
+		}
+	}
+	if all, err := s.standingAuthorizations(ctx); err == nil {
+		for _, a := range all.Authorizations {
+			b.WriteString("\n" + strings.Join(a.Actions, " ") + "\n" + a.Quote)
+		}
+	}
+	return b.String()
+}
+
+// ownerStepRoute is where conversation by takes a step only the owner may allow: a direction lead hands it to the main
+// conversation (which batches what the owner must decide), never to the owner directly; the main conversation asks
+// the owner, with what they said before, what is new and its recommendation.
+func (s *Service) ownerStepRoute(ctx context.Context, by string) string {
+	if s.isMain(ctx, by) {
+		return "Ask the owner (ask_user, or task_review needs_user), with what they said before, what is new and what you " +
+			"recommend, and call task_scope again in the turn their answer starts"
+	}
+	return "Hand it to the main conversation (conversation_send, or task_review needs_user) with the owner's words, what is " +
+		"new and what you recommend; do not ask the owner yourself"
+}
+
+// scopeChange changes the fields it supplies. Approval is the owner's message that started the turn making the change.
 type scopeChange struct {
+	taskContract
 	By, Change, Why string
 	DoneWhen        []string
 	Expect          int
@@ -79,6 +155,10 @@ func (s *Service) applyScope(ctx context.Context, t Todo, c scopeChange) (TaskBr
 	if brief.ID == "" {
 		return TaskBrief{}, fmt.Errorf("task %s has no brief", t.ID)
 	}
+	contract := c.taskContract.changesFrom(brief)
+	if c.WorkMode.Valid() && !brief.workModeDeclared() {
+		contract.WorkMode = c.WorkMode // a declaration also makes an already-effective default explicit
+	}
 	next := brief.Criteria
 	if c.DoneWhen != nil {
 		next = cleanDoneWhen(c.DoneWhen)
@@ -95,25 +175,29 @@ func (s *Service) applyScope(ctx context.Context, t Todo, c scopeChange) (TaskBr
 			dropped = append(dropped, x)
 		}
 	}
-	if len(added)+len(dropped) == 0 && (expect == 0 || expect == brief.ExpectNow) && strings.TrimSpace(c.Change) == "" {
+	criteriaChanged := len(added)+len(dropped) > 0
+	contractChanged := contract != (taskContract{})
+	if !criteriaChanged && !contractChanged && (expect == 0 || expect == brief.ExpectNow) && strings.TrimSpace(c.Change) == "" {
 		return brief, errScopeNothing
 	}
 	known := strings.Join(append(append([]string{brief.Goal, t.Title, brief.Handover}, brief.DoneWhen...), brief.Criteria...), "\n")
 	if brief.Request != nil {
 		known += "\n" + brief.Request.Text
 	}
+	known += s.ownerOnRecord(ctx, t)
 	kind := briefEventScope
 	var risk []string
-	if expect > 0 && c.DoneWhen == nil {
+	if expect > 0 && c.DoneWhen == nil && !contractChanged {
 		// Estimate explanations are audit data and never extend the authorized work.
 		kind = briefEventEstimate
 	} else {
-		risk = scopeRisk(c.Change+"\n"+strings.Join(added, "\n"), known)
+		steps := s.addedDeliverySteps(ctx, brief.CompletionModeNow, contract.CompletionMode)
+		risk = scopeRisk(c.Change+"\n"+strings.Join(added, "\n")+steps, known)
 	}
 	if words := risk; len(words) > 0 && c.Approval == nil {
-		return TaskBrief{}, fmt.Errorf("this change adds a step only the owner may allow (%s): it was not applied. Ask the owner "+
-			"(ask_user, or task_review needs_user with what you recommend), and call task_scope again in the turn their answer starts",
-			strings.Join(words, ", "))
+		return TaskBrief{}, fmt.Errorf("this change adds a step only the owner may allow (%s: speaking for them to others, "+
+			"spending their money or deleting what is theirs), and neither the brief, the owner's request nor their recorded "+
+			"decisions and standing authorizations say it: it was not applied. %s", strings.Join(words, ", "), s.ownerStepRoute(ctx, c.By))
 	}
 	scopes := 0
 	for _, e := range brief.Log {
@@ -128,9 +212,9 @@ func (s *Service) applyScope(ctx context.Context, t Todo, c scopeChange) (TaskBr
 	if expect > 0 && brief.EstimateSourceNow != "" {
 		estimateSource = briefEstimateOverride
 	}
-	ev := BriefEvent{At: time.Now().UTC(), Kind: kind, Todo: t.ID, By: c.By, Change: clip(oneLine(c.Change), 300),
+	ev := BriefEvent{taskContract: contract, At: time.Now().UTC(), Kind: kind, Todo: t.ID, By: c.By, Change: clip(oneLine(c.Change), 300),
 		Why: clip(oneLine(c.Why), 300), Added: added, Dropped: dropped, ExpectMinutes: expect, EstimateSource: estimateSource, eventID: c.eventID}
-	if len(added)+len(dropped) > 0 {
+	if criteriaChanged {
 		ev.DoneWhen = next
 		if ev.DoneWhen == nil {
 			ev.DoneWhen = []string{}
@@ -151,14 +235,23 @@ func (s *Service) applyScope(ctx context.Context, t Todo, c scopeChange) (TaskBr
 	}
 	for _, id := range s.briefTodos(brief.ID) {
 		o, ok := s.todoNow(id)
+		if !ok || o.DoneAt != nil {
+			continue
+		}
+		if ev.WorkMode != "" {
+			s.restage(ctx, id, nil)
+		}
 		// A task with no ledger gets none here: a ledger moves its notices into supervision messages (#4101).
-		if !ok || o.DoneAt != nil || o.Supervision == nil {
+		if o.Supervision == nil {
 			continue
 		}
 		if _, _, err := s.updateSupervision(ctx, id, func(v *Supervision) bool {
 			v.DoneWhen, v.ExpectMinutes = slices.Clone(brief.Criteria), brief.ExpectNow
-			if len(added)+len(dropped) > 0 && (v.State == reviewAccepted || v.State == reviewCancelled) {
-				// The terminal review covered the old criteria, not this new scope (#6880).
+			if criteriaChanged {
+				v.recordAssignments(o.Agents, ev.At)
+			}
+			if (criteriaChanged || contractChanged) && (v.State == reviewAccepted || v.State == reviewCancelled) {
+				// The terminal review covered the old scope (#6880).
 				v.State = ""
 				if v.Round > 0 {
 					v.State = reviewRework
@@ -214,16 +307,22 @@ func (s *Service) rescopeWithEvent(ctx context.Context, t Todo, self, supervisor
 
 // toolTaskScope is the assistant's task_scope: the supervisor of a task changes what it is to do or what done means,
 // as an entry in its brief's log.
-func (s *Service) toolTaskScope(ctx context.Context, self string, args json.RawMessage) (string, error) {
+func (s *Service) toolTaskScope(ctx context.Context, machine, self string, args json.RawMessage) (string, error) {
 	var a struct {
+		taskContractInput
 		TodoID        string    `json:"todo_id"`
 		Change        string    `json:"change"`
 		Why           string    `json:"why"`
 		DoneWhen      *[]string `json:"done_when"`
 		ExpectMinutes int       `json:"expect_minutes"`
+		InboxItem     string    `json:"inbox_item"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("arguments: %v", err)
+	}
+	contract, err := a.validatedContract()
+	if err != nil {
+		return "", err
 	}
 	a.Change, a.Why = strings.TrimSpace(a.Change), strings.TrimSpace(a.Why)
 	if a.Change == "" || a.Why == "" {
@@ -253,7 +352,11 @@ func (s *Service) toolTaskScope(ctx context.Context, self string, args json.RawM
 	if err := s.cardlessOwnerWaitGuard(ctx, t); err != nil {
 		return "", err
 	}
-	c := scopeChange{By: self, Change: a.Change, Why: a.Why, Expect: a.ExpectMinutes}
+	source := PlanTask{InboxItem: a.InboxItem}
+	if err := s.planExistingTaskInbox(ctx, machine, self, &source, t); err != nil {
+		return "", err
+	}
+	c := scopeChange{taskContract: contract, By: self, Change: a.Change, Why: a.Why, Expect: a.ExpectMinutes}
 	if a.DoneWhen != nil {
 		c.DoneWhen = cleanDoneWhen(*a.DoneWhen)
 		if len(c.DoneWhen) == 0 {
@@ -269,6 +372,17 @@ func (s *Service) toolTaskScope(ctx context.Context, self string, args json.RawM
 	}
 	if err != nil {
 		return "", err
+	}
+	if source.InboxItem != "" {
+		var agents []SessionRef
+		for _, a := range t.Agents {
+			if a.ReleasedAt == nil && a.DismissedAt == nil {
+				agents = append(agents, SessionRef{MachineID: a.MachineID, SessionID: a.SessionID})
+			}
+		}
+		if err := s.linkExistingTaskInbox(ctx, self, source, t.ID, t.ID, agents); err != nil {
+			return "", fmt.Errorf("scope updated on task %s, but its Inbox link was not saved: %w", t.ID, err)
+		}
 	}
 	s.clearOverdue(t.ID)
 	var b strings.Builder
@@ -287,6 +401,12 @@ func (s *Service) toolTaskScope(ctx context.Context, self string, args json.RawM
 	}
 	fmt.Fprintf(&b, ". expect_minutes %d; the clock restarts and runs to %s.", brief.ExpectNow,
 		brief.DueAt.In(s.location(ctx)).Format("2006-01-02 15:04"))
+	if contract.WorkMode != "" {
+		fmt.Fprintf(&b, " Effective work_mode is %s.", brief.WorkModeNow)
+	}
+	if contract.CompletionMode != "" {
+		fmt.Fprintf(&b, " Effective completion_mode is %s.", brief.CompletionModeNow)
+	}
 	b.WriteString(" To replace the agent against this scope, pass scope_revision to task_plan with continues. To notify the same live agent, send the change with agent_send.")
 	return b.String(), nil
 }

@@ -29,6 +29,22 @@ class AgentModelPanelTest {
     private fun read(name: String) = ModelList(read = true, list = lists[name])
     private val switching = setOf(AgentModelPanel.LAUNCHER_SWITCH)
 
+    @Test fun desktopEffortComesFromTheSession() {
+        val list = LauncherModels("claude", listOf(AgentModel("opus", "Opus", efforts = listOf("low", "high"), defaultEffort = "high")))
+        fun shown(effort: String?): String {
+            val session = agent.copy(sourceKind = "claude_desktop", model = "opus", paneId = null, effort = effort)
+            val panel = AgentModelPanel.panel(session, launchers, { ModelList(read = true, list = list) }, emptySet())
+            val provider = panel.providers.first()
+            val model = provider.models!!.single()
+            assertTrue(model.sessionEffortOnly)
+            val setup = ModelPanel.rowSetup(provider, model, panel.state, PanelOverride(effort = "low"))
+            return PanelRow("current", PanelRow.Kind.Model, provider, model, setup, current = true).shownEffort
+        }
+        assertEquals("", shown(null))
+        assertEquals("high", shown("high"))
+        assertEquals("auto", shown("auto"))
+    }
+
     @Test fun anotherLauncherIsOffWithoutTheSwitch() {
         val panel = AgentModelPanel.panel(agent, launchers, ::read, emptySet())
         assertEquals(listOf("example", "work", "cx"), panel.providers.map { it.id })
@@ -233,6 +249,21 @@ class AgentModelPanelTest {
         val reading = AgentModelPanel.panel(agent, launchers, { ModelList(loading = true) }, emptySet()).providers.first()
         assertEquals(listOf("claude-opus-5-5"), reading.models?.map { it.id })
         assertTrue(reading.loading)
+    }
+
+    @Test fun aSavedAliasSelectsTheFoldedRowAndSendsNoSecondSwitch() {
+        val folded = AgentModel("claude-opus-5-5", "Opus 5.5", aliases = listOf("opus", "fable"), efforts = listOf("low", "high"))
+        val own = LauncherModels("claude", listOf(folded, AgentModel("sonnet", "Sonnet 4.5")))
+        val saved = agent.copy(model = "opus")
+        val panel = AgentModelPanel.panel(saved, launchers, { name -> if (name == "example") ModelList(read = true, list = own) else read(name) }, emptySet())
+        assertEquals(PanelConfig("example", "claude-opus-5-5", "high"), panel.state.current)
+        assertEquals(listOf("claude-opus-5-5", "sonnet"), panel.providers.first().models?.map { it.id })
+        assertEquals(emptyList<ModeStep>(), AgentModelPanel.pickPlan(saved,
+            PanelConfig("example", "claude-opus-5-5", "high"), { if (it == "example") own else lists[it] }, emptySet()))
+        assertEquals("Opus 5.5", AgentModelPanel.pill(saved, ModelList(read = true, list = own), launchers).setup.model)
+
+        val waiting = saved.copy(pendingSwitch = PendingSwitch("work", "fable"))
+        assertEquals("Opus 5.5", AgentModelPanel.pendingPill(waiting, { ModelList(read = true, list = own) }, launchers, "Default")?.model)
     }
 
     @Test fun switchRefusalsAreTheSwitches() {

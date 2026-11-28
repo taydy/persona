@@ -175,11 +175,12 @@ nonisolated enum NodeMenu {
     enum GitOp: String, CaseIterable, Identifiable, Sendable {
         case pull, push, fetch
         var id: String { rawValue }
-        var title: String {
+        var title: String { String(localized: titleResource) }
+        var titleResource: LocalizedStringResource {
             switch self {
-            case .pull: String(localized: "git.pull", defaultValue: "Pull")
-            case .push: String(localized: "Push")
-            case .fetch: String(localized: "Fetch")
+            case .pull: LocalizedStringResource("git.pull", defaultValue: "Pull")
+            case .push: "Push"
+            case .fetch: "Fetch"
             }
         }
         var symbol: String {
@@ -223,7 +224,8 @@ nonisolated enum NodeMenu {
     enum Direction: String, CaseIterable, Identifiable, Sendable {
         case right, down
         var id: String { rawValue }
-        var title: String { self == .right ? String(localized: "Split Right") : String(localized: "Split Down") }
+        var title: String { String(localized: titleResource) }
+        var titleResource: LocalizedStringResource { self == .right ? "Split Right" : "Split Down" }
         var symbol: String { self == .right ? Theme.Icon.splitRight : Theme.Icon.splitDown }
     }
 
@@ -912,9 +914,6 @@ struct NewWorktreeSheet: View {
                 }
                 .disabled(busy)
                 .themedPage()
-                #if os(macOS)
-                .formStyle(.grouped)
-                #endif
                 .navigationTitle(workspace == nil ? String(localized: "New Worktree") : String(localized: "workspace.newChildTitle", defaultValue: "New Worktree"))
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -939,9 +938,6 @@ struct NewWorktreeSheet: View {
             .task(id: workspaceID) { await prepare() }
             .presentationDetents(workspace == nil ? [.medium, .large] : [.large])
             .interactiveDismissDisabled(busy)
-            #if os(macOS)
-            .macSheet()
-            #endif
         }
     }
 
@@ -1062,11 +1058,7 @@ struct WorktreeInput: View {
 
     var body: some View {
         Group {
-            #if os(macOS)
-            TextField(title, text: $text).textFieldStyle(.roundedBorder).controlSize(.large)
-            #else
             TextField(title, text: $text, axis: multiline ? .vertical : .horizontal).textInputAutocapitalization(.never)
-            #endif
         }
             .font(Theme.Font.code).autocorrectionDisabled()
             .labelsHidden()

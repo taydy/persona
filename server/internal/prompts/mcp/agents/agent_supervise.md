@@ -1,4 +1,4 @@
-Main or a lead: adopt an Agent on no open task, e.g. from agent_start. Creates a to-do/card, supervision signals and task_review closeout, as task_plan does. The background supervisor reviews it unless assistant.main_supervises_own_tasks is on; the answer names the supervisor, and main can still review. Already your task: done_when/expect_minutes change its brief scope (prefer task_scope). Another conversation's task stays theirs; use agent_transfer to move it.{{template "shared/mcp_language" .}}
+{{if eq .Lang "en"}}Main or a direction lead can adopt an Agent with no open task. A leader needs done_when and a non-work-trust computer. Use task_scope to revise an existing task and agent_transfer to transfer supervision.{{else if eq .Lang "ja"}}メイン会話か担当分野のリーダーは、進行中のタスクがない Agent を監督できます。leader には done_when と仕事用以外のコンピュータが必要です。変更には task_scope、移管には agent_transfer を使います。{{else}}主对话或方向主管可收编无进行中任务的 Agent。leader 需 done_when 和非工作信任电脑。改范围用 task_scope，移交用 agent_transfer。{{end}}{{template "shared/mcp_language" .}}
 
 ```json
 {
@@ -18,7 +18,20 @@ Main or a lead: adopt an Agent on no open task, e.g. from agent_start. Creates a
     },
     "title": {
       "type": "string",
-      "description": "{{if eq .Lang "en"}}the task in a short line (English, under 20 characters); empty: the agent's title{{else if eq .Lang "ja"}}短いタスク名（日本語、20文字未満）。空の場合は Agent のタイトルを使います{{else}}Chinese task title, under 20 characters; empty: Agent title{{end}}"
+      "description": "{{if eq .Lang "en"}}English title under 20 characters. Defaults to the Agent title.{{else if eq .Lang "ja"}}短いタスク名（日本語、20文字未満）。空の場合は Agent のタイトルを使います{{else}}Chinese title under 20 chars. Defaults to Agent title.{{end}}"
+    },
+    "role": {
+      "type": "string",
+      "enum": ["leader"]
+    },
+    "work_mode": {
+      "type": "string",
+      "enum": ["execute", "research", "coordinate"],
+      "description": "Default execute."
+    },
+    "completion_mode": {
+      "type": "string",
+      "enum": ["inherit", "draft", "ready", "landed", "verified"]
     },
     "done_when": {
       "type": "array",

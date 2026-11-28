@@ -3,14 +3,15 @@
 // (`handling`), at most one suggestion with its version, and the handling chain. Every field is optional: an item from an
 // older hub has none of them and the inbox draws exactly what it drew before.
 //
-// The pure parts are plain functions so the tests run them without a DOM; `actOnSuggestion` is the one request.
+// The pure parts are plain functions so the tests run them without a DOM. What the first screen's lib/inbox.ts needs
+// (`statusOf`, and `actOnSuggestion`, the one request, with its toast `actedText`) is in lib/inbox-suggestion.ts, re-exported
+// here: the rest is the Inbox page's and the hand-off card's, which load lazily, so it and its words stay off the first screen.
 
 import { t } from "../i18n";
-import { api, ApiError, errorText } from "./api";
-import { itemHeaders } from "./manager-choice";
-import { uuid } from "./format";
 import type { DocChange, InboxItem } from "./inbox";
 import type { Route } from "./router";
+
+export { actedText, actOnSuggestion, statusOf, type SuggestionResult } from "./inbox-suggestion";
 
 // ── wire types ───────────────────────────────────────────
 
@@ -27,18 +28,76 @@ export interface InboxHandling {
   error?: string;
 }
 
-export type SuggestionKind = "reply" | "agent" | "conclusion" | "todo";
+export type SuggestionKind = "reply" | "handoff" | "agent" | "conclusion" | "todo";
+
+export interface InboxMention {
+  id: string;
+  name: string;
+}
+
+const MENTION_FENCE_OPEN_RE = /^```[a-zA-Z0-9_+#-]*\s*$/;
+const MENTION_FENCE_CLOSE_RE = /^```\s*$/;
+const MENTION_CODE_OR_LINK_RE = /`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s<>()]+\)/g;
+const MENTION_WORD_CHAR_RE = /^[\p{L}\p{N}_-]/u;
+
+function mentionPresentInSegment(segment: string, needle: string): boolean {
+  let offset = 0;
+  while (offset <= segment.length - needle.length) {
+    const idx = segment.indexOf(needle, offset);
+    if (idx < 0) return false;
+    const rest = segment.slice(idx + needle.length);
+    if (!rest || !MENTION_WORD_CHAR_RE.test(rest)) return true;
+    offset = idx + 1;
+  }
+  return false;
+}
+
+function mentionPresentInText(text: string, name: string): boolean {
+  if (!text || !name) return false;
+  const needle = `@${name}`;
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  for (let i = 0; i < lines.length; ) {
+    if (MENTION_FENCE_OPEN_RE.test(lines[i])) {
+      let j = i + 1;
+      while (j < lines.length && !MENTION_FENCE_CLOSE_RE.test(lines[j])) j++;
+      if (j < lines.length) {
+        i = j + 1;
+        continue;
+      }
+    }
+    const line = lines[i];
+    MENTION_CODE_OR_LINK_RE.lastIndex = 0;
+    let pos = 0;
+    let match: RegExpExecArray | null;
+    while ((match = MENTION_CODE_OR_LINK_RE.exec(line)) !== null) {
+      if (match.index > pos && mentionPresentInSegment(line.slice(pos, match.index), needle)) return true;
+      pos = match.index + match[0].length;
+    }
+    if (pos < line.length && mentionPresentInSegment(line.slice(pos), needle)) return true;
+    i++;
+  }
+  return false;
+}
+
+export function activeMentions(text: string, mentions?: InboxMention[]): InboxMention[] {
+  if (!text || !mentions?.length) return [];
+  return mentions.filter((m) => m.id && m.name && mentionPresentInText(text, m.name));
+}
 
 export interface InboxSuggestion {
   version: number;
   kind: SuggestionKind | string;
   text: string;
+  mentions?: InboxMention[];
   note?: string;
   /** A to-do suggestion's due: a day (2006-01-02, all day) or a moment (RFC 3339); absent: no due date. */
   due?: string;
   /** Needs judgment: confirming hands it back to the processing conversation instead of running it. */
   handback?: boolean;
   machine_id?: string;
+  /** The existing conversation proposed by a handoff suggestion. */
+  session_id?: string;
+  target_title?: string;
   changes?: DocChange[];
   at?: string;
   /** The conversation the item was handed to that handed it in (Hand to AI); absent for the item's own AI twin. */
@@ -53,6 +112,7 @@ export interface InboxSuggestionAttempt {
   code?: string;
   retry_after?: number;
   text: string;
+  mentions?: InboxMention[];
   at: string;
   conversation?: { machine_id: string; session_id: string };
 }
@@ -101,18 +161,6 @@ export function hasEvent(it: InboxItem): boolean {
   return Boolean(it.chain?.length || it.suggestion || it.recap || it.handling);
 }
 
-/** The section of an open item: the hub's `status` when it sends one, else the triage tier as before (empty = "Needs you"). */
-export function statusOf(it: InboxItem): InboxStatus {
-  switch (it.status) {
-    case "action":
-    case "working":
-    case "fyi":
-    case "noise":
-      return it.status;
-  }
-  return it.tier === "fyi" || it.tier === "noise" ? it.tier : "action";
-}
-
 /** The word an "In progress" row shows for what is going on; undefined when nothing is. */
 export function handlingWord(it: InboxItem): string | undefined {
   switch (it.handling?.state) {
@@ -137,10 +185,12 @@ export function handlingFailed(it: InboxItem): boolean {
 }
 
 /** The suggestion's name: "Suggested reply" / "Suggested Agent" / "Conclusion" (an unknown kind: "Suggestion"). */
-export function suggestionTitle(s: InboxSuggestion): string {
+export function suggestionTitle(s: InboxSuggestion, isMainTarget = false): string {
   switch (s.kind) {
     case "reply":
       return t("lib-inbox-events.kind_reply");
+    case "handoff":
+      return t("lib-inbox-events.kind_handoff", { target: s.target_title || (isMainTarget ? t("sidebar.main_chat") : t("lib-format.untitled_session")) });
     case "agent":
       return t("lib-inbox-events.kind_agent");
     case "conclusion":
@@ -163,6 +213,8 @@ export function suggestionButtons(s: InboxSuggestion): { confirm: string; edit: 
   switch (s.kind) {
     case "reply":
       return { confirm: t("lib-inbox-events.send"), edit: true };
+    case "handoff":
+      return { confirm: t("lib-inbox-events.hand_off"), edit: true };
     case "agent":
       return { confirm: t("lib-inbox-events.start"), edit: true };
     case "conclusion":
@@ -222,55 +274,4 @@ export function itemAtUid(it: InboxItem, uid?: number): InboxItem {
   if (!m || uid === undefined) return it;
   const i = m.uids.indexOf(uid);
   return i < 0 ? it : { ...it, mail: { ...m, uids: m.uids.slice(0, i + 1) } };
-}
-
-// ── acting on the suggestion ─────────────────────────────
-
-export type SuggestionResult =
-  | { ok: true; item: InboxItem }
-  | { ok: false; stale: true; item?: InboxItem; error: string }
-  | { ok: false; stale: false; error: string; code?: string; item?: InboxItem; delivered?: "none" | "unknown"; retryable?: boolean; retry_after?: number };
-
-/**
- * POST /api/v1/inbox/{id}/suggestion: "Confirm" (with the edited text when "Edit" changed it), "Reject", or "Say something" (instruct).
- * The version shown goes with it, so a suggestion that changed since is not run: the hub answers 409 suggestion_stale
- * with the item as it is now.
- */
-export async function actOnSuggestion(path: string, version: number, action: SuggestionAction, text?: string, clientID = uuid(), manager?: string, due?: string): Promise<SuggestionResult> {
-  try {
-    // the item's manager (another than the default: docs/assistant/managers.md "Clients") is named on its request
-    const item = await api<InboxItem>(`${path}/suggestion`, { method: "POST", json: { version, action, text: text || undefined, due: due || undefined, client_id: clientID }, headers: itemHeaders(manager) });
-    return { ok: true, item };
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 409 && e.body?.code === "suggestion_stale") {
-      const item = e.body.item as InboxItem | undefined;
-      return { ok: false, stale: true, item: item?.id ? item : undefined, error: t("lib-inbox-events.stale") };
-    }
-    const body = e instanceof ApiError ? e.body : undefined;
-    const item = body?.item as InboxItem | undefined;
-    return { ok: false, stale: false, error: errorText(e), code: typeof body?.code === "string" ? body.code : undefined,
-      item: item?.id ? item : undefined,
-      delivered: body?.delivered === "none" || body?.delivered === "unknown" ? body.delivered : undefined,
-      retryable: typeof body?.retryable === "boolean" ? body.retryable : undefined,
-      retry_after: typeof body?.retry_after === "number" && body.retry_after > 0 ? body.retry_after : undefined };
-  }
-}
-
-/** The toast after a suggestion was acted on. */
-export function actedText(s: InboxSuggestion, action: SuggestionAction): string {
-  if (action === "reject") return t("lib-inbox-events.rejected");
-  if (action === "instruct") return t("lib-inbox-events.instructed");
-  if (s.handback) return t("lib-inbox-events.handed_back");
-  switch (s.kind) {
-    case "reply":
-      return t("lib-inbox-events.sent");
-    case "agent":
-      return t("lib-inbox-events.agent_started");
-    case "conclusion":
-      return t("lib-inbox-events.filed");
-    case "todo":
-      return t("lib-inbox-events.todo_added");
-    default:
-      return t("lib-inbox-events.handed_back");
-  }
 }

@@ -199,9 +199,14 @@ nonisolated struct APIClient: Sendable {
     var sessionLookup = false
     /// The hub's hello has `sessions_list`: session lists come in pages with a revision that `since` follows.
     var sessionList = false
+    /// The hub's hello has `sessions_page_counts`: a windowed row answer can carry its own aggregates.
+    var sessionsPageCounts = false
     /// The hub's hello has `sessions_hierarchy`: windowed lists and counts send `roots=1`. Older hubs do not, so a
     /// child stays a row of its own. A parent-session page is a separate request and never sends `roots`.
     var sessionsHierarchy = false
+    /// The hub's hello has `sessions_cross_machine_hierarchy`: windowed root lists send `cross_machine_hierarchy=1`
+    /// and child queries send `parent_machine_id` + `parent_session_id` to retrieve cross-machine and archived-parent children.
+    var sessionsCrossMachineHierarchy = false
     /// Execution surface is diagnostic only; authorization still uses the paired hub credential.
     var clientMetadata: RequestClientMetadata = .current
     /// Answers the demo config's requests (DemoHub registers it at launch); every endpoint goes through `request`.
@@ -434,15 +439,23 @@ nonisolated struct APIClient: Sendable {
     /// (`If-None-Match`), else the new bytes and their tag. The fake transport has no headers: the tag rides in the query
     /// as `If-None-Match` and a 304 is an APIError with that status.
     func conditionalGet(_ path: String, query: [String: String], etag: String?) async throws -> (data: Data?, etag: String?) {
+        let answer = try await conditionalGet(path, query: query, etag: etag, header: nil)
+        return (answer.data, answer.etag)
+    }
+
+    /// `conditionalGet`, also giving the answer's `header` (a 304's too): nil when the hub sent none, and always from the
+    /// fake transport, which has no headers.
+    func conditionalGet(_ path: String, query: [String: String], etag: String?,
+                        header: String?) async throws -> (data: Data?, etag: String?, header: String?) {
         if requestRoute != nil {
             let routed = try await preparedForRequest()
-            return try await routed.conditionalGet(path, query: query, etag: etag)
+            return try await routed.conditionalGet(path, query: query, etag: etag, header: header)
         }
         try Self.refuseReplayed(path, query)
         if transport != nil || config.isDemo {
             var q = query
             if let etag { q["If-None-Match"] = etag }
-            do { return (try await request("GET", path, query: q), nil) } catch let e as APIError where e.status == 304 { return (nil, etag) }
+            do { return (try await request("GET", path, query: q), nil, nil) } catch let e as APIError where e.status == 304 { return (nil, etag, nil) }
         }
         var req = URLRequest(url: url(path, query: query), timeoutInterval: 30)
         config.authorize(&req)
@@ -454,8 +467,9 @@ nonisolated struct APIClient: Sendable {
         for (name, value) in routing(path, query) { req.setValue(value, forHTTPHeaderField: name) }
         let (data, resp) = try await Self.uncachedSession.data(for: req) // our own cache: URLSession's would hide the 304
         let http = resp as? HTTPURLResponse
-        if http?.statusCode == 304 { return (nil, etag) }
-        return (try checked(data, resp, requestID: requestID, path: path), http?.value(forHTTPHeaderField: "ETag"))
+        let extra = header.flatMap { http?.value(forHTTPHeaderField: $0) }
+        if http?.statusCode == 304 { return (nil, etag, extra) }
+        return (try checked(data, resp, requestID: requestID, path: path), http?.value(forHTTPHeaderField: "ETag"), extra)
     }
 
     /// A request whose answer is read as it arrives (the realtime voice saying a text, `voiceSpeak`): the response once
@@ -684,6 +698,37 @@ nonisolated struct APIClient: Sendable {
         var machineID: String
         enum CodingKeys: String, CodingKey { case launcher, model, effort, machineID = "machine_id" }
     }
+
+    /// The optimistic-concurrency token for an explicit logical-conversation switch.
+    struct ConversationSwitchState: Decodable, Sendable {
+        var enabled: Bool
+        var epoch: Int
+        var supervisionRequired: Bool?
+        enum CodingKeys: String, CodingKey {
+            case enabled, epoch
+            case supervisionRequired = "supervision_required"
+        }
+    }
+
+    /// One idempotent switch operation. Retrying after an uncertain answer keeps this exact body.
+    struct ConversationSwitchRequest: Encodable, Sendable, Equatable {
+        var operationID: String
+        var expectedEpoch: Int
+        var sourceMachineID: String
+        var machineID: String
+        var launcher: String
+        var model: String?
+        var effort: String?
+        var permissionMode: String?
+        enum CodingKeys: String, CodingKey {
+            case launcher, model, effort
+            case operationID = "operation_id"
+            case expectedEpoch = "expected_epoch"
+            case sourceMachineID = "source_machine_id"
+            case machineID = "machine_id"
+            case permissionMode = "permission_mode"
+        }
+    }
     nonisolated struct SessionsResponse: Decodable, Sendable { var sessions: [Session] }
     struct SessionResponse: Decodable { var session: Session }
     struct ItemsResponse: Decodable, Sendable {
@@ -901,6 +946,19 @@ nonisolated struct APIClient: Sendable {
     func deleteConversationModel(machine: String, conversation: String) async throws {
         try await delete("/api/v1/assistant/conversations/\(conversation.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? conversation)/model")
     }
+    private func conversationSwitchPath(_ conversation: String, suffix: String) -> String {
+        let id = conversation.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? conversation
+        return "/api/v1/assistant/conversations/\(id)/\(suffix)"
+    }
+    /// Reads the current epoch without writing or sending a message to either engine.
+    func conversationSwitchState(machine: String, conversation: String) async throws -> ConversationSwitchState {
+        try await get(conversationSwitchPath(conversation, suffix: "segments"), query: ["machine_id": machine],
+                      as: ConversationSwitchState.self)
+    }
+    /// Submits the explicit operation prepared from `conversationSwitchState`; the response may only acknowledge staging.
+    func switchConversation(machine: String, conversation: String, request body: ConversationSwitchRequest) async throws {
+        _ = try await post(conversationSwitchPath(conversation, suffix: "switch"), body: body, timeout: 60)
+    }
     /// The models the launcher's agent lists in its /model menu (New Agent's model picker). The node starts the CLI to
     /// ask (a few seconds, kept 10 minutes); refresh asks it again. Assistant purpose asks the shell launcher's list,
     /// even when the computer's Agent engine has a provider of the same name.
@@ -1062,6 +1120,14 @@ nonisolated struct APIClient: Sendable {
 
     private func sp(_ k: SessionKey) -> String { "/api/v1/sessions/\(k.machineID)/\(k.sessionID)" }
 
+    /// Answers the shell question a session's start stopped on. The hub keeps the same session and starts it in that tab.
+    func continueStart(_ k: SessionKey, choice: String) async throws -> Session? {
+        struct Body: Encodable { var choice: String }
+        struct Response: Decodable { var session: Session? }
+        let session = try await post(sp(k) + "/start/continue", body: Body(choice: choice), as: Response.self).session
+        return session.map { stamp($0) }
+    }
+
     /// Genuine user-input identities and full-history ordinals, without loading transcript bodies.
     func userInputIndex(_ k: SessionKey) async throws -> ChatUserInputIndex {
         let index = try await getDecodedOffMain(sp(k) + "/items", query: ["user_inputs": "1", "lazy_images": "1"], as: ChatUserInputIndex.self)
@@ -1069,12 +1135,18 @@ nonisolated struct APIClient: Sendable {
         return index
     }
 
+    /// Tells the hub's REST item endpoints that the iOS app renders out-of-band `tool_views` inline in chats.
+    private var toolViewsHeaders: [String: String] {
+        let iOSApp = RequestClientMetadata.Platform.iOS.rawValue + "-" + RequestClientMetadata.Surface.app.rawValue
+        return clientMetadata.platform == iOSApp ? ["X-Persona-Features": LiveConnection.toolViewsFeature] : [:]
+    }
+
     /// A page of history going back `turns` whole exchanges (user prompt + answer) before beforeSeq (nil: the latest
     /// page, with no before_seq at all: an empty one reached runtimes as 0, which some refuse).
     func items(_ k: SessionKey, beforeSeq: Int?, turns: Int = 2) async throws -> ItemsResponse {
         var query = ["turns": String(turns), "limit": "80", "lazy_images": "1", "fold_work": "1"]
         if let beforeSeq { query["before_seq"] = String(beforeSeq) }
-        let data = try await request("GET", sp(k) + "/items", query: query)
+        let data = try await request("GET", sp(k) + "/items", query: query, extraHeaders: toolViewsHeaders)
         // Images come without their bytes (`image(ref:)` fetches one when it is shown); a page is still worth
         // decoding off the main thread, which called us.
         return try await Task.detached(priority: .userInitiated) { try JSON.decoder.decode(ItemsResponse.self, from: data) }.value
@@ -1085,7 +1157,8 @@ nonisolated struct APIClient: Sendable {
     func itemRange(_ k: SessionKey, from: Int, through: Int) async throws -> [Item] {
         struct Range: Decodable, Sendable { var items: [Item] }
         let data = try await request("GET", sp(k) + "/items",
-                                     query: ["from_seq": String(from), "through_seq": String(through), "lazy_images": "1"])
+                                     query: ["from_seq": String(from), "through_seq": String(through), "lazy_images": "1"],
+                                     extraHeaders: toolViewsHeaders)
         let page = try await Task.detached(priority: .userInitiated) { try JSON.decoder.decode(Range.self, from: data) }.value
         return page.items
     }
@@ -1098,7 +1171,8 @@ nonisolated struct APIClient: Sendable {
         var from = fold.seq
         for _ in 0..<100 {
             let data = try await request("GET", sp(k) + "/items",
-                                         query: ["from_seq": String(from), "through_seq": String(through), "lazy_images": "1"])
+                                         query: ["from_seq": String(from), "through_seq": String(through), "lazy_images": "1"],
+                                         extraHeaders: toolViewsHeaders)
             let page = try await Task.detached(priority: .userInitiated) { try JSON.decoder.decode(Range.self, from: data) }.value
             out += page.items
             guard page.more == true, let last = page.items.last else { break }
@@ -1176,7 +1250,8 @@ nonisolated struct APIClient: Sendable {
 
     /// Everything after `afterSeq` (background sync of a session the app has not opened).
     func items(_ k: SessionKey, afterSeq: Int) async throws -> NewerResponse {
-        let data = try await request("GET", sp(k) + "/items", query: ["after_seq": String(afterSeq), "lazy_images": "1"])
+        let data = try await request("GET", sp(k) + "/items", query: ["after_seq": String(afterSeq), "lazy_images": "1"],
+                                     extraHeaders: toolViewsHeaders)
         return try await Task.detached(priority: .utility) { try JSON.decoder.decode(NewerResponse.self, from: data) }.value
     }
 
@@ -1197,20 +1272,21 @@ nonisolated struct APIClient: Sendable {
         var images: [ImagePayload]?
         var launcher: String?
         var model: String?
-        var clientMsgID: String?
+        var clientMsgID: String
         var clearDraft: String?
         var todoID: String?
         var via: MessageVia?
         var waitForEffort: Bool?
         var approvalReplyTo: String?
+        var approvalReplyCreatedAt: String?
         enum CodingKeys: String, CodingKey {
             case text, images, launcher, model, via, clientMsgID = "client_msg_id", clearDraft = "clear_draft", todoID = "todo_id"
-            case waitForEffort = "wait_for_effort", approvalReplyTo = "approval_reply_to"
+            case waitForEffort = "wait_for_effort", approvalReplyTo = "approval_reply_to", approvalReplyCreatedAt = "approval_reply_created_at"
         }
     }
     /// launcher / model switch what a headless (assistant) conversation runs on from this message on. clientMsgID
-    /// stays the same on a retry (the node types it once); clearDraft is the computer's draft the user agreed to
-    /// clear first.
+    /// is required and stays the same on a retry (the node types it once; runtime sessions reject sends without one
+    /// with `codex_send_guard`); clearDraft is the computer's draft the user agreed to clear first.
     /// opID: the message's op id (the outbox passes its id, the same as clientMsgID: docs/protocol/protocol.md「Operation receipts」).
     /// via: how the app sent it when not typed in the app itself (Siri, the share sheet).
     /// Returns whether the message waits behind a question on the computer (`waits_on_computer`, #5890): a Claude
@@ -1218,7 +1294,7 @@ nonisolated struct APIClient: Sendable {
     /// (the composer and the outbox flush) tells the user; the other callers drop it.
     @discardableResult
     func send(_ k: SessionKey, text: String, images: [ImagePayload] = [], launcher: String? = nil, model: String? = nil,
-              clientMsgID: String? = nil, clearDraft: String? = nil, todoID: String? = nil, via: MessageVia? = nil, opID: UUID? = nil) async throws -> Bool {
+              clientMsgID: String, clearDraft: String? = nil, todoID: String? = nil, via: MessageVia? = nil, opID: UUID? = nil) async throws -> Bool {
         try await sendReply(k, text: text, images: images, launcher: launcher, model: model, clientMsgID: clientMsgID,
                             clearDraft: clearDraft, todoID: todoID, via: via, opID: opID).waitsOnComputer == true
     }
@@ -1240,9 +1316,13 @@ nonisolated struct APIClient: Sendable {
 
     /// `send`, with the whole answer (`SendReply`).
     func sendReply(_ k: SessionKey, text: String, images: [ImagePayload] = [], launcher: String? = nil, model: String? = nil,
-                   clientMsgID: String? = nil, clearDraft: String? = nil, todoID: String? = nil, via: MessageVia? = nil, opID: UUID? = nil, holdsAgentMessages: Bool = false, waitForEffort: Bool = false) async throws -> SendReply {
+                   clientMsgID: String, clearDraft: String? = nil, todoID: String? = nil, via: MessageVia? = nil, opID: UUID? = nil, holdsAgentMessages: Bool = false, waitForEffort: Bool = false) async throws -> SendReply {
+        let normalizedClientMsgID = clientMsgID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedClientMsgID.isEmpty else {
+            throw APIError(status: 400, message: "client_msg_id is required", fields: ["code": "codex_send_guard", "delivered": "none"])
+        }
         let data = try await post(sp(k) + "/messages", body: SendBody(text: HubNaming.outbound(text, canonical: personaNaming), images: images.isEmpty ? nil : images, launcher: launcher,
-                                                                      model: model, clientMsgID: clientMsgID, clearDraft: clearDraft, todoID: todoID, via: via,
+                                                                      model: model, clientMsgID: normalizedClientMsgID, clearDraft: clearDraft, todoID: todoID, via: via,
                                                                       waitForEffort: waitForEffort ? true : nil),
                                   timeout: 100, opID: opID, extraHeaders: holdsAgentMessages ? ["X-Persona-Features": UndeliveredMessage.agentHoldFeature] : [:])
         return (try? JSON.decoder.decode(SendReply.self, from: data)) ?? SendReply()
@@ -1256,7 +1336,7 @@ nonisolated struct APIClient: Sendable {
         }
         let eventID = opID.uuidString.lowercased()
         let data = try await post(sp(ix.sessionKey) + "/messages",
-                                  body: SendBody(text: phrase, clientMsgID: eventID, approvalReplyTo: ix.id),
+                                  body: SendBody(text: phrase, clientMsgID: eventID, approvalReplyTo: ix.id, approvalReplyCreatedAt: ix.createdAtWire),
                                   timeout: 100, opID: opID)
         let reply = try JSON.decoder.decode(SendReply.self, from: data)
         guard reply.approvalReply == true, reply.interactionID == ix.id else {
@@ -1304,6 +1384,8 @@ nonisolated struct APIClient: Sendable {
     struct DeviceTokens: Decodable, Sendable {
         var tokens: [DeviceToken]
         var current: String?
+        /// Credential IDs with a live connection to the hub; nil from an older hub.
+        var online: [String]?
         /// Per credential, the push way of the device it registered last; nil from an older hub.
         var push: [String: PushRoute]?
         /// Which device takes the phone tools' calls (docs/apple/phone-tools.md); nil from an older hub.
@@ -1317,8 +1399,19 @@ nonisolated struct APIClient: Sendable {
     }
 
     /// Trades this credential for a device's own (kind "watch": answer-only).
-    func createToken(name: String, kind: String) async throws -> NewToken {
-        try JSON.decoder.decode(NewToken.self, from: try await request("POST", "/api/v1/auth/tokens", body: ["name": name, "kind": kind]))
+    /// When `replaces` names an earlier credential of the same kind, the hub revokes it alongside the exchange.
+    func createToken(name: String, kind: String, replaces: String? = nil) async throws -> NewToken {
+        let base = ["name": name, "kind": kind]
+        if let replaces, !replaces.isEmpty {
+            var withReplaces = base
+            withReplaces["replaces"] = replaces
+            do {
+                return try JSON.decoder.decode(NewToken.self, from: try await request("POST", "/api/v1/auth/tokens", body: withReplaces))
+            } catch let error as APIError where error.status == 400 {
+                // An older hub that rejects unknown fields on /auth/tokens answers 400; retry once without `replaces`.
+            }
+        }
+        return try JSON.decoder.decode(NewToken.self, from: try await request("POST", "/api/v1/auth/tokens", body: base))
     }
     func deviceTokens(timeout: TimeInterval = 30) async throws -> DeviceTokens {
         try JSON.decoder.decode(DeviceTokens.self, from: try await request("GET", "/api/v1/auth/tokens", timeout: timeout))
@@ -1586,7 +1679,7 @@ nonisolated struct APIClient: Sendable {
         try await post(sp(k) + "/queue/send-now", timeout: 30)
     }
 
-    struct AssistantState: Codable, Sendable {
+    struct AssistantState: Codable, Equatable, Sendable {
         var machineID: String
         var launcher: String
         var cwd: String
@@ -1609,6 +1702,7 @@ nonisolated struct APIClient: Sendable {
         /// conversation, a scheduled task or a follow-up started into one line. The value in effect; nil from a hub
         /// without the setting, which hides the switch and folds as if on (`backgroundFolded`).
         var mainBackgroundFolded: Bool?
+        var foldRoutineRelayReplies: Bool?
         /// Show Scheduled Task Chats in the sidebar's Recent (#8324): the chats a scheduled task or the background
         /// supervisor started are listed there too. The value in effect, one for all of the user's devices; nil from a
         /// hub without the setting, which hides the switch and keeps them out of Recent, as before.
@@ -1644,6 +1738,8 @@ nonisolated struct APIClient: Sendable {
         /// The manager that answered (its identity, the default's included): what a write that must name its manager
         /// names (the session-name settings, #7005). nil from an older hub.
         var manager: String?
+        /// The permission for new non-guest conversations without an explicit mode; existing conversations keep theirs.
+        var defaultPermissionMode: String?
         // Settings › Assistant Profile › Agent Follow-Up (#7005; the web's Settings › Assistant, "Starting tasks" and
         // "Agent follow-up"): each the value in effect, nil from a hub without it, which hides its row.
         /// Start what the owner asked for in a chat right away (#2559). On by default.
@@ -1669,9 +1765,15 @@ nonisolated struct APIClient: Sendable {
         var ownerReplyApproval: Bool?
         var persistentOwnerActionCards: Bool?
         var ownerReplyApprovalPhrases: [String]?
+        /// Let Persona make dashboards (#15017): the conversations may draft pages the owner keeps. Off by default; an
+        /// absent field (a hub without Dashboards, or one that never had it on) is off. The switch is shown by the hub's
+        /// `assistant_pages` feature, not by this field.
+        var dashboards: Bool?
         enum CodingKeys: String, CodingKey {
-            case launcher, cwd, conversations, timezone, main, leaders, manager
+            case launcher, cwd, conversations, timezone, main, leaders, manager, dashboards
+            case defaultPermissionMode = "default_permission_mode"
             case machineID = "machine_id", mainMachineID = "main_machine_id", notes = "notes_effective", mainTasksQuiet = "main_tasks_quiet"
+            case foldRoutineRelayReplies = "fold_routine_relay_replies"
             case mainBackgroundFolded = "main_background_folded", recentTaskChats = "recent_task_chats"
             case meetingAttendanceDefault = "meeting_attendance_default", timezonePicked = "timezone_picked"
             case mainSupervisesOwnTasks = "main_supervises_own_tasks", backgroundSupervisor = "background_supervisor"
@@ -1707,19 +1809,48 @@ nonisolated struct APIClient: Sendable {
     /// Decoded off the main actor: it holds every conversation, and the app reads it again each time it comes back to
     /// the front (#8324).
     func assistant() async throws -> AssistantState { owned(try await getDecodedOffMain("/api/v1/assistant")) }
-    /// A direction as `GET /api/v1/assistant/leaders` lists it (#3519, #3695): its leader conversation's id and the name
-    /// the hub gives the direction (the name set, else its project's, else the title without its "MMDD | kind | " prefix).
+    /// A direction as `GET /api/v1/assistant/leaders` lists it (#3519, #3695, #8236): its opaque direction id and
+    /// display name. Conversation-backed directions use their leader conversation's id; outside ones have no Persona
+    /// conversation and may carry a complete coding-Agent target used only for navigation.
     struct LeaderInfo: Codable, Sendable, Equatable {
         var id: String
         var name: String?
         var ended: Bool?
+        var external: Bool?
+        var machineID: String?
+        var sessionID: String?
+
+        init(id: String, name: String? = nil, ended: Bool? = nil, external: Bool? = nil,
+             machineID: String? = nil, sessionID: String? = nil) {
+            self.id = id
+            self.name = name
+            self.ended = ended
+            self.external = external
+            self.machineID = machineID
+            self.sessionID = sessionID
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(String.self, forKey: .id)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+            ended = try c.decodeIfPresent(Bool.self, forKey: .ended)
+            external = (try? c.decodeIfPresent(Bool.self, forKey: .external)) ?? nil
+            machineID = (try? c.decodeIfPresent(String.self, forKey: .machineID)) ?? nil
+            sessionID = (try? c.decodeIfPresent(String.self, forKey: .sessionID)) ?? nil
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, name, ended, external
+            case machineID = "machine_id", sessionID = "session_id"
+        }
     }
     /// Makes a conversation a direction (#4331, `POST /api/v1/assistant/directions/{id}/make`): its work is led from
     /// there from now on.
     func makeDirection(_ id: String) async throws {
         _ = try await request("POST", "/api/v1/assistant/directions/\(id)/make", body: [String: String]())
     }
-    /// Ends a direction (#4331, `POST /api/v1/assistant/directions/{id}/end`): its tasks keep their supervisor.
+    /// Ends a direction (#4331, `POST /api/v1/assistant/directions/{id}/end`): its open tasks go to the main chat's supervision.
     func endDirection(_ id: String) async throws {
         _ = try await request("POST", "/api/v1/assistant/directions/\(id)/end")
     }
@@ -1733,6 +1864,17 @@ nonisolated struct APIClient: Sendable {
         var out: [String: String] = [:]
         for l in list where !(l.ended ?? false) && !l.id.isEmpty {
             if let name = l.name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty { out[l.id] = name }
+        }
+        return out
+    }
+
+    /// The flat endpoint's outside-direction fallback, keyed by direction id and current rows only. Tree counts and
+    /// running state deliberately do not exist here; the row gets those only from the direction tree.
+    static func outsideDirections(_ list: [LeaderInfo]) -> [String: DirectionTree.Direction] {
+        var out: [String: DirectionTree.Direction] = [:]
+        for l in list where !(l.ended ?? false) && l.external == true && !l.id.isEmpty {
+            out[l.id] = DirectionTree.Direction(
+                id: l.id, name: l.name ?? "", external: true, machineID: l.machineID, sessionID: l.sessionID)
         }
         return out
     }
@@ -1777,6 +1919,7 @@ nonisolated struct APIClient: Sendable {
         var notes: String?
         var mainTasksQuiet: Bool?
         var mainBackgroundFolded: Bool?
+        var foldRoutineRelayReplies: Bool?
         var recentTaskChats: Bool?
         var meetingAttendanceDefault: String?
         var mainSupervisesOwnTasks: Bool?
@@ -1784,6 +1927,7 @@ nonisolated struct APIClient: Sendable {
         var meetingTranscriptionDefault: String?
         var meetingGlossary: [String]?
         var meetingTranscriptionExtension: String?
+        var defaultPermissionMode: String?
         var nextSuggestions: Bool?
         var startRequestedTasks: Bool?
         var taskWorkspacePreference: String?
@@ -1798,13 +1942,17 @@ nonisolated struct APIClient: Sendable {
         var ownerReplyApproval: Bool?
         var persistentOwnerActionCards: Bool?
         var ownerReplyApprovalPhrases: [String]?
+        /// Dashboards (#15017): `{"dashboards": true}` turns them on.
+        var dashboards: Bool?
         enum CodingKeys: String, CodingKey {
-            case launcher, timezone, notes
+            case launcher, timezone, notes, dashboards
             case machineID = "machine_id", mainTasksQuiet = "main_tasks_quiet", meetingAttendanceDefault = "meeting_attendance_default"
+            case foldRoutineRelayReplies = "fold_routine_relay_replies"
             case mainBackgroundFolded = "main_background_folded", mainSupervisesOwnTasks = "main_supervises_own_tasks"
             case recentTaskChats = "recent_task_chats"
             case meetingTranscriptionDefault = "meeting_transcription_default", meetingGlossary = "meeting_glossary"
             case meetingTranscriptionExtension = "meeting_transcription_extension"
+            case defaultPermissionMode = "default_permission_mode"
             case nextSuggestions = "next_suggestions", kbTopics = "kb_topics"
             case startRequestedTasks = "start_requested_tasks", taskWorkspacePreference = "task_workspace_preference"
             case agentTasks = "agent_tasks", idleCloseHours = "idle_close_hours", archiveClosedDays = "archive_closed_days"
@@ -1844,11 +1992,11 @@ nonisolated struct APIClient: Sendable {
     }
 
     /// What the main conversation still needs (docs/protocol/protocol.md「Main chat readiness」). `probe`: also try one word on it
-    /// (costs a little; only for Try a Message and 「我已经在用 Claude Code」). The hub may spend 100 s on the check
-    /// and another 12 s on the node's self-check, so a probe waits 130 s rather than the ordinary 30 s read budget.
+    /// (costs a little; only for Try a Message and 「我已经在用 Claude Code」). The hub may spend 20 s resolving the turn,
+    /// 170 s on the check and another 12 s on the node's self-check, so a probe waits 202 s rather than the ordinary 30 s read budget.
     func assistantReadiness(probe: Bool = false) async throws -> AssistantReadiness {
         try JSON.decoder.decode(AssistantReadiness.self, from: try await request("GET", "/api/v1/assistant/readiness",
-                                                                                 query: probe ? ["probe": "1"] : [:], timeout: probe ? 130 : 30))
+                                                                                 query: probe ? ["probe": "1"] : [:], timeout: probe ? 202 : 30))
     }
 
     /// Later: the checklist stops coming up by itself (the card still shows when the readiness gets worse).
@@ -2293,10 +2441,13 @@ nonisolated struct APIClient: Sendable {
     }
     @discardableResult
     /// opID: one per answer (the same on every retry of it), so a retry through a hub restart presses nothing twice.
-    /// `handoffCard`: a hand-off card's own approval, which says so (`SecretHandoff.feature`) on this request alone.
-    func resolve(_ id: String, _ r: Resolution, opID: UUID = UUID(), handoffCard: Bool = false) async throws -> ResolveResult {
-        let headers = handoffCard ? ["X-Persona-Features": SecretHandoff.feature] : [:]
-        return try JSON.decoder.decode(ResolveResult.self, from: try await post("/api/v1/interactions/\(id)/resolve", body: r, opID: opID,
+    /// `handoffCard`: a hand-off or explicit env card's own approval, which says so on this request alone.
+    /// `occurrence`: the exact creation timestamp on the card whose button was pressed; the hub must not rebind an answer to a replacement.
+    /// `secretRunEnv` selects the env feature; otherwise the hand-off feature is used.
+    func resolve(_ id: String, _ r: Resolution, opID: UUID = UUID(), occurrence: String? = nil, handoffCard: Bool = false, secretRunEnv: Bool = false) async throws -> ResolveResult {
+        var headers = occurrence.map { ["X-Persona-Interaction-Created-At": $0] } ?? [:]
+        if handoffCard { headers["X-Persona-Features"] = secretRunEnv ? "secret_run_env" : SecretHandoff.feature }
+        return try JSON.decoder.decode(ResolveResult.self, from: try await post("/api/v1/interactions/\(Self.pathPart(id))/resolve", body: r, opID: opID,
                                                                                  extraHeaders: headers))
     }
 
@@ -2449,6 +2600,17 @@ nonisolated struct APIClient: Sendable {
         struct Body: Decodable { var usage: UsageHours }
         return try await currentAssistantSettings().get("/api/v1/usage/hours", query: ["days": String(days)], as: Body.self).usage
     }
+    /// Today's, the last 3 and the last 7 days' tokens by project across computers (`GET /api/v1/usage/projects`, #16530,
+    /// docs/server/machines.md "Token usage by project"). 404 from a hub before it.
+    func usageProjects() async throws -> UsageProjects {
+        struct Body: Decodable { var usage: UsageProjects }
+        return try await currentAssistantSettings().get("/api/v1/usage/projects", as: Body.self).usage
+    }
+    /// One project's breakdown for the same ranges (`GET /api/v1/usage/projects/detail`).
+    func usageProjectDetail(_ key: String) async throws -> UsageProjectDetail {
+        struct Body: Decodable { var usage: UsageProjectDetail }
+        return try await currentAssistantSettings().get("/api/v1/usage/projects/detail", query: ["key": key], as: Body.self).usage
+    }
     /// Whether this device has the Home Screen widgets, alone: while its app is not open, the hub wakes it to write them
     /// again when the agents' counts change (#5721). An older hub keeps the field and does nothing with it.
     func setHasWidgets(device: String, _ has: Bool) async throws {
@@ -2588,12 +2750,120 @@ extension APIClient {
         try await post("/api/v1/assistant/conversations/\(id)/" + (archived ? "archive" : "unarchive"), body: [String: String]())
     }
 
+    /// Hub-wide Agents display settings (`GET`/`PUT /api/v1/agents/display-settings`,
+    /// `server/internal/assistant/agents_display.go`, #13899).
+    nonisolated struct AgentsDisplaySettings: Codable, Equatable, Sendable {
+        var showBotmux: Bool
+        var configured: Bool
+        var useHerdrTabName: Bool? = nil
+        var sortByActivity: Bool? = nil
+        var showFilter: Bool? = nil
+
+        enum CodingKeys: String, CodingKey {
+            case showBotmux = "show_botmux"
+            case configured
+            case useHerdrTabName = "use_herdr_tab_name"
+            case sortByActivity = "sort_by_activity"
+            case showFilter = "show_filter"
+        }
+    }
+
+    /// Reads the hub's Agents display settings (`GET /api/v1/agents/display-settings`). 404 on older hubs.
+    func agentsDisplaySettings() async throws -> AgentsDisplaySettings {
+        try JSON.decoder.decode(AgentsDisplaySettings.self, from: await request("GET", "/api/v1/agents/display-settings"))
+    }
+
+    /// Persists `use_herdr_tab_name` on the hub (`PUT /api/v1/agents/display-settings`), returning the acknowledged values.
+    func setAgentsUseHerdrTabName(_ enabled: Bool) async throws -> AgentsDisplaySettings {
+        struct Body: Encodable {
+            var useHerdrTabName: Bool
+            enum CodingKeys: String, CodingKey { case useHerdrTabName = "use_herdr_tab_name" }
+        }
+        return try JSON.decoder.decode(
+            AgentsDisplaySettings.self,
+            from: await request("PUT", "/api/v1/agents/display-settings", body: Body(useHerdrTabName: enabled))
+        )
+    }
+
+    static let agentAutonameFeature = "agent_autoname"
+
+    /// The manager publishes the new title before replying. Let the session feed apply it so
+    /// a delayed HTTP response can never overwrite a more recent manual rename.
+    func autoRenameSession(_ key: SessionKey) async throws {
+        _ = try await request("POST", "/api/v1/sessions/\(Self.enc(key.machineID))/\(Self.enc(key.sessionID))/autoname", timeout: 60)
+    }
+
     /// Renames the session's herdr tab and / or the Claude session (`/rename`).
     func renameSession(_ k: SessionKey, tabName: String?, title: String?) async throws {
         try await post("/api/v1/sessions/\(k.machineID)/\(k.sessionID)/rename", body: RenameBody(tabName: tabName, title: title))
     }
 }
 
+
+// MARK: Disk usage map (#14576, docs/server/machine-usage-map.md)
+
+nonisolated extension APIClient {
+    private static func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(["/"])) ?? s }
+
+    /// One folder's sizes, or the overview (`path` ""): answers within `waitMS`, `state: "scanning"` while the node goes on.
+    func storageUsage(machine: String, path: String, rescan: Bool = false, waitMS: Int = 1500) async throws -> StorageUsageReport {
+        var q = ["path": path, "wait_ms": String(waitMS)]
+        if rescan { q["rescan"] = "1" }
+        let data = try await request("GET", "/api/v1/machines/\(Self.enc(machine))/storage/usage", query: q, timeout: 20)
+        return try await Task.detached(priority: .userInitiated) { try JSON.decoder.decode(StorageUsageReport.self, from: data) }.value
+    }
+
+    func storageTrash(machine: String, paths: [String], dryRun: Bool = false) async throws -> StorageTrashResult {
+        struct Body: Encodable { var paths: [String]; var dry_run: Bool?; var confirm: Bool? }
+        let body = Body(paths: paths, dry_run: dryRun ? true : nil, confirm: dryRun ? nil : true)
+        return try JSON.decoder.decode(StorageTrashResult.self, from: await request("POST", "/api/v1/machines/\(Self.enc(machine))/storage/trash", body: body, timeout: 65))
+    }
+
+    func storageUntrash(machine: String, trashIDs: [String]) async throws -> StorageUntrashResult {
+        struct Body: Encodable { var trash_ids: [String] }
+        return try JSON.decoder.decode(StorageUntrashResult.self, from: await request("POST", "/api/v1/machines/\(Self.enc(machine))/storage/trash/undo",
+                                                                                       body: Body(trash_ids: trashIDs), timeout: 35))
+    }
+
+    func storagePurge(machine: String, trashIDs: [String]) async throws -> StoragePurgeResult {
+        struct Body: Encodable { var trash_ids: [String]; var confirm = true }
+        return try JSON.decoder.decode(StoragePurgeResult.self, from: await request("POST", "/api/v1/machines/\(Self.enc(machine))/storage/trash/purge",
+                                                                                     body: Body(trash_ids: trashIDs), timeout: 125))
+    }
+
+    /// The existing cache cleanup (#8037), as the web's disk sheet calls it.
+    func machineCleanup(machine: String, ids: [String]) async throws -> MachineCleanupResult {
+        struct Body: Encodable { var ids: [String] }
+        return try JSON.decoder.decode(MachineCleanupResult.self, from: await request("POST", "/api/v1/machines/\(Self.enc(machine))/cleanup",
+                                                                                       body: Body(ids: ids), timeout: 125))
+    }
+
+    func offloadProviders(machine: String) async throws -> [OffloadProvider] {
+        try JSON.decoder.decode(OffloadProvidersResponse.self, from: await request("GET", "/api/v1/extensions/-/offload", query: ["machine": machine])).providers
+    }
+
+    private static func offloadPath(_ p: OffloadProvider) -> String { "/api/v1/extensions/\(enc(p.extension))/-/offload/\(enc(p.contribution))" }
+
+    func offloadInventory(_ p: OffloadProvider, machine: String, refresh: Bool = false) async throws -> OffloadInventory {
+        var q = ["machine": machine]
+        if refresh { q["refresh"] = "1" }
+        let data = try await request("GET", Self.offloadPath(p) + "/inventory", query: q, timeout: 25)
+        return try await Task.detached(priority: .userInitiated) { try JSON.decoder.decode(OffloadInventory.self, from: data) }.value
+    }
+
+    /// A 409 `tool_install_required` carries the tool in `APIError.details["tool"]`; 422 `offload_refused` the items.
+    func offloadRun(_ p: OffloadProvider, _ body: OffloadRunRequest) async throws -> OffloadRunResult {
+        try JSON.decoder.decode(OffloadRunResult.self, from: await request("POST", Self.offloadPath(p) + "/run", body: body, timeout: 35))
+    }
+
+    func offloadJob(_ p: OffloadProvider, machine: String, job: String) async throws -> OffloadJob {
+        try JSON.decoder.decode(OffloadJob.self, from: await request("GET", Self.offloadPath(p) + "/jobs/\(Self.enc(job))", query: ["machine": machine], timeout: 15))
+    }
+
+    func offloadCancel(_ p: OffloadProvider, machine: String, job: String) async throws {
+        _ = try await request("DELETE", Self.offloadPath(p) + "/jobs/\(Self.enc(job))", query: ["machine": machine])
+    }
+}
 
 extension Date {
     /// nil for Go's zero time and other placeholder dates the hub sends for "never".

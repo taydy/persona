@@ -26,8 +26,9 @@ func (c *Client) chatCompletions(ctx context.Context, hc *http.Client, key strin
 	if r.MaxTokens > 0 {
 		body["max_tokens"] = r.MaxTokens
 	}
-	ApplyReasoningEffort(body, "chat", c.cfg.Model, c.cfg.ReasoningEffort)
-	droppedEffort := OmitChatEffort(c.cfg.BaseURL, key, c.cfg.Model, c.cfg.ViaMachine, c.cfg.ReasoningEffort)
+	effort := effortForRequest(c.cfg.ReasoningEffort, r)
+	ApplyReasoningEffort(body, "chat", c.cfg.Model, effort)
+	droppedEffort := OmitChatEffort(c.cfg.BaseURL, key, c.cfg.Model, c.cfg.ViaMachine, effort)
 	if droppedEffort {
 		delete(body, "reasoning_effort")
 	}
@@ -61,8 +62,8 @@ func (c *Client) chatCompletions(ctx context.Context, hc *http.Client, key strin
 			// of the rejected one, so X-Should-Retry: false forbids neither the modified request nor learning from it.
 			// Arbitrary 400s, non-off effort values, policy ceilings and started streams must never be replayed.
 			fieldRejected := ChatRejectsReasoningEffort(raw)
-			offValueRejected := !fieldRejected && ChatNoThinking(c.cfg.ReasoningEffort) && ChatRejectsNoEffortValue(raw)
-			if !droppedEffort && c.cfg.ReasoningEffort != "" && resp.StatusCode == http.StatusBadRequest && (fieldRejected || offValueRejected) {
+			offValueRejected := !fieldRejected && ChatNoThinking(effort) && ChatRejectsNoEffortValue(raw)
+			if !droppedEffort && effort != "" && resp.StatusCode == http.StatusBadRequest && (fieldRejected || offValueRejected) {
 				RememberChatEffortRejection(c.cfg.BaseURL, key, c.cfg.Model, c.cfg.ViaMachine, offValueRejected)
 				droppedEffort = true
 				delete(body, "reasoning_effort")
@@ -75,7 +76,7 @@ func (c *Client) chatCompletions(ctx context.Context, hc *http.Client, key strin
 				body["max_completion_tokens"] = r.MaxTokens
 				continue
 			}
-			if !droppedStreamOptions && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) && chatRejectsStreamOptions(raw) {
+			if !droppedStreamOptions && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) && ChatRejectsStreamOptions(raw) {
 				droppedStreamOptions = true
 				delete(body, "stream_options")
 				continue
@@ -371,9 +372,9 @@ func chatReasoningFieldError(message, param string) bool {
 	return strings.Contains(compact, "reasoning_effortisnotsupported")
 }
 
-// chatRejectsStreamOptions recognizes an error body that names the stream_options field. Such a server then
+// ChatRejectsStreamOptions recognizes an error body that names the stream_options field. Such a server then
 // streams no usage, and the reply reports zero.
-func chatRejectsStreamOptions(raw []byte) bool {
+func ChatRejectsStreamOptions(raw []byte) bool {
 	body := strings.ToLower(string(raw))
 	return strings.Contains(body, "stream_options") || strings.Contains(body, "include_usage")
 }
@@ -464,7 +465,9 @@ func readCompletions(body io.Reader) (Reply, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return Reply{}, fmt.Errorf("ai: read stream: %w", err)
+		// reply already carries any usage/model chunks read before the cut: keep them for the usage hook rather than
+		// reporting the failed call as zero tokens. Its Text is still empty (assembled only after the scan).
+		return reply, fmt.Errorf("ai: read stream: %w", err)
 	}
 	if err := consume(); err != nil {
 		return Reply{}, err

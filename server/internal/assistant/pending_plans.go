@@ -3,6 +3,7 @@ package assistant
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/nwverse/persona/server/internal/db"
 )
@@ -42,7 +43,8 @@ func (s *Service) openTaskPlans(ctx context.Context) ([]*TaskPlan, error) {
 	return out, nil
 }
 
-// Main belongs to the ordinary Assistant space; Health keeps its own decisions.
+// Main's Needs you has every open plan but Health's: Health keeps its own decisions (what they say stays in the health
+// space); a domain space's plan waits on the owner like any other conversation's and is decided from Main too.
 func (s *Service) mainPendingPlans(ctx context.Context) ([]*TaskPlan, error) {
 	plans, err := s.openTaskPlans(ctx)
 	if err != nil {
@@ -59,7 +61,7 @@ func (s *Service) mainPendingPlans(ctx context.Context) ([]*TaskPlan, error) {
 	}
 	out := make([]*TaskPlan, 0, len(plans))
 	for _, p := range plans {
-		if space := spaces[p.Conversation]; space.known && space.space != "" {
+		if space := spaces[p.Conversation]; space.known && space.space == SpaceHealth {
 			continue
 		}
 		if _, hidden := archived[p.Conversation]; hidden {
@@ -78,6 +80,25 @@ func (s *Service) planWithSpace(ctx context.Context, p *TaskPlan) *TaskPlan {
 		return nil
 	}
 	cp := *p
+	copied := false
+	s.todos.mu.RLock()
+	for i, task := range p.Tasks {
+		if task.TodoID == "" || task.Error == "" && task.ErrorCode == "" && task.WorkspaceError == nil && task.Start == nil {
+			continue
+		}
+		todo := s.todos.todos[task.TodoID]
+		if todo == nil || todo.DoneAt == nil || todo.failedStart() {
+			continue
+		}
+		task.Error, task.ErrorCode, task.ErrorArgs = "", "", nil
+		task.WorkspaceError, task.RetryWith, task.Start = nil, nil, nil
+		if !copied {
+			cp.Tasks = slices.Clone(p.Tasks)
+			copied = true
+		}
+		cp.Tasks[i] = task
+	}
+	s.todos.mu.RUnlock()
 	if space, known := s.conversationSpace(ctx, p.Conversation); known {
 		cp.Space = space
 	}

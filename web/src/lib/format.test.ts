@@ -5,6 +5,22 @@ import type { Session } from "./types";
 
 const session = (o: Partial<Session>): Session => ({ machine_id: "m", session_id: "s", cwd: "/x", status: "idle", ...o }) as Session;
 
+describe("remote path names", () => {
+  it.each([
+    ["C:\\Work\\App", "App"],
+    ["c:/Work/App/", "App"],
+    ["C:\\Work\\App\\", "App"],
+    ["\\\\server\\share\\Project", "Project"],
+    ["//server/share/Project/", "Project"],
+    ["/work/App/", "App"],
+    ["/work/a\\b", "a\\b"],
+    ["/", "/"],
+    ["", ""],
+  ])("shows the last component of %s", (path, name) => {
+    expect(baseName(path)).toBe(name);
+  });
+});
+
 describe("sessionTitle", () => {
   const tab = { slot_id: "w1:t1", slot_name: "Export work", space_kind: "herdr" };
   it("prefers a named herdr tab when enabled", () => {
@@ -70,8 +86,22 @@ describe("externalLink", () => {
   it("takes an https link", () => {
     expect(externalLink(session({ external_url: "https://applink.example.com/thread?x=1" }))).toBe("https://applink.example.com/thread?x=1");
   });
-  it("drops anything else", () => {
-    for (const url of ["http://applink.example.com/t", "javascript:alert(1)", "lark://open", "not a url", ""]) {
+  it("drops anything else, including single-slash relative URLs, userinfo, backslashes, and control chars", () => {
+    for (const url of [
+      "http://applink.example.com/t",
+      "javascript:alert(1)",
+      "lark://open",
+      "https:/admin",
+      "https:admin",
+      "https://user:pw@evil.example/t",
+      "https://@evil.example/t",
+      "https://good.example\\@evil.example/t",
+      "https://applink.example.com/t\t1",
+      "https://applink.example.com/t\n1",
+      "https://",
+      "not a url",
+      "",
+    ]) {
       expect(externalLink(session({ external_url: url })), url).toBeUndefined();
     }
     expect(externalLink(undefined)).toBeUndefined();

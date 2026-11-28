@@ -195,6 +195,8 @@ type Config struct {
 	InterceptReaders []string `json:"intercept_readers,omitempty"`
 	// Public is how the hub is reached from outside its LAN: TLS, the addresses it hands out (config_public.go).
 	Public PublicConfig `json:"public,omitempty"`
+	// Preview configures optional isolated wildcard-subdomain origins for web dev-server previews (config_preview.go).
+	Preview PreviewConfig `json:"preview,omitzero"`
 
 	Security SecurityConfig `json:"security,omitempty"`
 	// Admin is who may open the admin UI (docs/operations/admin.md).
@@ -261,6 +263,10 @@ func (c *Config) applyEnv() {
 		if v := identity.Getenv(e.name); v != "" {
 			*e.to(c) = v
 		}
+	}
+	if v := strings.TrimSpace(identity.Getenv("PERSONA_ALLOW_READONLY_SESSIONS")); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		c.Security.AllowReadOnlySessions = err == nil && enabled
 	}
 }
 

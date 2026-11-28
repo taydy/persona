@@ -51,7 +51,7 @@ func TestDeploymentMachineResponsesAndReplay(t *testing.T) {
 	// An event recorded in Chinese is localized again during resume, without changing event_seq.
 	resumed := &client{hub: h, out: make(chan []byte, 8), acceptLang: i18n.Ja}
 	h.mu.Lock()
-	h.helloLocked(resumed, map[string]any{"type": "hello"}, h.events.stream, 0, true)
+	h.helloLocked(resumed, wsHello{Type: "hello"}, h.events.stream, 0, true)
 	h.mu.Unlock()
 	<-resumed.out // hello
 	read(resumed, i18n.Ja)
@@ -176,7 +176,7 @@ func TestComputerBrowserSnapshotsUseConnectionLanguage(t *testing.T) {
 	}
 	resumed := &client{hub: h, out: make(chan []byte, 8), acceptLang: i18n.Ja}
 	h.mu.Lock()
-	h.helloLocked(resumed, map[string]any{"type": "hello"}, h.events.stream, 0, true)
+	h.helloLocked(resumed, wsHello{Type: "hello"}, h.events.stream, 0, true)
 	h.mu.Unlock()
 	<-resumed.out
 	var replay struct {
@@ -201,17 +201,20 @@ func TestComputerBrowserSnapshotsUseConnectionLanguage(t *testing.T) {
 	}
 }
 
-// The notes nodes write on their engines (the Paseo engine's, in the canonical Chinese of node-engine) reach each
-// app in its language, in the machine list and in a machines event; the manager's snapshot keeps the canonical text,
-// and a note the hub has no words for (Orca's) stays as it is.
+// The notes nodes write on their engines (Paseo's and Orca's, in the canonical Chinese of node-engine; an older
+// node's Orca note is that same text, #17037) reach each app in its language, in the machine list and in a machines
+// event; the manager's snapshot keeps the canonical text, and a note the hub has no words for stays as it is.
 func TestEngineNotesLocalized(t *testing.T) {
 	args := i18n.Args{"reason": "no Node.js found (set PERSONA_NODEJS)"}
 	paseo := i18n.T(i18n.Default, "node-engine.paseo_unreachable", args)
-	orca := "这个版本的 Orca 和 Persona 不兼容，请把两边都更新到最新版"
-	in := []proto.Machine{{ID: "laptop", Engines: []proto.Engine{{ID: "orca", Note: orca}, {ID: "paseo", Available: true, Note: paseo}}}}
+	orca := i18n.T(i18n.Default, "node-engine.orca_incompatible")
+	other := "a note from a newer node"
+	in := []proto.Machine{{ID: "laptop", Engines: []proto.Engine{{ID: "orca", Note: orca},
+		{ID: "paseo", Available: true, Note: paseo}, {ID: "tern", Note: other}}}}
 	for _, l := range []i18n.Lang{i18n.En, i18n.Ja, i18n.ZhHans} {
 		got := localizedMachines(l, in)[0].Engines
-		if got[1].Note != i18n.T(l, "node-engine.paseo_unreachable", args) || got[0].Note != orca {
+		if got[1].Note != i18n.T(l, "node-engine.paseo_unreachable", args) ||
+			got[0].Note != i18n.T(l, "node-engine.orca_incompatible") || got[2].Note != other {
 			t.Fatalf("%s: %+v", l, got)
 		}
 	}

@@ -168,6 +168,22 @@ function rawUpdate() {
   return new Uint8Array([0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 1, 2, 3, 0, 4, 5, 6, 0]);
 }
 
+test('a scoped session desktop uses the matching owner-local machine throughout the stream', async () => {
+  const { screen, parent, row } = screenFixture(new TestStream());
+  parent.profile.id = row.group = 'sample-hub';
+  const machine = parent.machines[0];
+  machine.manager = '';
+  const foreign = ResourceRow.from(machine.data(), 'machine'); foreign.group = 'other-hub';
+  parent.machines = [foreign, machine];
+  const opening = screen.open(parent, row);
+  try {
+    await waitFor(() => screen.socketReady);
+    assert.equal(screen.isCurrent(screen.attempt), true);
+    parent.machines = [foreign];
+    assert.equal(screen.isCurrent(screen.attempt), false);
+  } finally { screen.close(); await opening; }
+});
+
 test('a port-stream failure while connect is pending invalidates the attempt before RFB can start', async () => {
   const stream = new TestStream();
   stream.failBeforeConnectResolves = true;
@@ -567,7 +583,7 @@ test('switching or waiting for a monitor keeps the same inline viewer and fits t
 
 test('stalled WebSocket writes replace waiting mouse motion while preserving every button and keyboard transition', async () => {
   const src = readFileSync(new URL('../entry/src/main/ets/platform/HubTransport.ets', import.meta.url), 'utf8');
-  const methods = ['sendBinary', 'enqueueFrame'].map(name => componentMethod(src, name));
+  const methods = ['sendBinary', 'enqueueFrame', 'outgoingLimit'].map(name => componentMethod(src, name));
   const crypto = { createRandom: () => ({ generateRandom: async () => ({ data: new Uint8Array(4) }) }) };
   const Transport = new Function('cryptoFramework', 'MAX_FRAME_BYTES', 'toArrayBuffer', 'concatArrays',
     'return ' + stripTypeScriptTypes('class Transport {' + methods.join('\n') + '}'))(
@@ -596,6 +612,7 @@ test('a system touch cancellation with no remaining fingers releases the pointer
   page.pointerDown = true;
   page.screen = { releasePointer: () => released++ };
   page.viewport = { cancel: () => cancelled++ };
+  page.stopWheel = () => {};
   page.setViewingGesture = value => assert.equal(value, false);
   page.touchFrame({ type: 3, changedTouches: [], touches: [] });
   assert.equal(page.pointerDown, false);
@@ -967,6 +984,35 @@ test('one legal full-screen update can arrive as a burst above the pre-login que
   for (let i = 0; i < bytes.length; i += 256 * 1024) stream.onBinary(bytes.buffer.slice(i, i + 256 * 1024));
   await waitFor(() => screen.hasFrame);
   assert.equal(screen.presentationSource().pixels.at(-4),123);
+});
+
+test('two fingers moving together scroll the computer, a pinch zooms the picture, and neither clicks or keeps a drag',async()=>{
+ const {ScreenWheel,ScreenTwoFingers,screenScrollFactor}=await import('../entry/src/main/ets/core/ScreenWheel.ts');
+ const touchType={Down:0,Up:1,Move:2,Cancel:3};
+ const Behavior=new Function('TouchType','ScreenPoint','screenScrollPreference','screenScrollFactor','return '+stripTypeScriptTypes('class TouchBehavior {'+['stopWheel','scrollWithTwoFingers','touchFrame'].map(pageMethod).join('\n')+'}'))(touchType,ScreenPoint,{choice:'default'},screenScrollFactor);
+ const page=new Behavior(),sent=[],viewport=new ScreenViewport();let control=true;viewport.layout(300,150,2);
+ Object.assign(page,{wheel:new ScreenWheel(),fingerMotion:new ScreenTwoFingers(),wheelTimer:-1,frameAreaWidth:300,frameAreaHeight:150,
+   framePixels:{},viewport,setViewingGesture(){},paceWheel(){},
+   screen:{hasFrame:true,controlAllowed:()=>control,scrollPointsInView:()=>1,pointerAt(x,y,b){sent.push(b);return true},releasePointer(){sent.push(0)}}});
+ // Each finger is [id,x,y]; `changed` is the finger this event is about, `type` its touch type.
+ function event(type,fingers,changed){
+   const touches=fingers.map(([id,x,y])=>({id,x,y,type:id===changed?type:touchType.Move}));
+   page.touchFrame({type,touches,changedTouches:touches.filter(t=>t.id===changed)});
+ }
+ event(0,[[1,30,75]],1);event(1,[[1,30,75]],1);assert.deepEqual(sent.splice(0),[1,0],'a tap still clicks');
+ event(0,[[1,30,50]],1);event(0,[[1,30,50],[2,60,50]],2);event(2,[[1,30,60],[2,60,60]],1);
+ event(1,[[1,30,60],[2,60,60]],1);event(1,[[2,60,60]],2);
+ assert.deepEqual(sent,[],'scrolling never clicks');assert.equal(page.wheel.busy,true);assert.equal(viewport.zoom,1);
+ event(0,[[1,30,75]],1);assert.equal(page.wheel.busy,false,'a new touch stops the momentum');event(1,[[1,30,75]],1);sent.splice(0);
+ event(0,[[1,100,75]],1);event(0,[[1,100,75],[2,140,75]],2);event(2,[[1,60,75],[2,180,75]],1);
+ assert.ok(viewport.zoom>1,'a pinch zooms the picture');assert.equal(page.wheel.busy,false);
+ event(1,[[1,60,75],[2,180,75]],1);event(1,[[2,180,75]],2);assert.deepEqual(sent,[]);
+ viewport.reset();control=false;
+ event(0,[[1,30,50]],1);event(0,[[1,30,50],[2,60,50]],2);event(2,[[1,30,70],[2,60,70]],1);
+ assert.equal(page.wheel.busy,false,'without control two fingers never scroll the computer');
+ event(1,[[1,30,70],[2,60,70]],1);event(1,[[2,60,70]],2);control=true;viewport.reset();
+ event(0,[[1,30,75]],1);event(2,[[1,40,75]],1);event(0,[[1,40,75],[2,90,75]],2);
+ assert.deepEqual(sent,[1,1,0],'a second finger releases a held drag');assert.equal(page.pointerDown,false);
 });
 
 test('screen sessions open in RFB and video on a supported display starts only on request', async () => {

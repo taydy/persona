@@ -15,7 +15,9 @@ struct PersonaWidgetsBundle: WidgetBundle {
         MeetingRecordingControl()
         AskPersonaControl()
         PersonaAgentsControl()
+        MessagePersonaControl()
         DictatePersonaControl()
+        CallPersonaControl()
         CompatibleAssistantControl()
         CompatibleAgentsControl()
     }
@@ -46,6 +48,16 @@ struct HomeWidgetBundle: WidgetBundle {
         UsageHomeWidget()
         ComputersHomeWidget()
         RecordHomeWidget()
+        HealthWidgetBundle().body
+    }
+}
+
+/// Keep every bundle builder below ten children, and preserve the existing Health kind.
+struct HealthWidgetBundle: WidgetBundle {
+    var body: some Widget {
         HealthHomeWidget()
+        WaterHomeWidget()
+        ProteinHomeWidget()
+        HealthTodayHomeWidget()
     }
 }

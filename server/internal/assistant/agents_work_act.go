@@ -18,17 +18,19 @@ import (
 // ---- acting ----
 
 // accountExhaustionRetryAllowed applies the separate, opt-in budget for an
-// exhausted upstream account pool to coding Agents, including task-leader
-// Agents. Every Assistant conversation keeps its existing mechanical recovery:
-// main chat, leader and background-supervision conversations, side chats,
-// scheduled-task and health chats, and meeting rooms. Only the first three
-// re-resolve their launcher and model on protected continuations. retries
-// counts continuations already sent in the transient run.
+// exhausted upstream account pool to every conversation. Selecting another
+// launcher cannot help when no account is eligible, whether the stopped turn is
+// a coding Agent's or an Assistant conversation's. retries counts continuations
+// already sent in the transient run.
 func accountExhaustionRetryAllowed(c proto.Session, retries, limit int) bool {
-	if c.Assistant {
-		return true
-	}
 	return !modelretry.AccountExhausted(c.TurnError) || retries < max(limit, 0)
+}
+
+func stoppedTransientLine(l i18n.Lang, c proto.Session, errText string) string {
+	if sessionTurnErrorCode(c) == proto.TurnErrorUpstreamUnavailable || c.TurnErrorCode == proto.TurnErrorUpstreamUnavailable {
+		return clip(oneLine(workT(l, "upstream_unavailable_stopped", i18n.Args{"error": errText})), 120)
+	}
+	return clip(oneLine(workT(l, "model_error", i18n.Args{"error": errText})), 60)
 }
 
 // actOn decides what the manager does about e's work state and records it on e (wake_at, a card). It sends nothing:
@@ -51,12 +53,12 @@ func (s *Service) actOn(ctx context.Context, v *workView, machine string, c prot
 	switch w.On {
 	case proto.WaitTransient:
 		if !sw.transientOn() {
-			w.Line = clip(oneLine(workT(l, "model_error", i18n.Args{"error": w.Wait})), 60)
+			w.Line = stoppedTransientLine(l, c, w.Wait)
 			return
 		}
 		if !accountExhaustionRetryAllowed(c, e.Retries, cfg.AccountExhaustionMaxRetries) {
 			e.WakeAt, w.WakeAt = nil, nil
-			w.Line = clip(oneLine(workT(l, "model_error", i18n.Args{"error": w.Wait})), 60)
+			w.Line = stoppedTransientLine(l, c, w.Wait)
 			s.logf("work %s/%s: not continued: account pool exhausted (budget %d, sent %d)", machine, short(c.SessionID),
 				cfg.AccountExhaustionMaxRetries, e.Retries)
 			return
@@ -80,6 +82,9 @@ func (s *Service) actOn(ctx context.Context, v *workView, machine string, c prot
 				return
 			}
 			break
+		}
+		if w.Closeout != nil {
+			return // A closeout records the dependency without assigning an automatic next step.
 		}
 		if w.Wait == "" && w.Agent == nil {
 			return // a background task or a /loop: it wakes itself
@@ -108,8 +113,7 @@ func (s *Service) actOn(ctx context.Context, v *workView, machine string, c prot
 		return
 	}
 	// Missing evidence is not a user decision. Authorization links have their own relay and manual card path.
-	if w.On == proto.WaitUser && w.By == "model" && len(w.Questions) == 0 && w.Link == nil {
-		*w = proto.WorkState{TurnAt: w.TurnAt, At: w.At, By: w.By, Artifacts: w.Artifacts}
+	if unsupportedUserWait(w) {
 		return
 	}
 	// On the user: a card. Without the triage none: the session shows its error and the apps' Retry as before.
@@ -459,16 +463,30 @@ func (s *Service) sendToSession(ctx context.Context, machine, sid, text string) 
 	return s.sendWorkText(ctx, machine, sid, text, false)
 }
 
+// autoContinueSource distinguishes a hub-generated recovery message from the
+// owner's manual Retry or Continue, including after transcript restoration.
+func autoContinueSource() *proto.MessageSource {
+	return &proto.MessageSource{Kind: proto.SourceAutoContinue}
+}
+
+func (s *Service) workSendWait(machine, sid string) time.Duration {
+	if row, ok := s.nodeSession(machine, sid); ok && row.CanRefreshTerminalLauncher() {
+		return proto.LauncherRefreshSendWait
+	}
+	return 30 * time.Second
+}
+
 // sendWorkText resolves a model only for a quota continuation; ordinary manager messages retain their send path.
 func (s *Service) sendWorkText(ctx context.Context, machine, sid, text string, quotaContinuation bool) error {
 	s.work.mu.Lock()
 	s.work.init()
 	s.work.sent[[2]string{machine, sid}] = time.Now()
 	s.work.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, s.workSendWait(machine, sid))
 	defer cancel()
 	params := map[string]any{"session_id": sid, "text": text}
 	if quotaContinuation {
+		params["message_source"] = autoContinueSource()
 		if err := s.protectedContinuationModel(ctx, machine, sid, params); err != nil {
 			return err
 		}
@@ -483,12 +501,12 @@ func (s *Service) sendModelRetry(ctx context.Context, e db.SessionWork, text str
 	s.work.init()
 	s.work.sent[[2]string{e.MachineID, e.SessionID}] = time.Now()
 	s.work.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, s.workSendWait(e.MachineID, e.SessionID))
 	defer cancel()
 	// PostgreSQL timestamps retain microseconds. Use that same precision before
 	// and after loading a due row so a crash cannot change its once-only send ID.
 	id := fmt.Sprintf("model-retry:%s:%d:%d", e.SessionID, e.TurnAt.Truncate(time.Microsecond).UnixNano(), e.Retries)
-	params := map[string]any{"session_id": e.SessionID, "text": text, "client_msg_id": id}
+	params := map[string]any{"session_id": e.SessionID, "text": text, "client_msg_id": id, "message_source": autoContinueSource()}
 	if err := s.protectedContinuationModel(ctx, e.MachineID, e.SessionID, params); err != nil {
 		return err
 	}

@@ -44,12 +44,16 @@ func TestRelayFailureClassification(t *testing.T) {
 		{"machine_offline from the bus", busError(coded(CodeMachineOffline)), relayFailedNotNow},
 		// The manager's own computers answer an offline machine with the bare error, no code (devices/machine.go).
 		{"offline on the manager's own computer", fmt.Errorf("%s: %w", "box", apierr.ErrOffline), relayFailedNotNow},
+		{"not sent before deadline", rpc.NotSent(context.DeadlineExceeded), relayFailedNotNow},
+		{"not sent before link closed", rpc.NotSent(rpc.ErrClosed), relayFailedNotNow},
+		{"not written before deadline", errors.Join(rpc.ErrNotWritten, context.DeadlineExceeded), relayFailedNotNow},
 		{"node_closed", coded(CodeNodeClosed), relayFailedNotNow},
 
 		{"no_device from the bus", busError(coded(assistantwire.CodeNoDevice)), relayFailedSetup},
 
 		{"the conversation is gone", &rpc.Error{Message: "conversation conv1 is gone"}, relayFailedGone},
 		{"the manager's pick is gone", errors.New("the picked model is gone"), relayFailedGone},
+		{"not_found", coded("not_found"), relayFailedGone},
 
 		{"the manager's own refusal", errors.New("the model pick cannot be read"), relayFailedLocal},
 		{"the manager's own localized refusal", i18n.Err("external-adapter.scope_required"), relayFailedLocal},
@@ -66,7 +70,7 @@ func TestRelayFailureClassification(t *testing.T) {
 	}
 	for _, code := range []string{proto.CodeClaudeMissing, proto.CodeLauncherMissing, proto.CodeNodeOutdated, "no_device",
 		"adapter_credentials_missing", "adapter_disabled", "adapter_config_conflict", "launcher_out_of_scope", "launcher_own_service",
-		"launcher_other_kind", "assistant_launcher_profile_switch"} {
+		"launcher_other_kind", "assistant_launcher_profile_switch", "assistant_model_unresolved"} {
 		cases = append(cases, row{code, coded(code), relayFailedSetup})
 	}
 	for _, code := range relayBusyCodes {
@@ -219,6 +223,104 @@ func TestQueuedNotNowRefusalWaitsForTheGap(t *testing.T) {
 	}
 }
 
+// A role-change refusal holds the whole conversation, not only the message that happened to be picked. Otherwise two
+// queued messages take turns being b.stuck and every drain finds a different one to send before relayRetryGap (#13918).
+func TestQueuedRoleChangeRefusalDoesNotRotateAroundRetryGap(t *testing.T) {
+	s, f := newQuietService(t)
+	gap := relayRetryGap
+	relayRetryGap = time.Hour
+	t.Cleanup(func() { relayRetryGap = gap })
+	idle := proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle}
+	at := time.Now().UTC()
+	s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "first", At: at})
+	s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "second", At: at.Add(time.Second)})
+	tries := relayTries(f, "conv1")
+	refuseSendsTo(f, "conv1", &rpc.Error{Code: assistantwire.CodeConversationBusy, Message: "role changed while working"})
+
+	drainSettled(t, s, idle)
+	if got := len(triesOf(f, tries)); got != 1 {
+		t.Fatalf("first drain made %d tries, want 1", got)
+	}
+	for i := 0; i < 3; i++ {
+		drainSettled(t, s, idle)
+	}
+	if got := len(triesOf(f, tries)); got != 1 {
+		t.Fatalf("repeated session events made %d tries inside the retry gap, want 1", got)
+	}
+	if got := s.queuedFor("conv1"); got != 2 {
+		t.Fatalf("%d messages remain queued, want both", got)
+	}
+}
+
+// A role change may be refused while the old process still has a foreground turn or background tasks. Once a list has
+// shown that work, repeated lists do not send; the first list with all of it over releases the queue at once, even
+// inside the ordinary fallback gap. Each message goes in once, and a duplicate idle event sends nothing more (#13918).
+func TestQueuedRoleChangeRefusalWaitsForWorkCompletion(t *testing.T) {
+	background := proto.BackgroundTask{ID: "background1", Kind: "shell", Description: "tests"}
+	for _, tc := range []struct {
+		name   string
+		first  proto.Session
+		active proto.Session
+	}{
+		{
+			name:   "foreground turn",
+			first:  proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle},
+			active: proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusWorking},
+		},
+		{
+			name: "background task",
+			first: proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle,
+				Background: []proto.BackgroundTask{background}},
+			active: proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle,
+				Background: []proto.BackgroundTask{background}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f := newQuietService(t)
+			gap := relayRetryGap
+			relayRetryGap = time.Hour
+			t.Cleanup(func() { relayRetryGap = gap })
+			at := time.Now().UTC()
+			s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "first", At: at})
+			s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "second", At: at.Add(time.Second)})
+			tries := relayTries(f, "conv1")
+			f.mu.Lock()
+			f.failAssistant = &rpc.Error{Code: assistantwire.CodeConversationBusy, Message: "role changed while working"}
+			f.mu.Unlock()
+
+			drainSettled(t, s, tc.first)
+			for i := 0; i < 3; i++ {
+				drainSettled(t, s, tc.active)
+			}
+			if got := len(triesOf(f, tries)); got != 1 {
+				t.Fatalf("active work led to %d tries, want only the first", got)
+			}
+			if got := s.queuedFor("conv1"); got != 2 {
+				t.Fatalf("%d messages remain queued while work runs, want both", got)
+			}
+
+			f.mu.Lock()
+			f.failAssistant = nil
+			f.mu.Unlock()
+			idle := proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle}
+			drainSettled(t, s, idle)
+			drainSettled(t, s, idle) // the second queued message, after the first delivery's turn ended
+			if queued, sent := s.queuedFor("conv1"), f.sentTo("conv1"); queued != 0 || sent != 2 {
+				t.Fatalf("after completion: %d queued, %d sent, tries %q, texts %q", queued, sent, triesOf(f, tries), f.sentTexts("conv1"))
+			}
+			got := f.sentTexts("conv1")
+			slices.Sort(got) // pickLocked deliberately takes the message that was not stuck first
+			if len(got) != 2 || !strings.HasSuffix(got[0], "first") || !strings.HasSuffix(got[1], "second") {
+				t.Fatalf("delivered texts %q, want first and second once each", got)
+			}
+			drainSettled(t, s, idle) // a repeated completion event has nothing to deliver again
+			if got := len(triesOf(f, tries)); got != 3 {
+				t.Fatalf("completion made %d total tries, want one refusal and two deliveries", got)
+			}
+		})
+	}
+}
+
 // A queued message refused for good with a code nobody knows is tried once and ends as its kind says (#11393): a
 // supervision message ends in the owner's push and is not moved (decision 2 is open), a card answer moves to the main
 // conversation, Persona's own notices end in one push, a message from another conversation leaves with one line to its
@@ -249,6 +351,7 @@ func TestQueuedRefusalForGoodEndsByKind(t *testing.T) {
 			relayRetryGap = 0 // a message that stays is tried on every drain
 			t.Cleanup(func() { relayRetryGap = gap })
 			s, f, tries := relayRefusalEnv(t, &rpc.Error{Code: "unheard_of", Message: "this conversation will not take it"})
+			setSettings(t, s, func(v *Settings) { on := true; v.ChatReplyRelay = &on }) // a chat_reply is only delivered while the relay is on
 			fromConversation := tc.msg.Tool == "conversation_send" || tc.msg.Tool == "conversation_new"
 			s.queueRelay("side1", tc.msg)
 
@@ -741,4 +844,211 @@ func TestEveryDevicesLayerRefusalWaits(t *testing.T) {
 	if found < 8 {
 		t.Fatalf("read %d codes, want the devices layer's whole list", found)
 	}
+}
+
+// When a conversation has multiple queued messages and delivery fails with a retryable error, each message gets one
+// try (preserving per-message fairness, #10194), and once all eligible messages have failed within relayRetryGap,
+// repeated session lists do not ping-pong between them around the backoff (#17592).
+func TestMultiMessageQueueDoesNotPingPongPastRetryGap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"uncoded node error", &rpc.Error{Message: "the launcher did not start"}},
+		{"busy code", &rpc.Error{Code: "runtime_away", Message: "runtime away"}},
+		{"local error", errors.New("node unreachable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f := newQuietService(t)
+			gap := relayRetryGap
+			relayRetryGap = time.Hour
+			t.Cleanup(func() { relayRetryGap = gap })
+			t.Cleanup(func() { stopRelayTimer(s, "conv1") })
+
+			idle := proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle}
+			at := time.Now().UTC()
+			s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "first", At: at})
+			s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "second", At: at.Add(time.Second)})
+			tries := relayTries(f, "conv1")
+			refuseSendsTo(f, "conv1", tc.err)
+
+			// Drain 1 tries "first"; drain 2 tries "second" once (per-message fairness).
+			drainSettled(t, s, idle)
+			drainSettled(t, s, idle)
+			if got := len(triesOf(f, tries)); got != 2 {
+				t.Fatalf("after first two drains: %d tries, want 2 (one per message)", got)
+			}
+
+			// Further session lists inside relayRetryGap must not ping-pong between "first" and "second".
+			for range 5 {
+				drainSettled(t, s, idle)
+			}
+			if got := len(triesOf(f, tries)); got != 2 {
+				t.Fatalf("repeated session lists ping-ponged to %d tries inside relayRetryGap, want 2", got)
+			}
+			if got := s.queuedFor("conv1"); got != 2 {
+				t.Fatalf("queued = %d, want 2", got)
+			}
+
+			// A newly queued third message may still try once; when it succeeds, conversation backoff clears and the
+			// previously failed messages deliver immediately on subsequent drains.
+			f.mu.Lock()
+			f.onAssistantSend = nil
+			f.failAssistant = nil
+			f.mu.Unlock()
+			s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "third", At: at.Add(2 * time.Second)})
+			for range 3 {
+				drainSettled(t, s, idle)
+			}
+			if queued, sent := s.queuedFor("conv1"), f.sentTo("conv1"); queued != 0 || sent != 3 {
+				t.Fatalf("after recovery: queued=%d sent=%d, want 0 and 3", queued, sent)
+			}
+		})
+	}
+}
+
+// Once relayRetryGap elapses for a backed-off multi-message queue, the earliest-failed message becomes eligible again.
+func TestMultiMessageQueueRetriesAfterBackoffExpires(t *testing.T) {
+	s, f := newQuietService(t)
+	gap := relayRetryGap
+	relayRetryGap = 80 * time.Millisecond
+	t.Cleanup(func() { relayRetryGap = gap })
+	t.Cleanup(func() { stopRelayTimer(s, "conv1") })
+
+	idle := proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle}
+	at := time.Now().UTC()
+	s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "first", At: at})
+	s.queueRelay("conv1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "second", At: at.Add(time.Second)})
+	tries := relayTries(f, "conv1")
+	refuseSendsTo(f, "conv1", &rpc.Error{Message: "the launcher did not start"})
+
+	drainSettled(t, s, idle)
+	drainSettled(t, s, idle)
+	if got := len(triesOf(f, tries)); got != 2 {
+		t.Fatalf("initial tries = %d, want 2", got)
+	}
+
+	// Clear the failure and let the backoff timer expire; the next drain delivers.
+	f.mu.Lock()
+	f.onAssistantSend = nil
+	f.failAssistant = nil
+	f.mu.Unlock()
+	s.drainRelays("server", []proto.Session{idle})
+	waitFor(t, "backed-off queue delivers after relayRetryGap", func() bool { return f.sentTo("conv1") >= 1 && !drainingNow(s, "conv1") })
+	drainSettled(t, s, idle)
+	if queued, sent := s.queuedFor("conv1"), f.sentTo("conv1"); queued != 0 || sent != 2 {
+		t.Fatalf("after backoff expiry: queued=%d sent=%d, want 0 and 2", queued, sent)
+	}
+}
+
+// RPC not_found is classified as relayFailedGone (#17592): sendNotTaken returns true, queued approval-results and
+// main-conversation card answers leave the queue instead of staying forever, side-conversation card answers move to
+// the main conversation, conversation_send notifies the sender with handoverGone, and logical placeholders keep their
+// transient deferral.
+func TestNotFoundClassifiedAsGoneAcrossRelayKinds(t *testing.T) {
+	notFound := &rpc.Error{Code: "not_found", Message: "conversation is unreadable"}
+	if !sendNotTaken(notFound) {
+		t.Fatal("sendNotTaken(not_found) = false, want true")
+	}
+
+	t.Run("approval result leaves queue immediately", func(t *testing.T) {
+		s, f, tries := relayRefusalEnv(t, notFound)
+		s.queueRelay("side1", relayMsg{From: approvalResultFrom + "ix1", FromTitle: "Approval result", Tool: askAnswerTool, Text: "Approval ix1 applied", At: time.Now().UTC()})
+		drainSettled(t, s, side1)
+		for range 3 {
+			drainSettled(t, s, side1)
+		}
+		if got := s.queuedFor("side1"); got != 0 {
+			t.Fatalf("approval result remained queued (%d) after not_found", got)
+		}
+		if got := len(triesOf(f, tries)); got != 1 {
+			t.Fatalf("tries = %d, want 1", got)
+		}
+	})
+
+	t.Run("main conversation card answer leaves queue instead of looping", func(t *testing.T) {
+		s, f := newQuietService(t)
+		main := proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle}
+		f.setSessions("server", main)
+		tries := relayTries(f, "conv1")
+		refuseSendsTo(f, "conv1", notFound)
+
+		s.queueRelay("conv1", relayMsg{From: "todo_1", FromTitle: "Todo", Tool: askAnswerTool, Text: "owner chose A", At: time.Now().UTC(), Owner: true})
+		drainSettled(t, s, main)
+		for range 3 {
+			drainSettled(t, s, main)
+		}
+		if got := s.queuedFor("conv1"); got != 0 {
+			t.Fatalf("main-chat card answer remained queued (%d) after not_found", got)
+		}
+		if got := len(triesOf(f, tries)); got != 1 {
+			t.Fatalf("tries = %d, want 1", got)
+		}
+	})
+
+	t.Run("side conversation card answer moves to main conversation", func(t *testing.T) {
+		s, f, tries := relayRefusalEnv(t, notFound)
+		s.queueRelay("side1", relayMsg{From: "todo_1", FromTitle: "Todo", Tool: askAnswerTool, Text: "owner chose B", At: time.Now().UTC(), Owner: true})
+		drainSettled(t, s, side1)
+		waitFor(t, "card answer delivered to main", func() bool { return f.sentTo("conv1") == 1 })
+		if got := s.queuedFor("side1"); got != 0 {
+			t.Fatalf("side1 queued = %d, want 0", got)
+		}
+		if got := len(triesOf(f, tries)); got != 1 {
+			t.Fatalf("side1 tries = %d, want 1", got)
+		}
+		if texts := f.sentTexts("conv1"); len(texts) != 1 || !strings.Contains(texts[0], "owner chose B") {
+			t.Fatalf("main conversation got %q, want card answer", texts)
+		}
+	})
+
+	t.Run("conversation_send notifies sender with gone", func(t *testing.T) {
+		s, f, tries := relayRefusalEnv(t, notFound)
+		f.mu.Lock()
+		f.hello.Locale = "en"
+		f.mu.Unlock()
+		s.queueRelay("side1", relayMsg{From: "conv2", FromTitle: "Planning", Tool: "conversation_send", Text: "status check", At: time.Now().UTC()})
+		drainSettled(t, s, side1)
+		waitFor(t, "sender notified of gone", func() bool { return f.sentTo("conv2") == 1 })
+		if got := s.queuedFor("side1"); got != 0 || len(triesOf(f, tries)) != 1 {
+			t.Fatalf("queued=%d tries=%d, want 0 and 1", s.queuedFor("side1"), len(triesOf(f, tries)))
+		}
+		if notice := f.sentTexts("conv2")[0]; !strings.Contains(notice, "no longer available (gone)") {
+			t.Fatalf("sender notice = %q, want gone notice", notice)
+		}
+	})
+
+	t.Run("logical placeholder still defers transient not_found until physical row arrives", func(t *testing.T) {
+		gap := relayRetryGap
+		relayRetryGap = 10 * time.Second
+		t.Cleanup(func() { relayRetryGap = gap })
+
+		s, f := newQuietService(t)
+		t.Cleanup(func() { stopRelayTimer(s, "lead1") })
+		f.mu.Lock()
+		f.known["conv1"] = true
+		f.known["lead1"] = true
+		f.mu.Unlock()
+		main := proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle}
+		placeholder := proto.Session{SessionID: "lead1", MachineID: "server", Assistant: true, Status: proto.StatusOffline, LogicalPlaceholder: true}
+		physical := proto.Session{SessionID: "lead1", MachineID: "server", Assistant: true, Status: proto.StatusIdle}
+		f.setSessions("server", main, placeholder)
+
+		s.queueRelay("lead1", relayMsg{From: "conv1", FromTitle: "Main", Tool: "conversation_send", Text: "wait for physical", At: time.Now().UTC()})
+		refuseSendsTo(f, "lead1", notFound)
+		drainSettled(t, s, placeholder)
+		if got := s.queuedFor("lead1"); got != 1 {
+			t.Fatalf("after first not_found on placeholder: queued = %d, want 1", got)
+		}
+
+		f.mu.Lock()
+		f.onAssistantSend = nil
+		f.failAssistant = nil
+		f.mu.Unlock()
+		f.setSessions("server", main, physical)
+		drainSettled(t, s, physical)
+		if got := f.sentTo("lead1"); got != 1 || s.queuedFor("lead1") != 0 {
+			t.Fatalf("after physical row listed: sent=%d queued=%d, want 1 and 0", got, s.queuedFor("lead1"))
+		}
+	})
 }

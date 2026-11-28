@@ -20,11 +20,12 @@ const { ResourceRow, Wire } = await import('../entry/src/main/ets/models/Wire.et
 const { screenConnectionInfo } = await import('../entry/src/main/ets/models/ScreenConnectionInfo.ets');
 const source=readFileSync(new URL('../entry/src/main/ets/components/SettingsPage.ets',import.meta.url),'utf8');
 function method(name){const start=source.search(new RegExp('^  private (?:async )?'+name+'\\(','m'));assert.ok(start>=0,name);const body=source.indexOf('{',start);let depth=1,quote='',escape=false,index=body+1;for(;index<source.length&&depth;index++){const c=source[index];if(quote){if(escape)escape=false;else if(c==='\\')escape=true;else if(c===quote)quote='';}else if(c==='"'||c==="'"||c==='`')quote=c;else if(c==='{')depth++;else if(c==='}')depth--;}return source.slice(start,index);}
-const Page=new Function('Wire','ResourceRow','screenConnectionInfo','return '+stripTypeScriptTypes('class Page{'+['chooseMachine','machineRow','screenMachine','supportsScreen','canOpenScreen'].map(method).join('\n')+'}'))(Wire,ResourceRow,screenConnectionInfo);
+const methods=['chooseMachine','machineRow','screenMachine','canOpenScreen','clearMachineChoice','sameRoutedMachine','machineOptions','loadMachineDirectory','openMachineAdmin'];
+const Page=new Function('Wire','ResourceRow','screenConnectionInfo','return '+stripTypeScriptTypes('class Page{'+methods.map(method).join('\n')+'}'))(Wire,ResourceRow,screenConnectionInfo);
 function deferred(){let resolve;return{promise:new Promise(r=>resolve=r),resolve:value=>resolve(value)};}
 function fixture(){const page=new Page(),calls=[];let generation=1;
  const machine=(group)=>{const row=ResourceRow.from({id:'same-mac',manager:'work',online:true,trust:'confirmed',os:'mac'},'machine');row.group=group;return row;};
- const a=machine('hub-a'),b=machine('hub-b');const owner=row=>({profile:{id:row.group,manager:'work'},connected:true,demo:false,machines:[row],scope:()=>row.group,connectionGeneration:()=>generation,pairingRevision:()=>0});const owners={a:owner(a),b:owner(b)};
+ const a=machine('hub-a'),b=machine('hub-b');const owner=row=>({connected:true,demo:false,machines:[row]});const owners={a:owner(a),b:owner(b)};
  page.model={demo:false,connectionGeneration:()=>generation,scope:()=> 'root',owns:(g,s)=>g===generation&&s==='root',viewFor:async row=>row.group==='hub-b'?owners.b:owners.a};
  page.management={loading:false,rows:[],setAdmission(admit){this.admit=admit;},async load(_page,owner){calls.push(owner);this.rows=owner.machines.map(row=>({id:row.id,raw:row.data()}));}};page.mounted=true;page.active=true;page.machineRevision=0;
  return{page,calls,a,b,owners,bump:()=>generation++};}
@@ -33,33 +34,93 @@ test('a late owner lookup cannot replace the current machine or revive a hidden 
 
 test('choosing an unavailable Hub clears the former machine and its pair code before lookup',async()=>{const f=fixture();await f.page.chooseMachine(f.a);f.page.management.pairing={pair_url:'synthetic-owner-a-code',machine:f.a.id};f.page.pairingOwnerScope='hub-a';f.page.computerName='Old draft';f.page.model.viewFor=async()=>{throw Error('offline');};await f.page.chooseMachine(f.b);assert.equal(f.page.machineOwner,undefined);assert.equal(f.page.screenMachine(),undefined);assert.equal(f.page.canOpenScreen(),false);assert.equal(f.page.management.selectedId,'');assert.deepEqual(f.page.management.pairing,{});assert.equal(f.page.computerName,'');assert.equal(f.page.pairingOwnerScope,'');});
 
-test('an unqualified legacy row can open only the selected owner’s screen', async () => {
- const f = fixture();
- f.owners.b.profile = { id: 'hub-b', manager: 'work' };
- const local = ResourceRow.from(f.b.data(), 'machine');
- f.owners.b.machines = [local];
- await f.page.chooseMachine(f.b);
- assert.equal(f.page.screenMachine().group, 'hub-b');
- assert.equal(local.group, '');
- f.owners.b.profile = { id: 'hub-a', manager: 'work' };
- assert.equal(f.page.canOpenScreen(), false);
+test('management starts at the routed machine across equal IDs and clears stale actions when that specific machine disappears',async()=>{
+  const f=fixture(), page=f.page;
+  Object.assign(page.model,{profile:{id:'hub-a',manager:'work'},directoryReady:true,directoryMachines:[f.a,f.b],
+    selected:f.a,refreshDirectory:async()=>{}});
+  page.page='machines';page.initialMachine=f.b;
+  await page.loadMachineDirectory();
+  assert.equal(page.machineOwner,f.owners.b);assert.equal(page.machineDirectoryKey,f.b.key());assert.equal(page.screenMachine(),f.b);
+  page.management.pairing={pair_url:'fixture-code'};page.model.directoryMachines=[f.a];await page.loadMachineDirectory();
+  assert.equal(page.management.error,'admin_machine_unavailable');assert.equal(page.machineOwner,undefined);
+  assert.equal(page.screenMachine(),undefined);assert.deepEqual(page.management.pairing,{});assert.equal(page.management.admit(),false);
+  assert.deepEqual(f.calls,[f.owners.b]);
 });
 
-test('returning from a conversation reuses the same confirmed machine and renews admission for this visit', async () => {
-  const { page, b, calls, owners, bump } = fixture();
-  await page.chooseMachine(b);
-  const originalRows = page.management.rows, previousAdmission = page.management.admit;
-  page.detailOwner = owners.b;
-  page.machineRevision++;
-  assert.equal(previousAdmission(), false);
-  await page.chooseMachine(b, true);
-  assert.equal(calls.length, 1);
-  assert.equal(page.management.rows, originalRows);
-  assert.equal(page.management.admit(), true);
-  bump();
-  assert.equal(page.management.admit(), false);
-  await page.chooseMachine(b, true);
-  assert.equal(calls.length, 2, 'a new connection must verify management actions again');
+test('when the route changes during lookup, only its latest bound machine can become active',async()=>{
+  const f=fixture(), page=f.page, gate=deferred();let request=0;
+  Object.assign(page.model,{profile:{id:'hub-a',manager:'work'},directoryReady:true,directoryMachines:[f.a,f.b],selected:f.a,
+    refreshDirectory:()=>++request===1?gate.promise:Promise.resolve()});
+  page.page='machines';page.initialMachine=f.a;
+  const first=page.loadMachineDirectory();page.initialMachine=f.b;await page.loadMachineDirectory();gate.resolve();await first;
+  assert.equal(page.machineDirectoryKey,f.b.key());assert.equal(page.machineOwner,f.owners.b);
+  assert.deepEqual(f.calls,[f.owners.b]);
+});
+
+test('an owner-local row without a group opens its actual computer, and a mismatched manager is never rebound',async()=>{
+  const f=fixture(), page=f.page;f.owners.b.profile={id:'hub-b',manager:'work'};
+  await page.chooseMachine(f.b);
+  const local=ResourceRow.from({id:f.b.id,manager:'work',os:'darwin',online:true},'machine');
+  f.owners.b.machines=[local];
+  const result=page.screenMachine();assert.equal(result.group,'hub-b');assert.equal(result.manager,'work');assert.equal(page.canOpenScreen(),true);
+  f.owners.b.profile.manager='different';assert.equal(page.screenMachine(),undefined);assert.equal(page.canOpenScreen(),false);
+});
+
+test('the general machine manager remembers an explicit dropdown choice before the previously selected resource',async()=>{
+  const f=fixture(), page=f.page;
+  Object.assign(page.model,{profile:{id:'hub-a',manager:'work'},directoryReady:true,directoryMachines:[f.a,f.b],selected:f.a,
+    refreshDirectory:async()=>{}});
+  page.page='machines';await page.loadMachineDirectory();await page.chooseMachine(f.b);await page.loadMachineDirectory();
+  assert.equal(page.machineOwner,f.owners.b);assert.equal(page.machineDirectoryKey,f.b.key());
+});
+
+test('a routed detail never exposes actions for the first management row while its own row is resolving', async () => {
+  const f = fixture();
+  f.page.initialMachine = f.b;
+  const other = { id: 'other-machine', raw: { online: true } };
+  f.page.management.rows = [other];
+  f.page.management.selectedId = other.id;
+  assert.equal(f.page.machineRow(), undefined);
+  assert.equal(f.page.canOpenScreen(), false);
+
+  // A machine may disappear after the directory read but before the manager's response.
+  f.owners.b.machines = [];
+  await f.page.chooseMachine(f.b);
+  assert.equal(f.page.management.error, 'admin_machine_unavailable');
+  assert.equal(f.page.machineRow(), undefined);
+  assert.equal(f.page.screenMachine(), undefined);
+});
+
+test('a scoped detail shows loading while the directory is resolving instead of the empty list', async () => {
+  const f = fixture(), gate = deferred();
+  Object.assign(f.page.model, { profile: { id: 'hub-a', manager: 'work' }, directoryReady: true,
+    directoryMachines: [f.b], selected: f.b, refreshDirectory: () => gate.promise });
+  f.page.initialMachine = f.b;
+  const read = f.page.loadMachineDirectory();
+  assert.equal(f.page.management.loading, true);
+  assert.equal(f.page.canOpenScreen(), false);
+  gate.resolve();
+  await read;
+  assert.equal(f.page.management.loading, false);
+  assert.equal(f.page.screenMachine(), f.b);
+});
+
+test('removal opens the owning Hub admin page and leaves relayed addresses in the app', async () => {
+  const f = fixture(), links = [];
+  f.owners.b.profile = { id: 'hub-b', manager: 'work', baseUrl: 'https://example.invalid/' };
+  f.page.getUIContext = () => ({ getHostContext: () => ({ openLink: async url => links.push(url) }) });
+  await f.page.chooseMachine(f.b);
+  await f.page.openMachineAdmin();
+  assert.deepEqual(links, ['https://example.invalid/admin/machines']);
+
+  f.owners.b.profile.baseUrl = 'https://example.invalid/relay/sample';
+  await f.page.openMachineAdmin();
+  assert.equal(f.page.management.error, 'machine_admin_root');
+  assert.equal(links.length, 1);
+  f.owners.b.profile.baseUrl = 'https://example.invalid/';
+  f.page.active = false;
+  await f.page.openMachineAdmin();
+  assert.equal(links.length, 1);
 });
 
 test('an unavailable screen status lookup does not block loading the machine detail', async () => {
@@ -70,4 +131,23 @@ test('an unavailable screen status lookup does not block loading the machine det
   assert.equal(attempted, 1);
   assert.deepEqual(f.calls, [f.owners.b]);
   assert.equal(f.page.management.selectedId, f.b.id);
+});
+
+test('a scoped online Mac exposes View Screen directly from its own machine detail', () => {
+  const ui = readFileSync(new URL('../entry/src/main/ets/components/MachineDirectory.ets', import.meta.url), 'utf8');
+  const matched = ui.match(/  private canViewScreen\(row: ResourceRow\): boolean \{[\s\S]*?\n  \}/);
+  assert.ok(matched);
+  const Detail = new Function('return ' + stripTypeScriptTypes('class Detail {' + matched[0] + '}'))();
+  const page = new Detail();
+  const row = ResourceRow.from({ id: 'test-machine', os: 'macOS', online: true, trust: 'confirmed' }, 'machine');
+  row.group = 'sample-hub'; row.manager = 'sample-manager';
+  const owner = { connected: true, demo: false };
+  Object.assign(page, { active: true, selected: row, model: { directoryOwnerFor: () => owner } });
+  assert.equal(page.canViewScreen(row), true);
+  const foreign = ResourceRow.from(row.data(), 'machine'); foreign.group = 'other-hub';
+  assert.equal(page.canViewScreen(foreign), false);
+  owner.connected = false; assert.equal(page.canViewScreen(row), false);
+  owner.connected = true; owner.demo = true; assert.equal(page.canViewScreen(row), false);
+  owner.demo = false; page.active = false; assert.equal(page.canViewScreen(row), false);
+  assert.match(ui, /Button\(tr\('computer_screen_open'\)\)[\s\S]*?this\.onComputer\(row\)[\s\S]*?id\('machines\.screen'\)/);
 });

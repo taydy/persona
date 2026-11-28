@@ -6,10 +6,23 @@ export class Tokens {
   static readonly divider: number = 0.5;
   static readonly card: number = 20;
   static readonly header: number = 56;
+  static readonly compactStatusInset: number = 62;
   static readonly chrome: number = 40;
   static readonly symbol: number = 22;
   static readonly symbolFont: string = String(Tokens.symbol) + 'vp';
-  static readonly chromeFontMaxScale: number = 2;
+  // Persona caps interface text at iOS xxxLarge. UIKit adds six points to its
+  // standard interface styles there. Message, document and editor text retain
+  // the full accessibility scale.
+  static readonly interfaceFontMaxScale: number = 23 / 17;
+  static readonly chromeFontMaxScale: number = 40 / 34;
+  static interfaceScaleFor(points: number): number {
+    const standard = Math.max(11, Math.min(34, points));
+    return (standard + 6) / standard;
+  }
+  // Native text-field placeholders and menu item content accept lengths in vp.
+  static interfaceFontVp(points:number,systemScale:number):string {
+    return String(points*Math.min(systemScale,Tokens.interfaceScaleFor(points)))+'vp';
+  }
   static readonly avatar: number = 40;
   static readonly avatarChoice: number = 56;
   static readonly caption: number = 13;
@@ -21,9 +34,11 @@ export class Tokens {
   static readonly inputLines: number = 144;
   static readonly compactPane: number = 340;
   static readonly popupWidth: number = 280;
+  // Compact system-like navigation shares a line with back and menu buttons at every text size.
+  static readonly navigationTextMaxScale: number = Tokens.interfaceFontMaxScale;
   static readonly headerSegment: number = 192;
   static readonly headerWideSegment: number = 176;
-  static readonly minimumInput: number = 160;
+  static readonly minimumInput: number = 136;
   static readonly hairline: number = 1;
   static readonly fine: number = 4;
   static readonly gap: number = 8;
@@ -34,6 +49,40 @@ export class Tokens {
   static readonly meta: number = 14;
   static readonly title: number = 20;
   static readonly signInNumber: number = 64;
+  // iOS Theme.Font / Theme.Radius / Theme.Space canonical scales
+  static readonly typeDisplay: number = 28;
+  static readonly typeTitle: number = 22;
+  static readonly typeHeading: number = 17;
+  static readonly typeBody: number = 17;
+  static readonly typeSecondary: number = 15;
+  static readonly typeCaption: number = 13;
+  static readonly typeSectionHeader: number = 13;
+  static readonly typeLabel: number = 12;
+  static readonly typeCode: number = 13;
+  static readonly lineHeightDisplay: number = 34;
+  static readonly lineHeightTitle: number = 28;
+  static readonly lineHeightHeading: number = 22;
+  static readonly lineHeightBody: number = 24;
+  static readonly lineHeightSecondary: number = 21;
+  static readonly lineHeightCaption: number = 18;
+  static readonly lineHeightLabel: number = 16;
+  static readonly radiusBadge: number = 6;
+  static readonly radiusControl: number = 10;
+  static readonly radiusCard: number = 14;
+  static readonly radiusSheetCard: number = 20;
+  static readonly radiusBubble: number = 20;
+  static readonly radiusPanel: number = 22;
+  static readonly radiusCapsule: number = 999;
+  static readonly spaceXxs: number = 2;
+  static readonly spaceXs: number = 4;
+  static readonly spaceSm: number = 6;
+  static readonly spaceS: number = 8;
+  static readonly spaceM: number = 12;
+  static readonly spaceL: number = 16;
+  static readonly spaceXl: number = 24;
+  static readonly controlCompact: number = 36;
+  static readonly controlBar: number = 44;
+  static readonly controlTouch: number = 48;
   static readonly markdownHeading1: number = 32;
   static readonly markdownHeading2: number = 28;
   static readonly markdownHeading3: number = 24;

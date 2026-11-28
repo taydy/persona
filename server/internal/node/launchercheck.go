@@ -12,6 +12,7 @@ import (
 	"github.com/nwverse/persona/server/internal/aiwire"
 	"github.com/nwverse/persona/server/internal/compat"
 	"github.com/nwverse/persona/server/internal/lazyre"
+	"github.com/nwverse/persona/server/internal/modelhttp"
 	"github.com/nwverse/persona/server/internal/prompts"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/shellcmd"
@@ -76,7 +77,13 @@ func (n *Node) launcherCheckWith(ctx context.Context, name string, o launcherChe
 	}
 	// A runtime's launcher, as a start in ctx's host runs it: where that host's engine runs only its own launchers, its
 	// provider of the name, whatever launcher of the shell's or of Persona's has it too (#8140).
-	if h := n.runtimeOfIn(ctx, name); h != nil {
+	h := n.runtimeOfIn(ctx, name)
+	if h == nil && !n.usesAgyPane(ctx, name, "") {
+		if m, ok := n.managedLauncher(name); ok && m.AgentType() == agyAgent {
+			h = n.runtimes.launcherRuntime(agyAgent)
+		}
+	}
+	if h != nil {
 		if result, handled := n.runtimeLauncherCheck(ctx, h, name, dir, prompt, model); handled {
 			return result
 		}
@@ -117,6 +124,10 @@ func (n *Node) launcherCheckWith(ctx context.Context, name string, o launcherChe
 		if err != nil {
 			return proto.LauncherCheck{Agent: agent, Error: err.Error()}
 		}
+		settings, err = n.sourceClaudeSettings(ctx, name, dir, settings, "", modelhttp.Source{Role: "background"})
+		if err != nil {
+			return proto.LauncherCheck{Agent: agent, Error: err.Error()}
+		}
 		after += scriptSettingsFlag(settings)
 	}
 	ctx, cancel := context.WithTimeout(ctx, launcherCheckTimeout)
@@ -126,8 +137,15 @@ func (n *Node) launcherCheckWith(ctx context.Context, name string, o launcherChe
 		script = turn.inDirScript(n)
 	}
 	run := func(flag string) (string, error) {
-		cmd := loginShell(ctx, script(name, dir, before+flag+after))
-		cmd.Env = turn.env // nil (the node's own) but for an assistant turn
+		line := script(name, dir, before+flag+after)
+		if agent == "codex" && os.Getenv(modelhttp.SourceHostsEnv) != "" {
+			line = codexShellWith(line, "")
+		}
+		cmd := loginShell(ctx, line)
+		cmd.Env = turn.env
+		if agent == "codex" {
+			cmd.Env = append(cmd.Environ(), modelSourceEnvironment(modelhttp.Source{Role: "background"}, n.bin)...)
+		} // nil (the node's own) but for an assistant turn
 		killGroupOnCancel(cmd)
 		out, err := cmd.CombinedOutput()
 		return strings.TrimSpace(string(out)), err

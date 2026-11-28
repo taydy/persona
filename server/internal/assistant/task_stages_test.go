@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nwverse/persona/server/internal/assistant/repositorystore"
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
@@ -36,7 +37,7 @@ func TestTaskStageMergeRequestLinks(t *testing.T) {
 }
 
 func TestTaskStageMidTaskReply(t *testing.T) {
-	s, f := newTaskService(t)
+	s, f := newTaskServiceOn(t, repositorystore.New(todoTestDB(t)))
 	todo := startedTask(t, s, f)
 	ctx := context.Background()
 	if got := todoNow(s, todo.ID); got.StageKind != "general" {
@@ -44,8 +45,9 @@ func TestTaskStageMidTaskReply(t *testing.T) {
 	}
 	agentTurn(s, f, proto.StatusWorking, "", 0)
 	url := "https://gitlab.example.com/group/repo/-/merge_requests/42"
+	reply := artifactReportProof(f, todo, "Opened "+url, url)
 	// No TurnEnded: a progress reply from the list must update a running task.
-	s.SessionsChanged(ctx, DeviceSessions{MachineID: "box", Sessions: []proto.Session{{SessionID: "s1", Status: proto.StatusWorking, LastText: "Opened " + url}}})
+	s.SessionsChanged(ctx, DeviceSessions{MachineID: "box", Sessions: []proto.Session{{SessionID: "s1", Status: proto.StatusWorking, LastText: reply.Text, UpdatedAt: reply.TS}}})
 	if got := todoNow(s, todo.ID); got.Stage != "review" || got.PRURL != url || got.StageKind != "code" || got.DoneAt != nil {
 		t.Fatalf("mid-task review = %+v", got)
 	}
@@ -64,7 +66,7 @@ func TestTaskStageMidTaskReply(t *testing.T) {
 }
 
 func TestTaskStageClippedProgressReply(t *testing.T) {
-	s, f := newTaskService(t)
+	s, f := newTaskServiceOn(t, repositorystore.New(todoTestDB(t)))
 	todo := startedTask(t, s, f)
 	ctx := context.Background()
 	url := "https://example.com/group/repo/-/merge_requests/73"
@@ -89,7 +91,8 @@ func TestTaskStageClippedProgressReply(t *testing.T) {
 	if got := todoNow(s, todo.ID); stageIndex(got.Stage) > stageIndex("develop") || got.PRURL != "" {
 		t.Fatalf("clipped item advanced progress: %+v", got)
 	}
-	s.taskStageItems(ctx, SessionItems{MachineID: "box", SessionID: "s1", Items: []proto.Item{{Role: "assistant", Kind: proto.KindText, Text: text}}})
+	reply := artifactReportProof(f, todo, text, url)
+	s.taskStageItems(ctx, SessionItems{MachineID: "box", SessionID: "s1", Items: []proto.Item{reply}})
 	if got := todoNow(s, todo.ID); got.Stage != "merge" || got.PRURL != url {
 		t.Fatalf("complete item missed its MR: %+v", got)
 	}
@@ -240,7 +243,7 @@ func TestTaskStagePendingPlan(t *testing.T) {
 		t.Fatalf("pending plan rolled back the stored stage: %s", stored)
 	}
 	// Starting another turn is not proof that the plan was approved.
-	s.taskWorking(ctx, "box", "s1")
+	s.taskWorking(ctx, "box", "s1", startRow{})
 	if todoNow(s, todo.ID).Stage != "plan" {
 		t.Fatal("working status cleared pending plan")
 	}
@@ -314,8 +317,10 @@ func TestTaskStageMetadataRoundTrip(t *testing.T) {
 	if got := s2.todoStages(ctx)[todo.ID].Kind; got != "general" {
 		t.Fatalf("reloaded kind = %s", got)
 	}
-	b := (&briefFacts{Progress: []briefProgress{{ID: todo.ID, Stage: "develop", StageKind: "general"}}}).body(s, "progress")
-	if b.Progress[0].StageKind != "general" {
-		t.Fatal("briefing omitted kind")
+	if s.briefingOn() {
+		b := s.briefBodyOf(&briefFacts{Progress: []briefProgress{{ID: todo.ID, Stage: "develop", StageKind: "general"}}}, "progress")
+		if b.Progress[0].StageKind != "general" {
+			t.Fatal("briefing omitted kind")
+		}
 	}
 }

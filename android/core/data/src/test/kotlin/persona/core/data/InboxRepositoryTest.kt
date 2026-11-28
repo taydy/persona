@@ -2,7 +2,7 @@ package persona.core.data
 
 import persona.core.contracts.*
 import persona.core.contracts.api.*
-import persona.feature.inbox.*
+import persona.core.contracts.generated.InboxStoredSources
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.test.TestScope
@@ -15,6 +15,7 @@ import org.junit.Test
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import persona.core.inbox.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class InboxRepositoryTest {
@@ -24,6 +25,38 @@ class InboxRepositoryTest {
             val calls = inboxCalls.get()
             delay(window)
             if (inboxCalls.get() == calls) break
+        }
+    }
+
+    @Test fun storedSourcesRoundTripThroughLiveResponseAndColdCache() = runBlocking {
+        val directory = Files.createTempDirectory("inbox-stored-sources-test").toFile()
+        val owner = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val snapshots = ListSnapshotStore(directory.resolve("snapshots"))
+            val transport = FakeTransport().apply {
+                storedSources = buildJsonObject { put("lark", true); put("mail", false) }
+            }
+            val repository = repository(transport, directory, owner, FakeHub(), snapshots = snapshots)
+            val live = withTimeout(5_000) { repository.snapshot.first { it.refreshes > 0 } }
+            assertEquals(InboxStoredSources(lark = true, mail = false), live.storedSources)
+            repository.refresh() // returns after the cache write
+            val cached = snapshots.restore<JsonObject>("hub/generation:inbox")!!
+            assertEquals(true, cached.getValue("stored_sources").jsonObject.getValue("lark").jsonPrimitive.boolean)
+            assertEquals(false, cached.getValue("stored_sources").jsonObject.getValue("mail").jsonPrimitive.boolean)
+
+            transport.onInbox = { awaitCancellation() }
+            val restoredRepository = repository(transport, directory, owner, FakeHub(), snapshots = snapshots)
+            val restored = withTimeout(5_000) { restoredRepository.snapshot.first { it.storedSources != null } }
+            assertEquals(InboxStoredSources(lark = true, mail = false), restored.storedSources)
+
+            val nullTransport = FakeTransport().apply { storedSources = JsonNull }
+            val nullRepository = repository(nullTransport, directory, owner, FakeHub(), snapshots = snapshots)
+            val unknown = withTimeout(5_000) { nullRepository.snapshot.first { it.refreshes > 0 } }
+            assertNull(unknown.storedSources)
+            assertNull(snapshots.restore<JsonObject>("hub/generation:inbox")!!["stored_sources"])
+        } finally {
+            owner.coroutineContext[Job]!!.cancelAndJoin()
+            directory.deleteRecursively()
         }
     }
 
@@ -44,6 +77,18 @@ class InboxRepositoryTest {
             val record = repository.snapshot.first { it.records.isNotEmpty() }.records.single()
             val connector = JsonCodec.encodeToJsonElement(InboxConnectorRef.serializer(), record.connector!!).jsonObject
             assertEquals(url, connector["url"]?.jsonPrimitive?.content)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun anApprovalDisplayCopyDoesNotBecomeASecondInboxRow() = runTest {
+        val directory = Files.createTempDirectory("inbox-approval-mirror-test").toFile()
+        try {
+            val original = Interaction("original", "box", "side", kind = "permission")
+            val mirror = original.copy(id = "display", sessionId = "main", mirrorOf = original.id)
+            val repository = repository(FakeTransport(), directory, backgroundScope, FakeHub(),
+                pending = listOf(original, mirror))
+            val shown = repository.snapshot.first { it.interactions.isNotEmpty() }.interactions
+            assertEquals(listOf("original"), shown.map { it.id })
         } finally { directory.deleteRecursively() }
     }
 
@@ -849,8 +894,8 @@ class InboxRepositoryTest {
             }
             val repository = repository(transport, directory, owner, FakeHub())
             val zone = java.time.ZoneId.of("Asia/Shanghai")
-            assertEquals(listOf(persona.feature.inbox.InboxDoneDay(java.time.LocalDate.of(2026, 11, 10), 120),
-                persona.feature.inbox.InboxDoneDay(java.time.LocalDate.of(2026, 11, 3), 4)), repository.doneDays("m-3fa21c", zone))
+            assertEquals(listOf(persona.core.inbox.InboxDoneDay(java.time.LocalDate.of(2026, 11, 10), 120),
+                persona.core.inbox.InboxDoneDay(java.time.LocalDate.of(2026, 11, 3), 4)), repository.doneDays("m-3fa21c", zone))
             assertEquals(listOf<Pair<String?, String>>("m-3fa21c" to "Asia/Shanghai"), asked)
             fun refused(code: Int) = object : IOException("hub $code"), persona.core.contracts.api.HubCodedFailure {
                 override val status: Int = code
@@ -1338,8 +1383,8 @@ class InboxRepositoryTest {
             assertEquals(listOf("received", "something_new"), listed.event.chain.map { it.kind })
             assertEquals(1L, listed.event.chain.first().link?.positionValue)
 
-            val request = persona.feature.inbox.SuggestionRequest("lark:c:1", 2, persona.feature.inbox.SuggestionAction.Confirm, "好的，改过")
-            assertEquals(persona.feature.inbox.SuggestionOutcome.Done, repository.actOnSuggestion(request))
+            val request = persona.core.inbox.SuggestionRequest("lark:c:1", 2, persona.core.inbox.SuggestionAction.Confirm, "好的，改过")
+            assertEquals(persona.core.inbox.SuggestionOutcome.Done, repository.actOnSuggestion(request))
             assertEquals(listOf("lark:c:1", 2L, "confirm", "好的，改过", request.clientId), transport.seen.single())
             repository.snapshot.value.records.single().let {
                 assertEquals("working", it.item.status)
@@ -1348,8 +1393,8 @@ class InboxRepositoryTest {
             }
 
             transport.answer = { throw InboxSuggestionStale(item(3, "action", "done")) }
-            val stale = persona.feature.inbox.SuggestionRequest("lark:c:1", 2, persona.feature.inbox.SuggestionAction.Reject)
-            assertEquals(persona.feature.inbox.SuggestionOutcome.Stale, repository.actOnSuggestion(stale))
+            val stale = persona.core.inbox.SuggestionRequest("lark:c:1", 2, persona.core.inbox.SuggestionAction.Reject)
+            assertEquals(persona.core.inbox.SuggestionOutcome.Stale, repository.actOnSuggestion(stale))
             assertEquals(3L, repository.snapshot.value.records.single().event.suggestion?.version)
         } finally {
             owner.coroutineContext[Job]!!.cancelAndJoin()
@@ -1792,7 +1837,7 @@ class InboxRepositoryTest {
 
     private fun repository(transport: FakeTransport, directory: java.io.File, owner: CoroutineScope,
         hub: FakeHub, snapshots: ListSnapshotStore? = null, sender: MainConversationSender? = null,
-        refreshWindowMillis: Long = 1_000): RealInboxRepository = RealInboxRepository(
+        pending: List<Interaction> = emptyList(), refreshWindowMillis: Long = 1_000): RealInboxRepository = RealInboxRepository(
         object : InboxAssistantConnection { override val current = MutableStateFlow<InboxAssistantTransport?>(transport) },
         InboxReplyJournal(directory, "hub/generation"),
         object : SessionsRepository {
@@ -1801,7 +1846,7 @@ class InboxRepositoryTest {
             override suspend fun refresh() = Unit
         },
         object : InteractionCenter {
-            override val pending = MutableStateFlow<List<Interaction>>(emptyList())
+            override val pending = MutableStateFlow(pending)
             override suspend fun refresh() = Unit
             override suspend fun resolve(id: String, resolution: Resolution) = Unit
         }, owner, snapshots = snapshots, hubConnection = hub, mainConversationSender = sender,
@@ -1830,6 +1875,7 @@ class InboxRepositoryTest {
     private class FakeTransport(override val scope: String = "hub/generation") : InboxAssistantTransport {
         var onReply: suspend (String) -> JsonObject = { JsonObject(emptyMap()) }
         var items = JsonArray(emptyList())
+        var storedSources: JsonElement? = null
         val mediaRefs = mutableListOf<String>()
         var onMedia: suspend (String) -> ByteArray = { byteArrayOf(1) }
         var onMessages: suspend (Long?, String?, String?) -> JsonObject = { _, _, _ -> buildJsonObject {
@@ -1842,7 +1888,10 @@ class InboxRepositoryTest {
         override suspend fun doneHistory(manager: String?, before: String?, beforeId: String?, limit: Int) = onDoneHistory(manager)
         val inboxCalls = java.util.concurrent.atomic.AtomicInteger()
         var onInbox: suspend () -> Unit = {}
-        override suspend fun inbox(): JsonObject { inboxCalls.incrementAndGet(); onInbox(); return buildJsonObject { put("items", items) } }
+        override suspend fun inbox(): JsonObject { inboxCalls.incrementAndGet(); onInbox(); return buildJsonObject {
+            put("items", items)
+            storedSources?.let { put("stored_sources", it) }
+        } }
         /** Each single-item read: the hub id and the manager its request named (RequestManager). */
         val itemCalls = mutableListOf<Pair<String, String?>>()
         var onItem: suspend (String) -> JsonObject = { throw UnsupportedOperationException() }

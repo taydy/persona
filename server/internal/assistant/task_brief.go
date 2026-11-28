@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/db"
 	"github.com/nwverse/persona/server/internal/prompts"
 	"github.com/nwverse/persona/server/internal/proto"
@@ -75,6 +76,8 @@ const (
 	briefEventDispatch    = "dispatch"
 	briefEventCompletion  = "completion"
 	briefEventEstimateDue = "estimate_due"
+	// briefEventMemory: the memory entries a start of the to-do carried in its first message (memory_handoff.go).
+	briefEventMemory = "memory"
 )
 
 // BriefRequest is the owner's message that led to a task: its words as they wrote them (cut at briefRequestMax, then
@@ -92,10 +95,64 @@ type BriefRequest struct {
 	Via []string `json:"via,omitempty"`
 }
 
-// BriefEvent is one entry of a brief's log. A scope change says what changed and the criteria/estimate it left;
-// dispatch starts one automatic task_plan round; completion records that round's first active completion and actual
-// minutes; estimate_due and overdue record accepted supervisor delivery. Approval belongs only to a risky scope change.
+// taskContract is the original contract on a brief or the fields changed by one scope event.
+type taskContract struct {
+	WorkMode         assistantwire.WorkMode       `json:"work_mode,omitempty"`
+	CompletionMode   assistantwire.CompletionMode `json:"completion_mode,omitempty"`
+	WorkModeDeclared bool                         `json:"work_mode_declared,omitempty"`
+}
+
+func (c taskContract) withDefaultWorkMode(readonly bool) taskContract {
+	if c.WorkMode == "" {
+		c.WorkMode = assistantwire.WorkModeExecute
+		if readonly {
+			c.WorkMode = assistantwire.WorkModeResearch
+		}
+	} else {
+		c.WorkModeDeclared = true
+	}
+	return c
+}
+
+// changesFrom keeps only fields that would change the effective contract.
+func (c taskContract) changesFrom(brief TaskBrief) taskContract {
+	if c.WorkMode == brief.WorkModeNow {
+		c.WorkMode = ""
+	}
+	if c.CompletionMode == brief.CompletionModeNow {
+		c.CompletionMode = ""
+	}
+	return c
+}
+
+// taskContractInput distinguishes an omitted option from an explicitly empty enum string in a tool call.
+type taskContractInput struct {
+	WorkMode       *assistantwire.WorkMode       `json:"work_mode"`
+	CompletionMode *assistantwire.CompletionMode `json:"completion_mode"`
+}
+
+func (in taskContractInput) validatedContract() (taskContract, error) {
+	var contract taskContract
+	if in.WorkMode != nil {
+		if !in.WorkMode.Valid() {
+			return taskContract{}, fmt.Errorf("work_mode %q must be execute, research or coordinate", *in.WorkMode)
+		}
+		contract.WorkMode = *in.WorkMode
+	}
+	if in.CompletionMode != nil {
+		if !in.CompletionMode.Valid() {
+			return taskContract{}, fmt.Errorf("completion_mode %q must be inherit, draft, ready, landed or verified", *in.CompletionMode)
+		}
+		contract.CompletionMode = *in.CompletionMode
+	}
+	return contract, nil
+}
+
+// BriefEvent is one entry of a brief's log. A scope change says what changed and the criteria, estimate or modes it left.
+// A dispatch starts an automatic task_plan round and completion records its first active completion and actual
+// minutes. Estimate_due and overdue record accepted supervisor delivery. Approval belongs only to a risky scope change.
 type BriefEvent struct {
+	taskContract
 	At               time.Time             `json:"at"`
 	Kind             string                `json:"kind"`
 	Todo             string                `json:"todo_id,omitempty"`
@@ -115,7 +172,11 @@ type BriefEvent struct {
 	Added         []string      `json:"added,omitempty"`
 	Dropped       []string      `json:"dropped,omitempty"`
 	Approval      *BriefRequest `json:"approval,omitempty"`
-	eventID       string        // process-local continuation rollback identity; never part of the wire or stored schema
+	// Entries are the memory entries a memory event's start carried, SensitiveEntries the sensitive ones among them
+	// (#13532): what the first message took of the user's memory, for the owner to check.
+	Entries          []string `json:"entries,omitempty"`
+	SensitiveEntries []string `json:"sensitive_entries,omitempty"`
+	eventID          string   // process-local continuation rollback identity; never part of the wire or stored schema
 }
 
 // BriefCriterion is one criterion's result when the work ended: met, not_met, unchecked (nobody checked it), or dropped
@@ -147,6 +208,7 @@ type BriefResult struct {
 
 // briefRecord is the part of a brief written once (the brief column): nothing changes it afterwards.
 type briefRecord struct {
+	taskContract
 	ID        string    `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
 	// Request: the owner's message, nil when the work was not started on one (StartedBy says by whom) or it could not
@@ -164,6 +226,7 @@ type briefRecord struct {
 	EstimateSource   string                `json:"estimate_source,omitempty"`
 	EstimateEvidence *TaskEstimateEvidence `json:"estimate_evidence,omitempty"`
 	OutOfBounds      []string              `json:"out_of_bounds,omitempty"`
+	DistinctFrom     []TaskDistinctFrom    `json:"distinct_from,omitempty"`
 	// Reconstructed: made later from what the to-do still had (a task from before briefs): Handover is the prompt its
 	// agent was handed, which is not the owner's words, and nothing else was invented.
 	Reconstructed bool   `json:"reconstructed,omitempty"`
@@ -187,6 +250,9 @@ type TaskBrief struct {
 	// and the supervisor was told.
 	Criteria  []string `json:"criteria"`
 	ExpectNow int      `json:"expect_minutes_now,omitempty"`
+	// WorkModeNow and CompletionModeNow are the original modes as the scope log left them.
+	WorkModeNow       assistantwire.WorkMode       `json:"work_mode_now,omitempty"`
+	CompletionModeNow assistantwire.CompletionMode `json:"completion_mode_now,omitempty"`
 	// EstimateSourceNow, EstimateClockAt and EstimateDueAt describe the automatic review clock, not the older
 	// overdue clock below. Empty for manual or pre-feature work until a task_plan dispatch makes it eligible.
 	EstimateSourceNow   string                `json:"estimate_source_now,omitempty"`
@@ -199,6 +265,14 @@ type TaskBrief struct {
 	ClockAt             time.Time             `json:"clock_at"`
 	DueAt               time.Time             `json:"due_at"`
 	Overdue             *time.Time            `json:"overdue_at,omitempty"`
+}
+
+// workModeDeclared distinguishes a work mode the supervisor set from the mode inferred from the launch permission.
+// Older briefs already distinguish coordinate and explicit scope changes. An initial execute or research mode with
+// no declaration record could have been the default.
+func (b TaskBrief) workModeDeclared() bool {
+	return b.WorkModeNow.Valid() && (b.WorkModeDeclared || b.WorkMode == assistantwire.WorkModeCoordinate ||
+		slices.ContainsFunc(b.Log, func(e BriefEvent) bool { return e.Kind == briefEventScope && e.WorkMode.Valid() }))
 }
 
 // LineageStep is one to-do of a brief's lineage: who worked on it, from when to when, and why it stopped ("" while it
@@ -309,6 +383,22 @@ func (tb *taskBrief) criteria() []string {
 		}
 	}
 	return slices.Clone(out)
+}
+
+func (tb *taskBrief) contract() taskContract {
+	out := tb.rec.taskContract
+	for _, e := range tb.st.Log {
+		if e.Kind != briefEventScope {
+			continue
+		}
+		if e.WorkMode != "" {
+			out.WorkMode = e.WorkMode
+		}
+		if e.CompletionMode != "" {
+			out.CompletionMode = e.CompletionMode
+		}
+	}
+	return out
 }
 
 func (e BriefEvent) updatesEstimate() bool {
@@ -484,7 +574,9 @@ func (tb *taskBrief) dropped() []BriefCriterion {
 
 func (tb *taskBrief) view() TaskBrief {
 	_, source, clock := tb.estimateState()
+	contract := tb.contract()
 	v := TaskBrief{briefRecord: tb.rec, Log: slices.Clone(tb.st.Log), Criteria: tb.criteria(), ExpectNow: tb.expect(),
+		WorkModeNow: contract.WorkMode, CompletionModeNow: contract.CompletionMode,
 		EstimateSourceNow: source, EstimateEvidenceNow: tb.estimateEvidence(), ClockAt: tb.clockAt(), DueAt: tb.dueAt(), Overdue: tb.overdueAt()}
 	if source != "" && v.ExpectNow > 0 {
 		v.EstimateClockAt, v.EstimateDueAt = clock, clock.Add(time.Duration(v.ExpectNow)*time.Minute)
@@ -495,6 +587,7 @@ func (tb *taskBrief) view() TaskBrief {
 		v.ActualMinutes, v.CompletionReported = c.ActualMinutes, &at
 	}
 	v.DoneWhen = slices.Clone(tb.rec.DoneWhen)
+	v.DistinctFrom = slices.Clone(tb.rec.DistinctFrom)
 	if v.DoneWhen == nil {
 		v.DoneWhen = []string{}
 	}
@@ -573,6 +666,19 @@ func (s *Service) briefOfTodo(id string) (TaskBrief, bool) {
 		return TaskBrief{}, false
 	}
 	return tb.view(), true
+}
+
+// committedBriefOfTodo waits for a pending write before a consumer acts on the contract.
+func (s *Service) committedBriefOfTodo(id string) (TaskBrief, bool) {
+	b := &s.tbriefs
+	b.mu.Lock()
+	briefID := b.links[id].Brief
+	b.mu.Unlock()
+	if briefID == "" {
+		return TaskBrief{}, false
+	}
+	brief, _, ok := s.briefSnapshotByID(briefID)
+	return brief, ok
 }
 
 // briefTodos are the to-dos on brief id, in the order they joined it.
@@ -917,7 +1023,8 @@ func (s *Service) linkTaskBrief(ctx context.Context, id, todoID, continues, reas
 	return nil
 }
 
-// unlinkTaskBrief takes back a continuation whose adoption failed, including only its uniquely marked scope event.
+// unlinkTaskBrief takes back a continuation whose adoption failed, including only its uniquely marked scope or estimate
+// event (an estimate-only takeover logs an estimate event, applyScope).
 // Durable writes go first: a failure leaves memory matching what a restart would read rather than hiding stale lineage
 // or criteria only until then. Scope and link removal are separate steps; the caller restores ledgers from the brief
 // that actually remains after both attempts.
@@ -931,7 +1038,7 @@ func (s *Service) unlinkTaskBrief(ctx context.Context, todoID, eventID string) e
 			kept := make([]BriefEvent, 0, len(tb.st.Log))
 			removed := false
 			for _, ev := range tb.st.Log {
-				if ev.Kind == briefEventScope && ev.Todo == todoID && ev.eventID == eventID {
+				if (ev.Kind == briefEventScope || ev.Kind == briefEventEstimate) && ev.Todo == todoID && ev.eventID == eventID {
 					removed = true
 					continue
 				}
@@ -985,6 +1092,7 @@ func (s *Service) changeBriefLocked(ctx context.Context, id string, change func(
 		return v, false, nil
 	}
 	tb.revision++
+	s.trevision.changed() // briefs and lineage are in the full to-do list too
 	tb.pending++
 	raw, err := json.Marshal(tb.st)
 	v := tb.view()
@@ -1137,11 +1245,13 @@ func (s *Service) callerOrigin(ctx context.Context, conversation string) briefRe
 	return s.briefOrigin(ctx, c.machine, conversation)
 }
 
-// briefFor makes the brief of a task handed out outside a plan (agent_start's task, an adopted agent, an agent that
-// became a task): who asked is origin, the goal its title, done as given. Logged, never fatal: the task goes on.
-func (s *Service) briefFor(ctx context.Context, origin briefRecord, todo Todo, doneWhen []string, expect int) {
+// briefFor makes the brief of a task handed out outside a plan, with its origin, title and acceptance criteria.
+// Callers decide whether the dispatch can proceed if the brief could not be kept.
+func (s *Service) briefFor(ctx context.Context, origin briefRecord, todo Todo, doneWhen []string, expect int) error {
 	origin.Goal, origin.DoneWhen, origin.ExpectMinutes = todo.Title, doneWhen, expect
-	if _, err := s.putTaskBrief(ctx, origin, todo.ID); err != nil {
+	_, err := s.putTaskBrief(ctx, origin, todo.ID)
+	if err != nil {
 		s.logf("task %s: brief: %v", todo.ID, err)
 	}
+	return err
 }

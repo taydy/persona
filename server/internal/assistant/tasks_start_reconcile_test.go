@@ -10,7 +10,42 @@ import (
 
 	"github.com/nwverse/persona/server/internal/db"
 	"github.com/nwverse/persona/server/internal/proto"
+	"github.com/nwverse/persona/server/internal/repositorywire"
+	"github.com/nwverse/persona/server/internal/taskworkspace"
 )
+
+func TestPlanStartTimeout(t *testing.T) {
+	ordinary := PlanTask{}
+	if got := ordinary.planStartTimeout(); got != taskStartTimeout {
+		t.Errorf("ordinary task timeout = %v, want %v", got, taskStartTimeout)
+	}
+	perRepo := repositorywire.MirrorEnsureTimeout + taskworkspace.GitTimeout + taskworkspace.ColdFetchTimeout
+	// Prepare, cancel and acquire each reserve the ordinary RPC budget, and prepare also has planning time.
+	base := taskStartTimeout + 3*taskworkspace.RPCTimeout + time.Minute
+	workspaces := map[string]PlanTask{
+		"resolved": {WorkspaceResolved: &TaskWorkspaceResolved{Repositories: make([]BackendLaunchRepository, 2)}},
+		"selected": {Workspace: &TaskWorkspace{
+			Mode:      workspaceContainer,
+			Container: &ContainerWorkspaceSelection{SelectedRepoIDs: []string{"repo_web", "repo_api"}},
+		}},
+	}
+	for name, task := range workspaces {
+		if got, want := task.planStartTimeout(), base+2*perRepo; got != want {
+			t.Errorf("%s workspace timeout = %v, want %v for two mirrors, direct fetches, workspace RPCs and the agent start", name, got, want)
+		}
+	}
+	saved := PlanTask{Workspace: &TaskWorkspace{
+		Mode:    workspaceBackend,
+		Backend: &BackendWorkspaceSelection{OperationID: "op_saved"},
+	}}
+	if got, want := saved.planStartTimeout(), base+repositorywire.MaxTaskRepositories*perRepo; got != want {
+		t.Errorf("unresolved saved workspace timeout = %v, want %v for the full repository limit", got, want)
+	}
+	saved.WorkspaceResolved = &TaskWorkspaceResolved{OperationID: "op_saved"}
+	if got := saved.planStartTimeout(); got != taskStartTimeout {
+		t.Errorf("resolved empty workspace timeout = %v, want %v", got, taskStartTimeout)
+	}
+}
 
 // ctxAwareLinkStore is a Store + todoStore whose agent links refuse a spent context, as pgx does: its first pool
 // Acquire on a cancelled or deadline-exceeded context fails at once. Only the methods the task-start path calls are
@@ -94,6 +129,16 @@ func shortTaskStartReconcile(t *testing.T) {
 	t.Cleanup(func() {
 		taskStartTimeout, taskStartAdoptWait, taskStartAdoptPoll, agentStartListTimeout = oldStart, oldWait, oldPoll, oldListTimeout
 	})
+}
+
+// shortTaskStartAdopt shortens only the search for the session of a start that did not answer (one second, quick polls),
+// for a test whose fake fails the start at once. The start keeps its budget: what it reads before it asks the node (the
+// plan, the model configuration in Postgres) is not squeezed into milliseconds (#14158).
+func shortTaskStartAdopt(t *testing.T) {
+	t.Helper()
+	oldWait, oldPoll := taskStartAdoptWait, taskStartAdoptPoll
+	taskStartAdoptWait, taskStartAdoptPoll = time.Second, 15*time.Millisecond
+	t.Cleanup(func() { taskStartAdoptWait, taskStartAdoptPoll = oldWait, oldPoll })
 }
 
 // reconcileHub is a fake hub with the given machines (no sessions yet) whose session.start always spends the

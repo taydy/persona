@@ -85,9 +85,75 @@ func reportHandoffTest(s *Service, session, kind string, receipt map[string]stri
 	return s.reportToSupervisor(context.Background(), "box", session, args, time.Now())
 }
 
+func TestTaskHandoffInboxStaysWithOrigin(t *testing.T) {
+	for _, mode := range []string{"omitted", "explicit", "already linked to origin", "already linked to receiver", "unassigned receiver"} {
+		t.Run(mode, func(t *testing.T) {
+			d := todoTestDB(t)
+			s, f, origin, _, receiving := handoffTestTodos(t, d)
+			it := taskInboxItem(t, s, "example:release-check", "server", "conv1")
+			session := "receiver"
+			if mode == "unassigned receiver" {
+				session = "unassigned"
+				f.setSessions("box",
+					proto.Session{MachineID: "box", SessionID: "origin-a", Status: proto.StatusIdle, Agent: "codex"},
+					proto.Session{MachineID: "box", SessionID: session, Status: proto.StatusIdle, Agent: "codex"})
+			}
+			if mode == "already linked to origin" || mode == "already linked to receiver" {
+				id := origin.ID
+				if mode == "already linked to receiver" {
+					id = receiving.ID
+				}
+				source := PlanTask{InboxItem: it.ID}
+				if err := s.planInboxSource(t.Context(), "server", "conv1", &source); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.linkExistingTaskInbox(t.Context(), "conv1", source, id, id, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := map[string]any{"machine": "box", "session_id": session, "text": "Please run the release check.",
+				"handoff": map[string]string{"todo_id": origin.ID, "receiving_todo_id": receiving.ID, "head": strings.Repeat("a", 40),
+					"check": handoffCheck, "until": "2h"}}
+			if mode != "omitted" {
+				args["inbox_item"] = it.ID
+			}
+			got, err := existingInboxCall(t, s, "agent_send", args)
+			if mode == "unassigned receiver" || mode == "already linked to receiver" {
+				if err == nil || len(sentToAgent(f)) != 0 {
+					t.Fatalf("invalid handoff sent a message: %s, %v", got, err)
+				}
+				return
+			}
+			if err != nil || len(sentToAgent(f)) != 1 {
+				t.Fatalf("handoff did not send exactly once: %s, %v", got, err)
+			}
+			next, _ := newQuietServiceOn(t, d)
+			if err := next.inboxReady(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "omitted" {
+				next.inbox.mu.Lock()
+				saved := next.inbox.items[it.ID]
+				unlinked := saved != nil && saved.Agent == nil
+				next.inbox.mu.Unlock()
+				if !unlinked {
+					t.Fatal("omitting inbox_item changed the saved Inbox assignment")
+				}
+			} else {
+				// The explicit backlink belongs to the origin. The chain points to the receiver.
+				origin.Agents = receiving.Agents
+				assertExistingInboxLink(t, next, it.ID, origin)
+			}
+			if current, ok := s.openTodoOfAgent("box", session); !ok || current.ID != receiving.ID {
+				t.Fatal("handoff changed the receiver's owning task", current.ID)
+			}
+		})
+	}
+}
+
 func TestConfirmedTaskHandoffsWakeOnlyMatchingOrigin(t *testing.T) {
 	ctx := context.Background()
-	d, err := db.Open(ctx, newDatabase(t), db.AllSets)
+	d, err := db.Open(ctx, newMigratedDatabase(t, db.AllSets), db.AllSets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +320,7 @@ func TestTaskHandoffRespectsNewWorkAndOwnerDecision(t *testing.T) {
 		t.Fatal("an unrelated conversation may not send a handoff for the originating to-do")
 	}
 	f.mu.Lock()
-	f.beforeSend = func() { s.taskWorking(context.Background(), "box", "origin-a") }
+	f.beforeSend = func() { s.taskWorking(context.Background(), "box", "origin-a", startRow{}) }
 	f.mu.Unlock()
 	if _, err := sendHandoffTest(t, s, f, "conv1", a.ID, receiving.ID, head); err == nil || todoNow(s, a.ID).Supervision.State == reviewParked {
 		t.Fatal("a node acknowledgement parked a work round that had already changed")
@@ -263,7 +329,7 @@ func TestTaskHandoffRespectsNewWorkAndOwnerDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.taskWorking(context.Background(), "box", "origin-a")
+	s.taskWorking(context.Background(), "box", "origin-a", startRow{})
 	second, err := sendHandoffTest(t, s, f, "conv1", a.ID, receiving.ID, strings.Repeat("b", 40))
 	if err != nil {
 		t.Fatal(err)

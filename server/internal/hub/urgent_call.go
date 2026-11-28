@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,8 +15,8 @@ import (
 	"github.com/nwverse/persona/server/internal/apns"
 	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/bus"
+	"github.com/nwverse/persona/server/internal/buswire"
 	"github.com/nwverse/persona/server/internal/lazyre"
-	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/relayproto"
 	"github.com/nwverse/persona/server/internal/rpc"
 )
@@ -25,13 +26,9 @@ import (
 // phone opens it, reports the call and asks the manager for the matter. The hub keeps no state about calls.
 
 func init() {
-	handleBus(assistantwire.MethodCallRing, func(h *Hub, ctx context.Context, c *busConn, params json.RawMessage) (any, error) {
-		var p assistantwire.CallRingRequest
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, &rpc.Error{Code: bus.CodeInvalidParams, Message: assistantwire.MethodCallRing + ": " + err.Error()}
-		}
+	handleTypedBus(assistantwire.CallRingMethod, assistantwire.MethodCallRing+": ", func(h *Hub, ctx context.Context, c *busConn, p assistantwire.CallRingRequest) (assistantwire.CallRingResult, error) {
 		if p.Call.ID == "" || p.Call.Title == "" {
-			return nil, &rpc.Error{Code: bus.CodeInvalidParams, Message: assistantwire.MethodCallRing + ": id and title are required"}
+			return assistantwire.CallRingResult{}, &rpc.Error{Code: bus.CodeInvalidParams, Message: assistantwire.MethodCallRing + ": id and title are required"}
 		}
 		return h.push.ringCall(ctx, c.managerID(), p.Call), nil
 	})
@@ -51,10 +48,8 @@ func init() {
 func (h *Hub) refreshAssistantTools() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	var res struct {
-		Tools []proto.Tool `json:"tools"`
-	}
-	if err := h.callBus(ctx, assistantwire.AssistantID, assistantwire.MethodTools, nil, &res); err != nil {
+	res, err := buswire.Call(ctx, h.managerCaller(assistantwire.AssistantID), assistantwire.ToolsMethod, assistantwire.SessionRef{})
+	if err != nil {
 		h.logf("assistant: tools: %v", err)
 		return
 	}
@@ -71,13 +66,15 @@ func (p *Pusher) callRouteOf(d Device) pushRoute {
 	switch {
 	case d.VoIPToken == "":
 		return pushRoute{Route: pushNone, Reason: pushNoToken}
-	case p.direct != nil:
+	case p.direct != nil && p.callable(d):
 		return pushRoute{Route: pushDirect}
+	case p.direct != nil:
+		return pushRoute{Route: pushNone, Reason: pushNoKey} // office network mode: a phone without a push key is not rung
 	case p.callable(d):
 		return pushRoute{Route: pushRelay}
 	case d.VoIPError != "":
 		return pushRoute{Route: pushNone, Reason: pushRelayFailed, Detail: d.VoIPError}
-	case d.RelayURL == "":
+	case d.RelayURL == "" || d.RelayGrant == "":
 		return pushRoute{Route: pushNone, Reason: pushNoRelay}
 	default:
 		return pushRoute{Route: pushNone, Reason: pushRelayFailed, Detail: "no grant"}
@@ -93,15 +90,16 @@ func (p *Pusher) callRouteOfID(id string) (pushRoute, bool) {
 	return p.callRouteOf(d), true
 }
 
-// callable: a ring can reach d (its PushKit token, and the relay's grant for it when the hub has no key).
+// callable: a ring can reach d (its PushKit token, the ordinary relay registration, and the relay's grant for that
+// token when the hub has no key). A relay URL kept only to diagnose a refused ordinary registration is not enough.
 func (p *Pusher) callable(d Device) bool {
 	if d.VoIPToken == "" {
 		return false
 	}
 	if p.direct != nil {
-		return true
+		return !p.privateOnly || d.PushKey != "" // office network mode rings only sealed
 	}
-	return d.RelayURL != "" && d.VoIPGrant != "" && d.PushKey != ""
+	return p.relayed(d) && d.VoIPGrant != ""
 }
 
 // pushTypeVoIP is the APNs push type of a ring (an APNs header, not a message the apps get).
@@ -200,6 +198,9 @@ func (p *Pusher) ringOne(d Device, payload map[string]any, call assistantwire.Ca
 		}
 		sealed = s
 	}
+	if p.privateOnly && sealed == "" {
+		return errors.New("office network mode rings only a phone with a push key")
+	}
 	if p.direct == nil {
 		return p.ringRelay(d, relayproto.PushRequest{Type: pushTypeVoIP, CollapseID: relayCollapseID("call:" + call.ID), Sealed: sealed, TTL: call.TTL})
 	}
@@ -215,7 +216,7 @@ func (p *Pusher) ringOne(d Device, payload map[string]any, call assistantwire.Ca
 		CollapseID: "call:" + call.ID, Expiration: p.now().Add(time.Duration(voipTTL(call.TTL)) * time.Second).Unix(), Body: body}
 	res, err := p.direct.Send(context.Background(), r)
 	for _, wait := range p.retryWaits {
-		if err == nil && !directRetryable(res.Status) {
+		if (err == nil && !directRetryable(res.Status)) || errors.Is(err, apns.ErrInvalidDeviceToken) {
 			break
 		}
 		time.Sleep(wait)
@@ -259,6 +260,9 @@ func (p *Pusher) ringRelay(d Device, req relayproto.PushRequest) error {
 
 // renewVoIPGrant registers d's PushKit token with its relay again and keeps the new grant.
 func (p *Pusher) renewVoIPGrant(d Device) (string, error) {
+	if p.privateOnly {
+		return "", errRelayOff
+	}
 	if d.VoIPToken == "" || d.Topic == "" {
 		return "", fmt.Errorf("device has no call token to register")
 	}

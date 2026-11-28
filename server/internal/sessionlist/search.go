@@ -1,9 +1,9 @@
 package sessionlist
 
 import (
-	"encoding/json"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -78,8 +78,28 @@ func allowedMachineKey(ids []string) string {
 	ids = slices.Clone(ids)
 	slices.Sort(ids)
 	ids = slices.Compact(ids)
-	data, _ := json.Marshal(ids)
-	return string(data)
+	var b strings.Builder
+	b.WriteByte('1')
+	for _, id := range ids {
+		b.WriteString(strconv.Itoa(len(id)))
+		b.WriteByte(':')
+		b.WriteString(id)
+	}
+	return b.String()
+}
+
+func inAllowedMachines(spelled, machine string) bool {
+	if spelled == "" {
+		return true
+	}
+	for rest := spelled[1:]; rest != ""; {
+		var id string
+		id, rest = lengthPrefixed(rest)
+		if id == machine {
+			return true
+		}
+	}
+	return false
 }
 
 // SearchNeedsPins lets adapters avoid a database read for queries that never
@@ -210,7 +230,11 @@ func (i *Index) searchCandidates(o Options, f filters, allowed map[string]bool, 
 		}
 		row, rowID, side := item, id, ""
 		if fold := item.item.Fold; o.Roots && fold != nil && fold.SearchAs != "" && fold.Root != "" {
-			if f.NoPrivate && item.item.Private {
+			if (f.NoPrivate || f.AgentsOnly) && item.item.Private ||
+				f.AgentsOnly && item.item.Assistant ||
+				(f.Manager != "" && item.owner != f.Manager) ||
+				(o.AllowedMachines != nil && !allowed[item.item.Machine]) ||
+				(f.ExcludePaneSource != "" && f.ExcludePaneSource == f.paneSource(item.item)) {
 				continue
 			}
 			row, rowID, side = i.items[fold.SearchAs], fold.SearchAs, fold.SearchSession
@@ -334,7 +358,7 @@ func (i *Index) searchResult(o Options, decoded map[*record]decodedDocument) (*r
 		if d.doc.Assistant || rd.doc.Assistant {
 			return nil
 		}
-		state := stateOf(row.item, o.Roots)
+		state := stateOf(row.item, o.Roots, o.CrossMachineHierarchy)
 		if state == "" {
 			state = rd.doc.State
 		}
@@ -391,7 +415,7 @@ func (i *Index) searchResult(o Options, decoded map[*record]decodedDocument) (*r
 		}
 		r.searchHits[rowID] = hit
 		r.events = append(r.events, event{id: rowID, updated: row.item.UpdatedAt, value: row})
-		addCount(&r.counts, row.item, o.Roots, 1)
+		addCount(&r.counts, row.item, f, 1)
 		return nil
 	})
 	if err != nil {

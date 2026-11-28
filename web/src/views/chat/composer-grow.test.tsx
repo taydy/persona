@@ -93,6 +93,8 @@ describe("the phone composer", () => {
 
     box().setSelectionRange(5, 9);
     act(() => expandButton()!.click());
+    expect(editor()!.parentElement).toBe(document.body);
+    expect(host.contains(editor())).toBe(false);
     const big = editor()!.querySelector("textarea")!;
     expect(big.value).toBe(lines(9));
     expect([big.selectionStart, big.selectionEnd]).toEqual([5, 9]);
@@ -143,8 +145,8 @@ describe("the phone composer", () => {
     expect(onOverlayEntry()).toBe(true);
     act(() => document.querySelector<HTMLButtonElement>('[data-testid="composer-collapse"]')!.click());
     expect(editor()).toBeNull();
-    // back-close's 0 ms timer, then the Back it causes
-    await act(async () => void (await new Promise((r) => setTimeout(r, 30))));
+    // back-close's timer and the Back it causes can finish after a fixed sleep under load.
+    await act(async () => vi.waitFor(() => expect(onOverlayEntry()).toBe(false)));
     expect(onOverlayEntry()).toBe(false);
     expect(location.href).toBe(at);
   });

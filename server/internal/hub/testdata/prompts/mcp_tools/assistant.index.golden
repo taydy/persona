@@ -3,7 +3,10 @@ mail_search
 mail_read
 mail_save_attachment
 mail_send
+mail_move
+resource_status
 ask_user
+ask_user_withdraw
 notify_user
 supervision_finish
 schedule_followup
@@ -19,6 +22,7 @@ machine_redeploy
 agents_list
 agent_read
 agent_send
+agent_modes
 agent_switch
 agents_switch
 agent_interrupt
@@ -36,6 +40,7 @@ inbox_draft
 inbox_folders
 inbox_move
 inbox_post
+message_send
 kb_search
 kb_list
 kb_get
@@ -51,13 +56,20 @@ model_profiles_list
 model_profile_get
 model_profile_switch
 model_profile_rollback
+model_profile_capture
+model_profile_deactivate
+model_profile_clear
+model_probe
+launcher_import
 repositories_list
 repository_get
 repository_add
 view_show
 view_update
 view_get
+page
 conversations_list
+conversations_switch
 conversation_read
 conversation_rename
 conversation_archive

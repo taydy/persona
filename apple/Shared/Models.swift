@@ -670,12 +670,14 @@ extension Machine {
     }
 
     /// An explicit workspace host wins over the machine default, provided the machine enables it.
-    nonisolated func startsInHerdr(host: String?) -> Bool {
+    nonisolated func supportsOmpStartModel(host: String?) -> Bool {
         let herdr = MachineEngine.herdr.rawValue
-        let legacyHerdr = engine == .herdr || engine == .herdrBoth
-        guard engineHosts?.contains(herdr) ?? legacyHerdr else { return false }
-        if let host, !host.isEmpty { return host == herdr }
-        return defaultStartHost == herdr
+        let orca = MachineEngine.orca.rawValue
+        let target: String? = if let host, !host.isEmpty { host } else { defaultStartHost }
+        guard let target, target == herdr || target == orca else { return false }
+        if let engineHosts { return engineHosts.contains(target) }
+        if target == herdr { return engine == .herdr || engine == .herdrBoth }
+        return engine == .orca
     }
 }
 
@@ -692,6 +694,8 @@ nonisolated struct Launcher: Codable, Identifiable, Hashable, Sendable {
     var agentType: String? = nil
     /// An agent runtime's launcher that can run the Persona assistant (DSH's, docs/integrations/runtimes.md「Assistant」).
     var assistant: Bool? = nil
+    /// The runtime accepts manager-owned supervision instructions on a dedicated, per-session policy channel.
+    var supervisionPolicy: Bool? = nil
     /// How its last check or start went on the computer the list is for (`GET …/machines/{id}/launchers`,
     /// docs/server/launcher-health.md); nil: never checked, a failure too old to count, or an older hub.
     var health: LauncherHealth? = nil
@@ -714,7 +718,30 @@ nonisolated struct Launcher: Codable, Identifiable, Hashable, Sendable {
     var title: String {
         let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let label = trimmed?.isEmpty == false ? trimmed : nil
-        return Self.traeCLITitle(name: name, source: source, agent: runtimeAgent, baseURL: baseURL, displayName: label) ?? label ?? name
+        return Self.traeCLITitle(name: name, source: source, agent: runtimeAgent, baseURL: baseURL, displayName: label)
+            ?? Self.builtinTitle(name: name, displayName: label)
+    }
+    /// Canonical product titles shown for built-in launchers when no explicit custom `display_name` is set.
+    static let builtinTitles: [String: String] = [
+        "claude": "Claude Code",
+        "codex": "Codex",
+        "claude-desktop": "Claude Desktop",
+        "codex-app": "Codex App",
+        "traex": Session.traeCLIName,
+        "traecli": Session.traeCLIName,
+        "trae-cli": Session.traeCLIName,
+        "agy": "Antigravity CLI",
+        "omp": "Oh My Pi",
+        "cursor": "Cursor",
+        "gemini": "Gemini CLI",
+    ]
+    static func builtinTitle(name: String, displayName: String? = nil) -> String {
+        let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = trimmed?.isEmpty == false ? trimmed : nil
+        if let label, label.caseInsensitiveCompare(name) != .orderedSame {
+            return label
+        }
+        return builtinTitles[name.lowercased()] ?? label ?? name
     }
     /// Older hubs and runtime providers can supply a legacy label. Keep other labels chosen by the user.
     static func traeCLITitle(name: String, source: String?, agent: String?, baseURL: String?, displayName: String?) -> String? {
@@ -755,7 +782,7 @@ nonisolated struct Launcher: Codable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case name, model, agent, assistant, health, source
-        case displayName = "display_name", agentType = "agent_type"
+        case displayName = "display_name", agentType = "agent_type", supervisionPolicy = "supervision_policy"
         case baseURL = "base_url"
         case promptOptional = "prompt_optional"
         case runHere = "run_here"
@@ -775,6 +802,7 @@ nonisolated extension Launcher {
         agent = try c.decodeIfPresent(String.self, forKey: .agent)
         agentType = (try? c.decodeIfPresent(String.self, forKey: .agentType)).flatMap { $0 }
         assistant = try c.decodeIfPresent(Bool.self, forKey: .assistant)
+        supervisionPolicy = try c.decodeIfPresent(Bool.self, forKey: .supervisionPolicy)
         health = (try? c.decodeIfPresent(LauncherHealth.self, forKey: .health)) ?? nil
         promptOptional = try c.decodeIfPresent(Bool.self, forKey: .promptOptional)
         source = try c.decodeIfPresent(String.self, forKey: .source)
@@ -804,16 +832,19 @@ nonisolated struct LauncherHealth: Codable, Hashable, Sendable {
 
 extension Launcher {
     /// Runs Claude Code or Codex, or is an agent runtime's launcher that says it can: what the Persona assistant can
-    /// use (headless `claude -p`, `codex app-server`, the runtime). Other agents (TRAE CLI…) are left out; the node
-    /// refuses them with a reason too.
+    /// use (headless `claude -p`, `codex app-server`, the runtime). Mirrors the hub's assistant catalog and the web's
+    /// `runsAssistant` (#12569): native Claude Code/Codex launchers, Persona-managed providers of those engines,
+    /// managed Codex included, and runtimes that advertise the assistant. Other agents (TRAE CLI…) are left out; the
+    /// node refuses them with a reason too.
     var runsAssistant: Bool {
         if let assistant { return assistant }
         guard baseURL != "(traex)" else { return false }
-        // Older hubs can ignore purpose=assistant. A runtime's provider is not a shell command, and managed Codex
-        // launchers cannot start the assistant's app-server. Keep the shell fallback for hubs without capabilities.
+        // Older hubs can ignore purpose=assistant. A runtime's provider is not a shell command; keep the shell fallback
+        // for hubs without capabilities. The hub's configured kind wins over the node's agent (`runtimeAgent`).
         let managed = source == "persona" || source == LegacyNames.product
-        guard isMachineLauncher || managed, !(managed && agent == "codex") else { return false }
-        return agent == nil || agent == "" || agent == "claude" || agent == "codex"
+        guard isMachineLauncher || managed else { return false }
+        let kind = runtimeAgent
+        return kind == nil || kind == "" || kind == "claude" || kind == "codex"
     }
 }
 
@@ -895,14 +926,17 @@ nonisolated struct AgentModel: Codable, Hashable, Sendable, Identifiable {
     /// An ID the user typed before that ran, remembered on the hub for this computer and launcher (#1644); listed after
     /// the agent's own, most recent first, with no efforts (not known). It can be forgotten.
     var custom = false
+    /// Other spellings the hub folded into this row because they run the same model and context window (#10365).
+    /// Absent from an older hub, which lists every spelling as its own row.
+    var aliases: [String]?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, description, resolved, efforts, custom
+        case id, name, description, resolved, efforts, custom, aliases
         case isDefault = "default", defaultEffort = "default_effort"
     }
 
     init(id: String, name: String, description: String? = nil, resolved: String? = nil, isDefault: Bool = false,
-         efforts: [String]? = nil, defaultEffort: String? = nil, custom: Bool = false) {
+         efforts: [String]? = nil, defaultEffort: String? = nil, custom: Bool = false, aliases: [String]? = nil) {
         self.id = id
         self.name = name
         self.description = description
@@ -911,6 +945,7 @@ nonisolated struct AgentModel: Codable, Hashable, Sendable, Identifiable {
         self.efforts = efforts
         self.defaultEffort = defaultEffort
         self.custom = custom
+        self.aliases = aliases
     }
 
     init(from decoder: Decoder) throws {
@@ -923,6 +958,7 @@ nonisolated struct AgentModel: Codable, Hashable, Sendable, Identifiable {
         efforts = try c.decodeIfPresent([String].self, forKey: .efforts)
         defaultEffort = try c.decodeIfPresent(String.self, forKey: .defaultEffort)
         custom = try c.decodeIfPresent(Bool.self, forKey: .custom) ?? false
+        aliases = try c.decodeIfPresent([String].self, forKey: .aliases)
     }
 }
 
@@ -1109,6 +1145,8 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
     var sessionID: String
     var title: String
     var cwd: String
+    /// The node-verified physical directory used for workspace association.
+    var workspaceCWD: String? = nil
     var status: SessionStatus
     var paneID: String?
     var tabID: String?
@@ -1127,18 +1165,26 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
     /// App and Android do (`Session.isSubtask`, `CodexTasks`). Nil from older nodes.
     var isSubagent: Bool? = nil
     var parentSessionID: String? = nil
+    /// The parent's computer when `parent_session_id` lives on another computer (cross-machine A2A / dispatch subagent).
+    var parentMachineID: String? = nil
     var rootSessionID: String? = nil
     /// The session a question or approval is asking (`asking_parent_session_id`). The hub folds that child under it.
     var askingParentSessionID: String? = nil
     /// The parent this row folds under (`folded_under`), when the hub computed one. Empty from a hub without
     /// `sessions_hierarchy`, and for an orphan or a cycle. The row's own `state` is never replaced by the fold.
     var foldedUnder: String? = nil
+    /// The parent's computer when `folded_under` lives on another computer (`folded_under_machine_id`); nil for same-machine.
+    var foldedUnderMachineID: String? = nil
     /// How it folds (`folded_as`): "worker" for a tab worker, "side" for a Claude desktop app's side session (#7944).
     /// Absent otherwise.
     var foldedAs: String? = nil
     /// The side session whose chat a folded row belongs to when it folds through one and is not the side itself
     /// (`folded_side`: a side's own children and workers, #7944, `SideFold`). Absent otherwise.
     var foldedSide: String? = nil
+    /// Durable A2A task ID that launched this subagent (`a2a_task_id`); nil for peer messages and non-A2A subagents.
+    var a2aTaskID: String? = nil
+    /// How a subagent session was created (`subagent_origin`: "native" | "a2a" | "dispatch" | "runtime" | "spawned").
+    var subagentOrigin: String? = nil
     /// The session on the same machine this one was started from while staying a session of its own (`parent_agent_id`,
     /// #5935): a Claude desktop app's side chat, /btw question or spawned session. Nil from older nodes, and when empty.
     var parentAgentID: String? = nil
@@ -1213,6 +1259,8 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
     /// nil for the assistant's own. Not a host's space (`spaceKind` / `spaceID` are herdr's and Orca's).
     var assistantSpace: String? = nil
     var spaceKind: String?
+    /// Terminal host reported by the hub ("herdr", "herdr-core", "orca", "tern", "rex", "botmux"); optional on older hubs.
+    var host: String? = nil
     var spaceID: String?
     var spaceName: String?
     var spaceIndex: Int?
@@ -1389,6 +1437,8 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
     }
     /// How many subagents the row says are running: its own reported count and its working folded children, once.
     var shownRunningChildren: Int { ChildSessions.shownRunning(self) }
+    /// Unified parent-row rollup for subagents: Needs you > Running > quiet.
+    var childRollup: ChildSessions.Rollup { ChildSessions.childRollup(self) }
     /// Its turn ended, yet something brings it back, so its task waits rather than stopped (#3274; the hub's agentWaits):
     /// only its background work runs and will report back, or the hub waits out another agent, a deploy / CI / a time,
     /// or a moment's model failure for it and wakes it (work blocked on anything but the user).
@@ -1424,6 +1474,10 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
     static let healthSpace = "health"
     /// A conversation of the health space: kept off the Persona page's lists, shown on Health.
     var isHealth: Bool { assistantSpace == Self.healthSpace }
+    /// A conversation of any of the assistant's spaces, health's included (#13500): kept off the Persona page's lists.
+    var inSpace: Bool { assistantSpace != nil }
+    /// A conversation of a domain space other than health's (#13500, docs/apple/ios.md "Domain spaces").
+    var isDomainSpace: Bool { inSpace && !isHealth }
 
     var hasSource: Bool { !(sourceKind ?? "").isEmpty }
     var canRead: Bool { !hasSource || capabilities?.read == true }
@@ -1611,6 +1665,7 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
         case listWaiting = "waiting", listBackgroundCount = "background_count", listRunningSubagents = "running_subagents", listRunningWorkflows = "running_workflows"
         case listBackgroundTasksCount = "background_tasks_count", listWorkflowProgress = "workflow_progress"
         case title, cwd, status, launcher, model, agent, effort, efforts, capabilities, attached
+        case workspaceCWD = "workspace_cwd"
         case pendingEffort = "pending_effort", effortChangeFailed = "effort_change_failed"
         case hiddenByDirectory = "hidden_by_directory"
         case serviceTier = "service_tier", serviceTiers = "service_tiers"
@@ -1618,8 +1673,9 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
         case canFork = "can_fork"
         case sourceKind = "source_kind", sourceThreadID = "source_thread_id", sourceInstanceID = "source_instance_id",
              parentThreadID = "parent_thread_id", readOnlyReason = "read_only_reason"
-        case isSubagent = "is_subagent", parentSessionID = "parent_session_id", rootSessionID = "root_session_id"
-        case askingParentSessionID = "asking_parent_session_id", foldedUnder = "folded_under", foldedAs = "folded_as"
+        case isSubagent = "is_subagent", parentSessionID = "parent_session_id", parentMachineID = "parent_machine_id", rootSessionID = "root_session_id"
+        case askingParentSessionID = "asking_parent_session_id", foldedUnder = "folded_under", foldedUnderMachineID = "folded_under_machine_id", foldedAs = "folded_as"
+        case a2aTaskID = "a2a_task_id", subagentOrigin = "subagent_origin"
         case children, startedAt = "started_at", foldedSide = "folded_side", parentAgentID = "parent_agent_id"
         case codexRoute = "codex_route", codexRouteNote = "codex_route_note"
         case agentLabelHint = "agent_label"
@@ -1631,7 +1687,7 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
         case machineID = "machine_id", sessionID = "session_id", paneID = "pane_id", tabID = "tab_id",
              workspaceID = "workspace_id", agentName = "agent_name", startedByPersona = "started_by_persona", assistant, archived, state,
              assistantSpace = "space",
-             spaceKind = "space_kind", spaceID = "space_id", spaceName = "space_name", spaceIndex = "space_index", parentSpaceID = "parent_space_id",
+             spaceKind = "space_kind", host, spaceID = "space_id", spaceName = "space_name", spaceIndex = "space_index", parentSpaceID = "parent_space_id",
              slotID = "slot_id", slotName = "slot_name", slotIndex = "slot_index", paneIndex = "pane_index", seenAt = "seen_at", stateSince = "state_since", queued, background, loop, goal, subagents, workflows, ports,
              updatedAt = "updated_at", lastText = "last_text", asks, awaitsReply = "awaits_reply", backgroundWaiting = "background_waiting", backgroundWorking = "background_working", activity, activityAt = "activity_at", pendingInteractions = "pending_interactions", rev, suggestion, suggestionRisky = "suggestion_risky",
              starting, awaitingFirstMessage = "awaiting_first_message", startError = "start_error", startErrorCode = "start_error_code", startErrorArgs = "start_error_args", todo, quiet, hubGroup = "app_hub_group",
@@ -1651,6 +1707,7 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
         manager = try c.decodeIfPresent(String.self, forKey: .manager)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
         cwd = try c.decodeIfPresent(String.self, forKey: .cwd) ?? ""
+        workspaceCWD = try c.decodeIfPresent(String.self, forKey: .workspaceCWD)
         let rawStatus = try c.decodeIfPresent(String.self, forKey: .status)
         status = rawStatus.flatMap(SessionStatus.init(rawValue:)) ?? .unknown
         wasInterrupted = rawStatus == "interrupted"
@@ -1665,12 +1722,16 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
         parentThreadID = try c.decodeIfPresent(String.self, forKey: .parentThreadID)
         isSubagent = try c.decodeIfPresent(Bool.self, forKey: .isSubagent)
         parentSessionID = try c.decodeIfPresent(String.self, forKey: .parentSessionID)
+        parentMachineID = Self.lenientText(c, .parentMachineID)
         rootSessionID = try c.decodeIfPresent(String.self, forKey: .rootSessionID)
         askingParentSessionID = try c.decodeIfPresent(String.self, forKey: .askingParentSessionID)
         // The hierarchy's keys: an odd one never drops the session; an empty one names nothing (#7944).
         foldedUnder = Self.lenientText(c, .foldedUnder)
+        foldedUnderMachineID = Self.lenientText(c, .foldedUnderMachineID)
         foldedAs = Self.lenientText(c, .foldedAs)
         foldedSide = Self.lenientText(c, .foldedSide)
+        a2aTaskID = Self.lenientText(c, .a2aTaskID)
+        subagentOrigin = Self.lenientText(c, .subagentOrigin)
         parentAgentID = Self.lenientText(c, .parentAgentID)
         // An odd rollup never drops the session. Omitted is none.
         children = (try? c.decodeIfPresent(SessionChildren.self, forKey: .children)).flatMap { $0 }
@@ -1711,6 +1772,7 @@ nonisolated struct Session: Codable, Identifiable, Hashable, Sendable {
         hiddenByDirectory = try c.decodeIfPresent(Bool.self, forKey: .hiddenByDirectory)
         assistantSpace = try c.decodeIfPresent(String.self, forKey: .assistantSpace).flatMap { $0.isEmpty ? nil : $0 }
         spaceKind = try c.decodeIfPresent(String.self, forKey: .spaceKind)
+        host = try c.decodeIfPresent(String.self, forKey: .host)
         spaceID = try c.decodeIfPresent(String.self, forKey: .spaceID)
         spaceName = try c.decodeIfPresent(String.self, forKey: .spaceName)
         spaceIndex = try c.decodeIfPresent(Int.self, forKey: .spaceIndex)
@@ -2227,6 +2289,45 @@ nonisolated extension Session {
         }
         return x
     }
+
+    /// Row-only fields on a `summary=1` response are authoritative, while absent detail-only fields (embedded
+    /// subagents, background tasks, workflows, queued messages, loop prompt, modes) stay intact from an earlier full
+    /// row instead of being wiped when a summary list or child-list refresh lands.
+    func preservingDetails(from old: Session?) -> Session {
+        guard listWaiting != nil, let old else { return self }
+        var row = self
+        row.background = old.background
+        row.subagents = old.subagents
+        row.workflows = old.workflows
+        if !row.assistant, row.undelivered == nil { row.undelivered = old.undelivered }
+        row.queued = old.queued
+        row.queuedRelayed = old.queuedRelayed
+        if var loop = row.loop, (loop.prompt ?? "").isEmpty, let oldPrompt = old.loop?.prompt, !oldPrompt.isEmpty {
+            loop.prompt = oldPrompt
+            row.loop = loop
+        }
+        row.ports = old.ports
+        row.permissionMode = old.permissionMode
+        row.bypassAvailable = old.bypassAvailable
+        // The pending choice and the confirmed effort come from the same session snapshot.
+        if row.pendingEffort == nil && old.pendingEffort == nil, row.effort == nil { row.effort = old.effort }
+        row.efforts = old.efforts
+        row.serviceTier = old.serviceTier
+        row.serviceTiers = old.serviceTiers
+        row.ultracode = old.ultracode
+        row.launcher = old.launcher
+        row.suggestion = old.suggestion
+        row.suggestionRisky = old.suggestionRisky
+        row.codexRoute = old.codexRoute
+        row.codexRouteNote = old.codexRouteNote
+        row.runtime = old.runtime
+        row.runtimeFallback = old.runtimeFallback
+        row.modelFallback = old.modelFallback
+        row.modelRestore = old.modelRestore
+        row.compaction = old.compaction
+        row.asks = old.asks
+        return row
+    }
 }
 
 extension Session {
@@ -2249,10 +2350,7 @@ extension Session {
         if state == .needsYou, let r = attentionReason, !r.isEmpty { return r } // a stale reason (offline, seen) stays out
         if state != .working, let r = failureReason, !r.isEmpty { return Session.failureText(r) }
         if let r = replyLine(muted: muted) { return r }
-        // The native Mac app is frozen (docs/apple/mac.md): its rows keep the line they had.
-        #if !os(macOS)
         if let c = closeoutPreview() { return c }
-        #endif
         if let w = workLine() { return w }
         return lastText.flatMap { $0.isEmpty ? nil : Fmt.plain($0) }
     }
@@ -2545,13 +2643,63 @@ nonisolated struct Fold: Codable, Hashable, Sendable {
     var tasks: [FoldTasks]? = nil
     /// The hub proved this supervision round is user-visible, even while its visibility tools are folded away.
     var supervisionUser: Bool? = nil
+    /// The files the run's successful edits changed (docs/protocol/protocol.md「Folded work」 `fold.changes`):
+    /// always a list from hubs that compute it (empty when the run edited nothing); nil from older hubs.
+    var changes: [FoldChange]? = nil
     /// What the folded items used (#5426). Omitted when none of them carried usage, and from older nodes.
     var usage: [TokenUsage]? = nil
+    /// Declarative UI views returned out-of-band by folded tool results (`Fold.toolViews`, UI version 12).
+    var toolViews: [FoldToolView]? = nil
+    /// Successful BotMux replies retained while their sending calls are folded away.
+    var botmux: [BotmuxMessage]? = nil
 
     enum CodingKeys: String, CodingKey {
-        case items, tools, thoughts, until, images, tasks, usage
+        case items, tools, thoughts, until, images, tasks, changes, usage, botmux
+        case toolViews = "tool_views"
         case supervisionUser = "supervision_user"
         case throughSeq = "through_seq", throughID = "through_id"
+    }
+}
+
+/// One file a folded run's successful edits changed (`Fold.changes`, docs/protocol/protocol.md「Folded work」):
+/// the lines added and removed summed over the run's edits of that path. `exact` is false when an edit's input was
+/// clipped for good.
+nonisolated struct FoldChange: Codable, Hashable, Sendable {
+    var path: String
+    var add: Int
+    var del: Int
+    var exact: Bool
+
+    init(path: String, add: Int, del: Int, exact: Bool = true) {
+        self.path = path
+        self.add = add
+        self.del = del
+        self.exact = exact
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decode(String.self, forKey: .path)
+        add = try c.decodeIfPresent(Int.self, forKey: .add) ?? 0
+        del = try c.decodeIfPresent(Int.self, forKey: .del) ?? 0
+        exact = try c.decodeIfPresent(Bool.self, forKey: .exact) ?? true
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case path, add, del, exact
+    }
+}
+
+/// One declarative UI view returned out-of-band by a folded run's tool_result (`Fold.toolViews`, UI version 12).
+nonisolated struct FoldToolView: Codable, Hashable, Sendable {
+    var itemID: String?
+    var toolUseID: String
+    var tool: String
+    var view: ExtensionView
+
+    enum CodingKeys: String, CodingKey {
+        case tool, view
+        case itemID = "item_id", toolUseID = "tool_use_id"
     }
 }
 
@@ -2760,19 +2908,60 @@ nonisolated struct Item: Codable, Identifiable, Hashable, Sendable {
     var sourceFingerprint: String? = nil
     /// The model that wrote this assistant item, including tool work after the last words. Older hubs omit it.
     var model: String? = nil
+    /// kind == .toolResult: out-of-band declarative UI views (maps, routes, search pins) drawn in the chat, never shown to models.
+    var toolViews: [ExtensionView]? = nil
+    /// Display-only BotMux metadata; text remains the original transcript.
+    var botmux: BotmuxMessage? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, seq, ts, role, kind, text, image, queued, from, wake, fold, task, compact, injected, source, outcome, usage, model
+        case id, seq, ts, role, kind, text, image, queued, from, wake, fold, task, compact, injected, source, outcome, usage, model, botmux
         case modelRefusal = "model_refusal", narration, codexHeartbeatQuiet = "codex_heartbeat_quiet"
         case sourceFingerprint = "source_fingerprint"
         case toolUseID = "tool_use_id", toolName = "tool_name", toolInput = "tool_input", isError = "is_error", fullSize = "full_size",
              clientMsgID = "client_msg_id", supervisionUser = "supervision_user"
+        case toolViews = "tool_views"
     }
 
     /// The text without the line the hub adds where it cut it (the app offers the whole text itself).
     var cutText: String {
         guard fullSize != nil, let text, let r = text.range(of: "\n…（已截断", options: .backwards) else { return text ?? "" } // i18n-ignore: matches the hub's text
         return String(text[..<r.lowerBound])
+    }
+}
+
+/// Safe display metadata from the node. Unknown kinds remain decodable and fall back to the original transcript.
+nonisolated struct BotmuxMessage: Codable, Hashable, Sendable {
+    var kind: String
+    var text: String
+    var sender: String?
+    var senderType: String?
+    var quoted: Bool?
+    var topicContext: Bool?
+    var thread: Bool?
+    var attachments: Int?
+    var attachmentMeta: [Attachment]?
+    var mentions: [String]?
+    var source: String?
+    var final: Bool?
+    var voice: Bool?
+    var truncated: Bool?
+
+    var isInbound: Bool { kind == "message" || kind == "trigger" }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, text, sender, quoted, thread, attachments, mentions, source, final, voice, truncated
+        case senderType = "sender_type", topicContext = "topic_context", attachmentMeta = "attachment_meta"
+    }
+
+    nonisolated struct Attachment: Codable, Hashable, Sendable {
+        var kind: String
+        var name: String?
+        var mimeType: String?
+
+        enum CodingKeys: String, CodingKey {
+            case kind, name
+            case mimeType = "mime_type"
+        }
     }
 }
 
@@ -2824,6 +3013,62 @@ nonisolated struct Question: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+/// A decoded optional Date that also retains its RFC3339 text for exact occurrence
+/// comparisons. Assigning a Date directly clears the wire text and keeps the old
+/// memberwise-initializer behavior; equality remains the old Date-only equality.
+/// This is plain storage rather than a property wrapper on Interaction: Swift 6.2
+/// does not allow a property wrapper on a stored property of a nonisolated type.
+nonisolated struct InteractionOccurrenceDate: Codable, Hashable, Sendable {
+    private var raw: String?
+    var wrappedValue: Date? {
+        didSet { raw = nil }
+    }
+    var projectedValue: String? { raw }
+
+    init() {
+        wrappedValue = nil
+        raw = nil
+    }
+
+    init(wrappedValue: Date?) {
+        self.wrappedValue = wrappedValue
+        raw = nil
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if try container.decodeNil() {
+            self.init()
+            return
+        }
+        // Match JSON.decoder's existing date behavior, including an invalid value
+        // becoming the zero Date rather than dropping the whole interaction.
+        let text = (try? container.decode(String.self)) ?? ""
+        self.init(wrappedValue: JSON.parseDate(text) ?? Date(timeIntervalSince1970: 0))
+        raw = text.isEmpty ? nil : text
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        if let raw {
+            try container.encode(raw)
+        } else {
+            try container.encode(wrappedValue)
+        }
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.wrappedValue == rhs.wrappedValue }
+    func hash(into hasher: inout Hasher) { hasher.combine(wrappedValue) }
+}
+
+/// Whether an answer completion may remove a pending card. A dated answer removes only the exact displayed
+/// occurrence; an old timestamp-less card keeps the legacy ID-only behavior.
+nonisolated func interactionRemovalMatches(_ candidate: Interaction, resolved: Interaction) -> Bool {
+    guard candidate.uid == resolved.uid else { return false }
+    guard let occurrence = resolved.createdAtWire else { return true }
+    return candidate.createdAtWire == occurrence
+}
+
 nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
     var id: String
     var machineID: String
@@ -2834,7 +3079,13 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
     var taskTitle: String?
     var cwd: String?
     var kind: InteractionKind
-    var createdAt: Date?
+    /// Display precision stays Date-compatible; `createdAtWire` retains the full occurrence timestamp.
+    /// The separate box is not a CodingKey: encoding below writes it as created_at, preserving the exact input text.
+    var createdAt: Date? = nil {
+        didSet { createdAtOccurrence = InteractionOccurrenceDate(wrappedValue: createdAt) }
+    }
+    /// Internal only because a private stored property would make Interaction's memberwise initializer private.
+    var createdAtOccurrence = InteractionOccurrenceDate()
     var expiresAt: Date?
     var toolName: String?
     var toolUseID: String?
@@ -2892,8 +3143,21 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
     var mutedFlag: Bool?
     /// The assistant is deciding whether it may answer this question for the user (docs/assistant/assistant.md "Assistant
     /// answers questions first"): nothing was pushed yet, and an answer given here wins. The same card comes again
-    /// without it, by `id`.
+    /// without it, by `id`. On a permission, plan or terminal dialog (`screen`) card it means the card went to the
+    /// supervisor of its Agent's task first (`supervisorHeld`).
     var delegating: Bool?
+    /// A card the supervisor of its Agent's task holds: a permission, a plan or a terminal dialog (`screen`) the hub
+    /// handed to the supervising conversation first (`routeAsk` in server/internal/assistant/ask_route.go sets
+    /// `delegating`, and clears it when the supervisor passes the card up with `ask_escalate`). Until then it is the
+    /// supervisor's, not the user's: it is no row of the Agents tab's Needs You and counts nowhere (the list, its header,
+    /// its filter and every badge leave it out), and the app offers no way to answer it (`answerableHere`). The owner
+    /// confirmed it for routed terminal questions on 2026-11-23 (docs/plans/plan-derived-counts.md, D11). A `delegating`
+    /// question is the other case, the assistant deciding whether it may answer for the user (`isDelegating`), and
+    /// stays as it was: listed and answerable.
+    var supervisorHeld: Bool { delegating == true && kind != .question }
+    /// Whether this app offers ways to answer the card (its form, quick answers on a list's card, Siri's Approve First,
+    /// the watch): not while its task's supervisor holds it (`supervisorHeld`), where the card says so instead.
+    var answerableHere: Bool { !supervisorHeld }
     /// What the assistant filled in when it left the question to the user.
     var delegate: Delegate?
     /// A standing rule the hub suggests on a question a supervisor passed up (#4929, #5802); the card comes again
@@ -2902,6 +3166,10 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
     /// The manager that reported it (docs/protocol/protocol.md "Per-manager routing"). Once it is no longer pending
     /// the hub routes by the manager a request names, so Change Answer names this one.
     var manager: String?
+    /// The authoritative interaction whose display-only copy this is. Conversation views keep both cards; aggregate
+    /// pages, counts and arrival feedback count only the authoritative one.
+    var mirrorOf: String? = nil
+    var isDisplayMirror: Bool { mirrorOf?.isEmpty == false }
     /// An `elicitation` card's form or link, and who asks: the MCP server, where it is configured, and the subagent that
     /// called it, each only when the source gave it.
     var elicitation: ElicitationRequest?
@@ -2915,6 +3183,11 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
         get { foldedUnderText?.value }
         set { foldedUnderText = newValue.map(LenientText.init) }
     }
+    /// The asking session's `folded_under_machine_id` when the ancestor lives on another computer.
+    var foldedUnderMachineID: String? {
+        get { foldedUnderMachineIDText?.value }
+        set { foldedUnderMachineIDText = newValue.map(LenientText.init) }
+    }
     /// How the asking session folds (`folded_as`): "worker", "side" (#7944).
     var foldedAs: String? {
         get { foldedAsText?.value }
@@ -2925,8 +3198,9 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
         get { foldedSideText?.value }
         set { foldedSideText = newValue.map(LenientText.init) }
     }
-    /// What the three are stored as: a value of another type, or an empty one, reads as none and never drops the card.
+    /// What the hierarchy keys are stored as: a value of another type, or an empty one, reads as none and never drops the card.
     var foldedUnderText: LenientText? = nil
+    var foldedUnderMachineIDText: LenientText? = nil
     var foldedAsText: LenientText? = nil
     var foldedSideText: LenientText? = nil
 
@@ -2936,6 +3210,8 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
     var ownerProposal: Bool?
     var noExpiry: Bool?
     var ownerApprovalPhrases: [String]?
+    /// True when the card has no interactive computer terminal or UI to hand back to; absent/false keeps hand-back.
+    var noHandBack: Bool?
     var ownerApprovalPhrase: String? {
         guard kind == .permission, ownerProposal == true, let approvalBatchID, !approvalBatchID.isEmpty,
               !machineID.isEmpty, !sessionID.isEmpty,
@@ -2944,10 +3220,25 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
     }
 
     var sessionKey: SessionKey { SessionKey(group: group, machineID: machineID, sessionID: sessionID) }
+    /// The exact timestamp received from the hub; nil for a directly constructed card.
+    var createdAtWire: String? { createdAtOccurrence.projectedValue }
+    /// The computer of the session the card is shown on (the ancestor's machine for a cross-machine fold, else `machineID`).
+    var requestHomeMachineID: String {
+        guard let under = foldedUnder, !under.isEmpty else { return machineID }
+        let targetMachine = (foldedUnderMachineID?.isEmpty == false) ? foldedUnderMachineID! : machineID
+        if targetMachine == machineID && under == sessionID { return machineID }
+        return targetMachine
+    }
     /// The session the card is shown on. Answering still uses `id` and `sessionID`.
     var requestHome: String {
-        if let under = foldedUnder, !under.isEmpty, under != sessionID { return under }
-        return sessionID
+        guard let under = foldedUnder, !under.isEmpty else { return sessionID }
+        let targetMachine = (foldedUnderMachineID?.isEmpty == false) ? foldedUnderMachineID! : machineID
+        if targetMachine == machineID && under == sessionID { return sessionID }
+        return under
+    }
+    /// Full cross-machine identity of the session the card is shown on.
+    var requestHomeKey: SessionKey {
+        SessionKey(group: group, machineID: requestHomeMachineID, sessionID: requestHome)
     }
     var machineRef: MachineRef { MachineRef(group: group, id: machineID) }
 
@@ -2963,6 +3254,7 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, kind, questions, plan, summary, format, screen, cwd, dialog, secret, fields, agent, reason, delegating, delegate, manager
+        case mirrorOf = "mirror_of"
         case suggestion, canCancel = "can_cancel"
         case planThen = "plan_then"
         case machineID = "machine_id", sessionID = "session_id", sessionTitle = "session_title", taskTitle = "task_title",
@@ -2970,9 +3262,128 @@ nonisolated struct Interaction: Codable, Identifiable, Hashable, Sendable {
              toolInput = "tool_input", alwaysLabel = "always_label", alwaysKeys = "always_keys", alwaysHonored = "always_honored",
              toolTitle = "tool_title", agentLabelHint = "agent_label", hubGroup = "app_hub_group",
              mutedFlag = "muted", elicitation, mcpServerName = "mcp_server_name", mcpConfigSource = "mcp_config_source",
-             agentID = "agent_id", agentType = "agent_type", foldedUnderText = "folded_under", foldedAsText = "folded_as",
+             agentID = "agent_id", agentType = "agent_type", foldedUnderText = "folded_under",
+             foldedUnderMachineIDText = "folded_under_machine_id", foldedAsText = "folded_as",
              foldedSideText = "folded_side", approvalBatchID = "approval_batch_id", approvalItemID = "approval_item_id",
-             ownerProposal = "owner_proposal", noExpiry = "no_expiry", ownerApprovalPhrases = "owner_approval_phrases"
+             ownerProposal = "owner_proposal", noExpiry = "no_expiry", ownerApprovalPhrases = "owner_approval_phrases",
+             noHandBack = "no_hand_back"
+    }
+}
+
+nonisolated extension Interaction {
+    // Keep the old missing/null date behavior and the memberwise initializer. The plain occurrence box avoids
+    // Swift 6.2's property-wrapper restriction on nonisolated types; its raw text also drives encoding below.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        machineID = try c.decode(String.self, forKey: .machineID)
+        sessionID = try c.decode(String.self, forKey: .sessionID)
+        sessionTitle = try c.decodeIfPresent(String.self, forKey: .sessionTitle)
+        taskTitle = try c.decodeIfPresent(String.self, forKey: .taskTitle)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        kind = try c.decode(InteractionKind.self, forKey: .kind)
+        let occurrence = try c.decodeIfPresent(InteractionOccurrenceDate.self, forKey: .createdAt) ?? InteractionOccurrenceDate()
+        createdAt = occurrence.wrappedValue
+        createdAtOccurrence = occurrence
+        expiresAt = try c.decodeIfPresent(Date.self, forKey: .expiresAt)
+        toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
+        toolUseID = try c.decodeIfPresent(String.self, forKey: .toolUseID)
+        questions = try c.decodeIfPresent([Question].self, forKey: .questions)
+        canCancel = try c.decodeIfPresent(Bool.self, forKey: .canCancel)
+        plan = try c.decodeIfPresent(String.self, forKey: .plan)
+        planThen = try c.decodeIfPresent(String.self, forKey: .planThen)
+        toolInput = try c.decodeIfPresent(JSONValue.self, forKey: .toolInput)
+        summary = try c.decodeIfPresent(String.self, forKey: .summary)
+        format = try c.decodeIfPresent(String.self, forKey: .format)
+        screen = try c.decodeIfPresent(String.self, forKey: .screen)
+        dialog = try c.decodeIfPresent(ScreenDialog.self, forKey: .dialog)
+        secret = try c.decodeIfPresent(Bool.self, forKey: .secret)
+        fields = try c.decodeIfPresent([InteractionField].self, forKey: .fields)
+        agent = try c.decodeIfPresent(String.self, forKey: .agent)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        alwaysLabel = try c.decodeIfPresent(String.self, forKey: .alwaysLabel)
+        alwaysKeys = try c.decodeIfPresent([String].self, forKey: .alwaysKeys)
+        alwaysHonored = try c.decodeIfPresent(Bool.self, forKey: .alwaysHonored)
+        toolTitle = try c.decodeIfPresent(String.self, forKey: .toolTitle)
+        agentLabelHint = try c.decodeIfPresent(String.self, forKey: .agentLabelHint)
+        hubGroup = try c.decodeIfPresent(String.self, forKey: .hubGroup)
+        mutedFlag = try c.decodeIfPresent(Bool.self, forKey: .mutedFlag)
+        delegating = try c.decodeIfPresent(Bool.self, forKey: .delegating)
+        delegate = try c.decodeIfPresent(Delegate.self, forKey: .delegate)
+        suggestion = try c.decodeIfPresent(RuleSuggestion.self, forKey: .suggestion)
+        manager = try c.decodeIfPresent(String.self, forKey: .manager)
+        mirrorOf = try c.decodeIfPresent(String.self, forKey: .mirrorOf)
+        elicitation = try c.decodeIfPresent(ElicitationRequest.self, forKey: .elicitation)
+        mcpServerName = try c.decodeIfPresent(String.self, forKey: .mcpServerName)
+        mcpConfigSource = try c.decodeIfPresent(String.self, forKey: .mcpConfigSource)
+        agentID = try c.decodeIfPresent(String.self, forKey: .agentID)
+        agentType = try c.decodeIfPresent(String.self, forKey: .agentType)
+        foldedUnderText = try c.decodeIfPresent(LenientText.self, forKey: .foldedUnderText)
+        foldedUnderMachineIDText = try c.decodeIfPresent(LenientText.self, forKey: .foldedUnderMachineIDText)
+        foldedAsText = try c.decodeIfPresent(LenientText.self, forKey: .foldedAsText)
+        foldedSideText = try c.decodeIfPresent(LenientText.self, forKey: .foldedSideText)
+        approvalBatchID = try c.decodeIfPresent(String.self, forKey: .approvalBatchID)
+        approvalItemID = try c.decodeIfPresent(String.self, forKey: .approvalItemID)
+        ownerProposal = try c.decodeIfPresent(Bool.self, forKey: .ownerProposal)
+        noExpiry = try c.decodeIfPresent(Bool.self, forKey: .noExpiry)
+        ownerApprovalPhrases = try c.decodeIfPresent([String].self, forKey: .ownerApprovalPhrases)
+        noHandBack = try c.decodeIfPresent(Bool.self, forKey: .noHandBack)
+    }
+
+    // Explicit rather than synthesized so created_at uses the occurrence box's exact RFC3339 text.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(machineID, forKey: .machineID)
+        try c.encode(sessionID, forKey: .sessionID)
+        try c.encodeIfPresent(sessionTitle, forKey: .sessionTitle)
+        try c.encodeIfPresent(taskTitle, forKey: .taskTitle)
+        try c.encodeIfPresent(cwd, forKey: .cwd)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(createdAtOccurrence, forKey: .createdAt)
+        try c.encodeIfPresent(expiresAt, forKey: .expiresAt)
+        try c.encodeIfPresent(toolName, forKey: .toolName)
+        try c.encodeIfPresent(toolUseID, forKey: .toolUseID)
+        try c.encodeIfPresent(questions, forKey: .questions)
+        try c.encodeIfPresent(canCancel, forKey: .canCancel)
+        try c.encodeIfPresent(plan, forKey: .plan)
+        try c.encodeIfPresent(planThen, forKey: .planThen)
+        try c.encodeIfPresent(toolInput, forKey: .toolInput)
+        try c.encodeIfPresent(summary, forKey: .summary)
+        try c.encodeIfPresent(format, forKey: .format)
+        try c.encodeIfPresent(screen, forKey: .screen)
+        try c.encodeIfPresent(dialog, forKey: .dialog)
+        try c.encodeIfPresent(secret, forKey: .secret)
+        try c.encodeIfPresent(fields, forKey: .fields)
+        try c.encodeIfPresent(agent, forKey: .agent)
+        try c.encodeIfPresent(reason, forKey: .reason)
+        try c.encodeIfPresent(alwaysLabel, forKey: .alwaysLabel)
+        try c.encodeIfPresent(alwaysKeys, forKey: .alwaysKeys)
+        try c.encodeIfPresent(alwaysHonored, forKey: .alwaysHonored)
+        try c.encodeIfPresent(toolTitle, forKey: .toolTitle)
+        try c.encodeIfPresent(agentLabelHint, forKey: .agentLabelHint)
+        try c.encodeIfPresent(hubGroup, forKey: .hubGroup)
+        try c.encodeIfPresent(mutedFlag, forKey: .mutedFlag)
+        try c.encodeIfPresent(delegating, forKey: .delegating)
+        try c.encodeIfPresent(delegate, forKey: .delegate)
+        try c.encodeIfPresent(suggestion, forKey: .suggestion)
+        try c.encodeIfPresent(manager, forKey: .manager)
+        try c.encodeIfPresent(mirrorOf, forKey: .mirrorOf)
+        try c.encodeIfPresent(elicitation, forKey: .elicitation)
+        try c.encodeIfPresent(mcpServerName, forKey: .mcpServerName)
+        try c.encodeIfPresent(mcpConfigSource, forKey: .mcpConfigSource)
+        try c.encodeIfPresent(agentID, forKey: .agentID)
+        try c.encodeIfPresent(agentType, forKey: .agentType)
+        try c.encodeIfPresent(foldedUnderText, forKey: .foldedUnderText)
+        try c.encodeIfPresent(foldedUnderMachineIDText, forKey: .foldedUnderMachineIDText)
+        try c.encodeIfPresent(foldedAsText, forKey: .foldedAsText)
+        try c.encodeIfPresent(foldedSideText, forKey: .foldedSideText)
+        try c.encodeIfPresent(approvalBatchID, forKey: .approvalBatchID)
+        try c.encodeIfPresent(approvalItemID, forKey: .approvalItemID)
+        try c.encodeIfPresent(ownerProposal, forKey: .ownerProposal)
+        try c.encodeIfPresent(noExpiry, forKey: .noExpiry)
+        try c.encodeIfPresent(ownerApprovalPhrases, forKey: .ownerApprovalPhrases)
+        try c.encodeIfPresent(noHandBack, forKey: .noHandBack)
     }
 }
 
@@ -3518,7 +3929,7 @@ nonisolated enum DeleteSessionText {
 /// Where an agent was opened (`Session.source`, #2526).
 nonisolated enum SessionSource: String, Sendable {
     case feishu, terminal
-    var label: String { self == .feishu ? String(localized: "Lark Group [Models e86099]") : String(localized: "Terminal") }
+    var label: String { self == .feishu ? String(localized: "Lark Group [Models e86099]") : String(localized: "In a Tab") }
 }
 
 nonisolated extension Int64 {

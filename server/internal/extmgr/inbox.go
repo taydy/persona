@@ -10,6 +10,7 @@ import (
 
 	"github.com/nwverse/persona/server/internal/ai"
 	"github.com/nwverse/persona/server/internal/assistantwire"
+	"github.com/nwverse/persona/server/internal/buswire"
 	"github.com/nwverse/persona/server/internal/connector"
 )
 
@@ -53,10 +54,18 @@ type InboxConfig struct {
 	// Agent (model 3) works on the Needs you items (and those a policy hands it) and drafts the reply (the manager's
 	// inbox_agent.go).
 	Agent InboxAgentConfig `json:"agent,omitempty"`
+	// ReplyPolicy optionally restricts which classified items may become owner reply drafts. It retains both the legacy
+	// pointer fields and the upstream compiled categories; the assistant deliberately interprets only one schema.
+	ReplyPolicy *assistantwire.InboxReplyPolicyConfig `json:"reply_policy,omitempty"`
+	// Visibility keeps explicitly named chats, or all direct chats when enabled, out of AI handling and reads.
+	Visibility *assistantwire.InboxVisibilityConfig `json:"visibility,omitempty"`
 }
 
 // InboxAgentConfig is manager.json's inbox.agent, handed to the manager as it is.
 type InboxAgentConfig = assistantwire.InboxAgentConfig
+
+// InboxReplyPolicyConfig is manager.json's inbox.reply_policy, handed to the manager as it is.
+type InboxReplyPolicyConfig = assistantwire.InboxReplyPolicyConfig
 
 // inboxSources is this code's part of the inbox: the wake-ups, one collection at a time, and what the manager
 // reported.
@@ -220,7 +229,7 @@ func (h *Manager) collectInbox(ctx context.Context, round inboxRound) error {
 	r.Epoch, r.Seq = h.inbox.epoch, h.inbox.seq.Add(1)
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inboxRoundWait)
 	defer cancel()
-	if err := h.callAssistant(cctx, assistantwire.MethodInboxCollected, r, nil); err != nil {
+	if _, err := buswire.Call(cctx, assistantCaller(h.callAssistant), assistantwire.InboxCollectedMethod, r); err != nil {
 		h.inbox.held.Store(&r)
 		h.inbox.owed.Store(true) // read again, whole, when it is back
 		h.logf("inbox: hand the round to the manager: %v", err)

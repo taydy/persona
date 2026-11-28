@@ -1,10 +1,10 @@
 import { wirePackageName } from '../../runtime-sdk/lib/compat.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readlinkSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { startFakeNode, until } from '../../runtime-sdk/testing/fake-node.js'
-import { packageHash } from '../../runtime-sdk/lib/package.js'
+import { installCurrent, packageHash } from '../../runtime-sdk/lib/package.js'
 import { createPiHost, herdrPaneOf, piWebOf } from '../lib/pi.js'
 
 /** A pi session manager over entries (file order); the branch runs from the leaf back through parentId. */
@@ -322,7 +322,7 @@ test('an assistant start pi-web has not written yet is refused as delivered noth
 })
 
 test('approvals of configured tools go to the phone when it drives the session; pi\'s dialog otherwise; no answer blocks', async (t) => {
-  const { n, host } = await setup(t, { approve: ['bash'], answerFirst: 'phone' })
+  const { n, host } = await setup(t, { approve: ['bash', 'edit'], answerFirst: 'phone' })
   const a = piSession('s-x')
   host.register(a.pi)
   await a.fire('session_start')
@@ -331,6 +331,13 @@ test('approvals of configured tools go to the phone when it drives the session; 
   n.resolve = () => ({ allow: true })
   assert.equal(await a.fire('tool_call', { toolName: 'bash', toolCallId: 'c1', input: { command: 'rm -rf build' } }), undefined)
   assert.deepEqual([n.asked[0].tool_name, n.asked[0].summary, n.asked[0].tool_input.command], ['Bash', 'rm -rf build', 'rm -rf build'])
+  assert.equal(await a.fire('tool_call', {
+    toolName: 'edit',
+    toolCallId: 'c1m',
+    input: { path: 'a.go', edits: [{ oldText: 'a', newText: 'b' }, { oldText: 'c', newText: 'd' }] },
+  }), undefined)
+  assert.equal(n.asked[1].tool_name, 'MultiEdit')
+  assert.equal(n.asked[1].always_label, '本会话不再问 Edit')
   n.resolve = () => ({ allow: false, message: 'not now' })
   assert.deepEqual(await a.fire('tool_call', { toolName: 'bash', toolCallId: 'c2', input: { command: 'ls' } }), { block: true, reason: 'not now' })
   assert.equal(await a.fire('tool_call', { toolName: 'read', toolCallId: 'c3', input: { path: 'x' } }), undefined, 'tools not listed run as pi runs them')
@@ -420,7 +427,9 @@ test('A2A tools send and report from the active pi session', async (t) => {
   const { Type } = await import('./typebox-stub.js')
   const { n, host } = await setup(t)
   const a = piSession('s-a2a')
-  host.register(a.pi, { A2AType: Type })
+  const integerCalls = []
+  const trackedType = { ...Type, Integer(opts) { integerCalls.push(opts); return Type.Integer(opts) } }
+  host.register(a.pi, { A2AType: trackedType })
   await a.fire('session_start')
   await n.ready
   await until('A2A session listed', () => n.last('runtime.sessions')?.sessions.some(s => s.session_id === 's-a2a'))
@@ -430,6 +439,34 @@ test('A2A tools send and report from the active pi session', async (t) => {
   const result = await report.execute('call', args, a.ctx.signal, undefined, a.ctx)
   assert.equal(result.details.error, false)
   assert.deepEqual(n.toolCalls.at(-1), { name: 'a2a_report', args, session_id: 's-a2a' })
+
+  const read = a.pi.tools.find(t => t.name === 'a2a_read')
+  assert.deepEqual(integerCalls, [{ minimum: 1, maximum: 10 }])
+  assert.deepEqual(read.parameters.properties.turns, { type: 'integer', minimum: 1, maximum: 10, optional: true })
+  assert.deepEqual(read.parameters.properties.machine_id, { type: 'string' })
+  assert.deepEqual(read.parameters.properties.session_id, { type: 'string' })
+  const send = a.pi.tools.find(t => t.name === 'a2a_send')
+  assert.deepEqual(send.parameters.properties.wake, { type: 'boolean', optional: true })
+  assert.deepEqual(report.parameters.properties.state, { type: 'string', enum: ['progress', 'input_required', 'completed', 'failed'] })
+  const readArgs = { machine_id: 'm1', session_id: 's1', turns: 5 }
+  const readRes = await read.execute('call-read', readArgs, a.ctx.signal, undefined, a.ctx)
+  assert.equal(readRes.details.error, false)
+  assert.deepEqual(n.toolCalls.at(-1), { name: 'a2a_read', args: readArgs, session_id: 's-a2a' })
+
+  // A minimal Type builder without Type.Integer still preserves integer bounds instead of throwing or downgrading to string.
+  const b = piSession('s-a2a-minimal')
+  const { Integer: _omitInt, Number: _omitNum, ...minimalType } = Type
+  host.register(b.pi, { A2AType: minimalType })
+  const minimalRead = b.pi.tools.find(t => t.name === 'a2a_read')
+  assert.deepEqual(minimalRead.parameters.properties.turns, { type: 'integer', minimum: 1, maximum: 10, optional: true })
+
+  // When Type.Unsafe is available without Type.Integer, delegate to Type.Unsafe.
+  const c = piSession('s-a2a-unsafe')
+  const unsafeCalls = []
+  host.register(c.pi, { A2AType: { ...minimalType, Unsafe(schema) { unsafeCalls.push(schema); return { ...schema, unsafe: true } } } })
+  const unsafeRead = c.pi.tools.find(t => t.name === 'a2a_read')
+  assert.deepEqual(unsafeCalls, [{ type: 'integer', minimum: 1, maximum: 10 }])
+  assert.deepEqual(unsafeRead.parameters.properties.turns, { type: 'integer', minimum: 1, maximum: 10, unsafe: true, optional: true })
 })
 
 /** A phone that has not answered yet: resolve(answer) answers the card it holds. */
@@ -731,6 +768,113 @@ test('the companion installs the node\'s version and exits for its supervisor', 
   assert.equal(readlinkSync(join(dir, 'current')), n.offer.hash)
 })
 
+test('a store lock retries the verified package without fetching it again', async (t) => {
+  const dir = store(t)
+  const exits = []
+  const logs = []
+  const n = await startFakeNode(t)
+  n.offer = offerOf('v2-locked')
+  const lock = join(dir, '.install.lock')
+  mkdirSync(lock)
+  writeFileSync(join(lock, `${process.pid}-0000000000000000`), '')
+  const host = createPiHost({ SessionManager: { listAll: async () => [], open: () => sessionManager('x', '/') }, web: { port: 1, host: '127.0.0.1' }, log: (msg) => logs.push(msg) },
+    { socketPath: n.path, retryMs: 20, listDisk: true, update: { name: PKG, hash: 'the-running-version', store: dir, exit: (h) => exits.push(h) } })
+  t.after(() => host.stop())
+  host.start()
+  await until('the package fetched once', () => n.packageCalls.length === 1)
+  await until('asynchronous lock retries', () => logs.filter((msg) => msg.includes('store is busy')).length >= 2)
+  assert.equal(n.packageCalls.length, 1, 'lock retries do not fetch again')
+  assert.throws(() => readlinkSync(join(dir, 'current')))
+  rmSync(lock, { recursive: true, force: true })
+  await until('the verified package installs after the lock is released', () => exits.length === 1)
+  assert.equal(exits[0], n.offer.hash)
+  assert.equal(n.packageCalls.length, 1)
+})
+
+test('a newer offer invalidates an older pi lock retry', async (t) => {
+  const dir = store(t)
+  const logs = []
+  const n = await startFakeNode(t)
+  const older = offerOf('v2-older')
+  const newer = offerOf('v2-newer')
+  n.offer = older
+  const lock = join(dir, '.install.lock')
+  mkdirSync(lock)
+  writeFileSync(join(lock, `${process.pid}-0000000000000000`), '')
+  const host = createPiHost({ SessionManager: { listAll: async () => [], open: () => sessionManager('x', '/') }, web: { port: 1, host: '127.0.0.1' }, log: (msg) => logs.push(msg) },
+    { socketPath: n.path, retryMs: 100, listDisk: true, update: { name: PKG, hash: 'the-running-version', store: dir } })
+  t.after(() => host.stop())
+  host.start()
+  await until('the older offer is waiting on the lock', () => logs.some((msg) => msg.includes('store is busy')))
+  n.offer = newer
+  rmSync(lock, { recursive: true, force: true })
+  n.peer.close(new Error('a newer node offer arrives'))
+  await until('the newer offer installs', () => {
+    try { return readlinkSync(join(dir, 'current')) === newer.hash } catch { return false }
+  })
+  await new Promise((r) => setTimeout(r, 160))
+  assert.equal(readlinkSync(join(dir, 'current')), newer.hash, 'the older timed retry cannot roll current back')
+  assert.equal(n.packageCalls.length, 2)
+})
+
+test('a rollback hello keeps a stale pi retry from installing while reconnecting', async (t) => {
+  const dir = store(t)
+  const logs = []
+  const n = await startFakeNode(t)
+  const running = offerOf('rollback-A')
+  const offered = offerOf('rollback-B')
+  installCurrent(dir, running.hash, running.files.map((file) => ({ path: file.path, data: Buffer.from(file.data, 'base64') })))
+  n.offer = offered
+  const lock = join(dir, '.install.lock')
+  mkdirSync(lock)
+  writeFileSync(join(lock, `${process.pid}-0000000000000000`), '')
+  const host = createPiHost({ SessionManager: { listAll: async () => [], open: () => sessionManager('x', '/') }, web: { port: 1, host: '127.0.0.1' }, log: (msg) => logs.push(msg) },
+    { socketPath: n.path, retryMs: 100, listDisk: true, update: { name: PKG, hash: running.hash, store: dir } })
+  t.after(() => {
+    rmSync(lock, { recursive: true, force: true })
+    return host.stop()
+  })
+  host.start()
+  await until('the stale offer is waiting on the lock', () => logs.some((msg) => msg.includes('store is busy')))
+  const hellos = n.hellos
+  let answerHello
+  n.holdHello = new Promise((resolve) => { answerHello = resolve })
+  t.after(() => { answerHello(); n.holdHello = undefined })
+  n.offer = running
+  rmSync(lock, { recursive: true, force: true })
+  n.peer.close(new Error('node rollback'))
+  await until('the rollback hello is negotiating', () => n.hellos > hellos)
+  await new Promise((resolve) => setTimeout(resolve, 160))
+  assert.equal(readlinkSync(join(dir, 'current')), running.hash, 'the cached package cannot install before the replacement hello')
+  n.hello = undefined
+  answerHello()
+  n.holdHello = undefined
+  await until('the rollback hello completed', () => n.hello?.package?.hash === running.hash)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(readlinkSync(join(dir, 'current')), running.hash)
+  assert.equal(n.packageCalls.length, 1)
+})
+
+test('stopping during a package fetch does not install or schedule another retry', async (t) => {
+  const dir = store(t)
+  const n = await startFakeNode(t)
+  n.offer = offerOf('v2-stopped')
+  const host = createPiHost({ SessionManager: { listAll: async () => [], open: () => sessionManager('x', '/') }, web: { port: 1, host: '127.0.0.1' } },
+    { socketPath: n.path, retryMs: 20, listDisk: true, update: { name: PKG, hash: 'the-running-version', store: dir } })
+  t.after(() => host.stop())
+  const push = n.packageCalls.push.bind(n.packageCalls)
+  n.packageCalls.push = (...args) => {
+    const result = push(...args)
+    host.stop()
+    return result
+  }
+  host.start()
+  await until('the in-flight package request stopped the host', () => n.packageCalls.length === 1)
+  await new Promise((r) => setTimeout(r, 70))
+  assert.equal(n.packageCalls.length, 1, 'the stopped host did not poll the offer again')
+  assert.throws(() => readlinkSync(join(dir, 'current')), 'the stopped host did not install the fetched package')
+})
+
 test('when the reload brings the same version back, it connects again and does not take that version again', async (t) => {
   const dir = store(t)
   const { n, host } = await setup(t, { update: { name: PKG, hash: 'the-running-version', store: dir } })
@@ -746,6 +890,30 @@ test('when the reload brings the same version back, it connects again and does n
   assert.equal(n.packageCalls.length, 1, 'the same version is not fetched again')
   assert.equal(reloads(a).length, 1)
   assert.equal(host.retired, false)
+})
+
+test('a valid package whose hash differs from the hello offer is not installed', async (t) => {
+  const dir = store(t)
+  const running = offerOf('offer-A')
+  const offered = offerOf('offer-B')
+  const replacement = offerOf('offer-C')
+  installCurrent(dir, running.hash, running.files.map((file) => ({ path: file.path, data: Buffer.from(file.data, 'base64') })))
+  const n = await startFakeNode(t)
+  n.offer = offered
+  const push = n.packageCalls.push.bind(n.packageCalls)
+  n.packageCalls.push = (...args) => {
+    const result = push(...args)
+    n.offer = replacement
+    return result
+  }
+  const host = createPiHost({ SessionManager: { listAll: async () => [], open: () => sessionManager('x', '/') }, web: { port: 1, host: '127.0.0.1' } },
+    { socketPath: n.path, retryMs: 20, listDisk: true, update: { name: PKG, hash: running.hash, store: dir } })
+  t.after(() => host.stop())
+  host.start()
+  await until('the replacement package answered', () => n.packageCalls.length === 1)
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(readlinkSync(join(dir, 'current')), running.hash, 'C is not cached or installed for the B offer')
+  assert.equal(n.packageCalls.length, 1, 'the mismatched response does not start a retry loop')
 })
 
 test('a package whose files do not match its hash is not installed', async (t) => {

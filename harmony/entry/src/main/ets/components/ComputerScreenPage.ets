@@ -1,4 +1,6 @@
-import { ButtonStyles } from '../design/Controls';
+import { ButtonStyles, SelectStyles } from '../design/Controls';
+import { ScreenWheel, ScreenTwoFingers, screenScrollFactor } from '../core/ScreenWheel';
+import { screenScrollPreference } from '../platform/ScreenScrollPreference';
 import { Colors } from '../design/Colors';
 import { image } from '@kit.ImageKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -121,8 +123,20 @@ export struct ComputerScreenPage {
   private pointerDown: boolean = false;
   @Local pointerPosition: ScreenPoint | undefined = undefined;
   private keyboard: ScreenKeyboard | undefined;
+  private wheel: ScreenWheel = new ScreenWheel();
+  private fingerMotion: ScreenTwoFingers = new ScreenTwoFingers();
+  private wheelTimer: number = -1;
+  private frameTime: number = 0;
+  private multiTouch: boolean = false;
+  private scrolling: boolean = false;
+  private wheelX: number = 0;
+  private wheelY: number = 0;
+  private previousY: number = 0;
+  private previousTime: number = 0;
+  private velocity: number = 0;
+  private perPoint: number = 1;
 
-  aboutToAppear(): void { this.mounted = true; this.updateVisibility(); }
+  aboutToAppear(): void { this.mounted = true; screenScrollPreference.load(this.getUIContext().getHostContext()); this.updateVisibility(); }
 
   aboutToDisappear(): void {
     this.mounted = false;
@@ -142,6 +156,7 @@ export struct ComputerScreenPage {
   private deactivate(): void {
     this.displayedRowKey = '';
     this.viewingGesture = false;
+    this.stopWheel();
     this.pointerDown = false;
     this.pointerPosition = undefined;
     this.viewport.reset();
@@ -184,6 +199,7 @@ export struct ComputerScreenPage {
   @Monitor('screen.controlling') controlChanged(): void {
     this.viewport.cancel();
     this.setViewingGesture(false);
+    this.stopWheel();
     if (!this.screen.controlAllowed()) { this.closeKeyboard(); this.pointerDown = false; this.pointerPosition = undefined; }
   }
 
@@ -215,6 +231,7 @@ export struct ComputerScreenPage {
     this.clearFrame();
     this.clearPreviews();
     this.frameRatio = 1;
+    this.stopWheel();
     this.pointerDown = false;
     this.pointerPosition = undefined;
     this.screen.open(this.model, this.row).catch((): void => {});
@@ -409,10 +426,62 @@ export struct ComputerScreenPage {
     }
   }
 
+  private stopWheel(): void {
+    if (this.wheelTimer !== -1) clearTimeout(this.wheelTimer);
+    this.wheelTimer = -1; this.wheel.stop(); this.multiTouch = false; this.scrolling = false;
+  }
+
+  private paceWheel(): void {
+    if (this.wheelTimer !== -1 || !this.wheel.busy) return;
+    const attempt = this.screen.connectionRevision();
+    this.frameTime = Date.now();
+    const frame = (): void => {
+      this.wheelTimer = -1;
+      if (!this.isVisible() || !this.screen.controlAllowed() || attempt !== this.screen.connectionRevision()) { this.stopWheel(); return; }
+      const now = Date.now(), dt = Math.min(.1, Math.max(0, (now - this.frameTime) / 1000));
+      this.frameTime = now;
+      const amount = this.wheel.frame(dt);
+      if (amount && !this.screen.scrollFromView(this.wheelX, this.wheelY, this.frameAreaWidth, this.frameAreaHeight, amount)) { this.stopWheel(); return; }
+      if (this.wheel.busy) this.wheelTimer = setTimeout(frame, 16);
+    };
+    this.wheelTimer = setTimeout(frame, 16);
+  }
+
+  /** Two fingers moving together scroll the computer with the wheel; a pinch zooms and pans the picture, and so does
+   * every two-finger gesture without control. The viewport still sees two fingers arrive (it releases a held pointer and
+   * drops a pending tap) and the lift (so the last finger never taps). True when this event belongs to the scroll. */
+  private scrollWithTwoFingers(kind: string, fingers: ScreenPoint[]): boolean {
+    if (fingers.length < 2) {
+      if (kind === 'down') this.stopWheel(); // a new touch stops the momentum, as a finger on a trackpad does
+      if (this.multiTouch) {
+        if (this.scrolling && Date.now() - this.previousTime < 100) this.wheel.release(this.velocity, this.perPoint);
+        this.multiTouch = false; this.scrolling = false; this.paceWheel();
+      }
+      return false;
+    }
+    const a = fingers[0], b = fingers[1], x = (a.x + b.x) / 2, y = (a.y + b.y) / 2, spread = Math.hypot(a.x - b.x, a.y - b.y), now = Date.now();
+    if (!this.multiTouch) {
+      this.stopWheel(); this.multiTouch = true;
+      this.fingerMotion.begin(x, y, spread); this.wheel.begin(); this.previousY = y; this.previousTime = now; this.velocity = 0;
+      this.perPoint = this.screen.scrollPointsInView(this.frameAreaWidth, this.frameAreaHeight) * screenScrollFactor(screenScrollPreference.choice);
+      return false;
+    }
+    if (!this.screen.controlAllowed()) return false;
+    const meaning = this.fingerMotion.moved(x, y, spread);
+    if (meaning === 'pinch') return false;
+    if (meaning !== 'scroll') return true; // undecided: hold the picture still
+    this.scrolling = true;
+    const dy = y - this.previousY, dt = Math.max(.001, (now - this.previousTime) / 1000);
+    this.velocity = dy / dt; this.wheelX = x; this.wheelY = y;
+    this.wheel.move(dy, this.velocity, this.perPoint); this.previousY = y; this.previousTime = now; this.paceWheel();
+    return true;
+  }
+
   private touchFrame(event: TouchEvent): void {
     if (event.type === TouchType.Cancel) {
       if (this.pointerDown) this.screen.releasePointer();
       this.pointerDown = false;
+      this.stopWheel();
       this.pointerPosition = undefined;
       this.viewport.cancel();
       this.setViewingGesture(false);
@@ -434,6 +503,7 @@ export struct ComputerScreenPage {
       if (x >= 0 && x < 1 && y >= 0 && y < 1) this.pointerPosition = new ScreenPoint(x, y);
     }
     if (fingers.length > 1) this.pointerPosition = undefined;
+    if (this.scrollWithTwoFingers(kind, fingers)) { this.setViewingGesture(false); return; }
     this.viewport.touch(kind, new ScreenPoint(touch.x, touch.y), fingers, control,
       (x: number, y: number, buttons: number): void => {
         const accepted = this.screen.pointerAt(x, y, buttons);

@@ -4,23 +4,25 @@ import { ChatActionsContext, liveValue, type ChatActions } from "./chat-actions"
 import { t } from "../../i18n";
 import { MessageActions } from "./MessageActions";
 import { moreActions, rewindActions, savePromptActions } from "./ReplyBar";
+import { LatestReplyId } from "./latest-message-time";
 
 const base: ChatActions = { draftKey: "m/s", canCompose: true, speaker: "Persona", title: "Persona", images: () => [] };
 
 function render(actions: ChatActions, itemId?: string, bar = true) {
   return renderToStaticMarkup(
-    <ChatActionsContext.Provider value={actions}>
-      <MessageActions text="回复" itemId={itemId} bar={bar}>
-        <p>回复</p>
-      </MessageActions>
-    </ChatActionsContext.Provider>,
+    <LatestReplyId.Provider value={itemId}>
+      <ChatActionsContext.Provider value={actions}>
+        <MessageActions text="回复" itemId={itemId} bar={bar}>
+          <p>回复</p>
+        </MessageActions>
+      </ChatActionsContext.Provider>
+    </LatestReplyId.Provider>,
   );
 }
 
-// cindy's bar under a turn's last reply (#5314; its buttons and order: ReplyBar.test.tsx). It loads after the first
-// screen: until then its row is kept, so the reply does not move when it comes.
+// The latest reply renders its bar from a separate chunk, with its row reserved during loading.
 describe("the reply bar", () => {
-  it("keeps its row while it loads", () => {
+  it("keeps the latest reply's row while its bar loads", () => {
     const html = render({ ...base, fork: () => {} }, "u1#0");
     expect(html).toContain('data-reply-bar="loading"');
     expect(html).toMatch(/data-reply-bar="loading" class="mt-1\.5 hidden h-6 \[@media\(hover:hover\)\]:block"/);
@@ -57,8 +59,8 @@ describe("moreActions", () => {
   it("branches off at the reply it is on", () => {
     const got: string[] = [];
     const [fork] = moreActions("u1#0", (id) => got.push(id));
-    expect(fork?.label).toBe("开启一个新会话");
-    expect(moreActions("u1#0", () => {}, true)[0]?.label).toBe("开启一个新对话");
+    expect(fork?.label).toBe("开启新会话");
+    expect(moreActions("u1#0", () => {}, true)[0]?.label).toBe("开启新对话");
     fork?.onSelect();
     expect(got).toEqual(["u1#0"]);
   });
@@ -83,10 +85,10 @@ describe("rewindActions", () => {
   const run = async () => {};
   it("has the two choices, the second a danger that asks again", () => {
     const [rewind] = rewindActions("u1#0", "继续", { block: "", run });
-    expect(rewind.label).toBe("回退到这里");
+    expect(rewind.label).toBe("回退至此处");
     expect(rewind.disabled).toBe(false);
     const [conv, code] = rewind.children as { label: string; danger?: boolean; confirm?: string; inline?: boolean }[];
-    expect([conv.label, code.label]).toEqual(["只回退对话", "回退代码和对话"]);
+    expect([conv.label, code.label]).toEqual(["仅回退对话", "回退代码和对话"]);
     expect(conv.danger).toBeUndefined();
     expect(conv.confirm).toBeUndefined();
     expect(code.danger).toBe(true);

@@ -75,6 +75,14 @@ func (m *Manifest) Validate() error {
 	}
 	errs = append(errs, m.validateModel()...)
 	errs = append(errs, m.validateTools()...)
+	if u := m.Upgrade; u != nil {
+		if u.Backup != "" && u.Backup != BackupAuto && u.Backup != BackupRequired {
+			bad("upgrade.backup %q: auto or required", u.Backup)
+		}
+		if (u.Prepare || u.HealthCheck) && !m.Runtime.SpeaksRPC() {
+			bad("upgrade.prepare and upgrade.health_check need a runtime that speaks the protocol")
+		}
+	}
 	for _, name := range sortedKeys(m.Contributes) {
 		p, known := Points[name]
 		if !known {
@@ -110,7 +118,12 @@ func (m *Manifest) Validate() error {
 			bad("contributes.quota needs permissions.launcher_keys (the user agrees that it reads quota with launchers' keys)")
 		}
 		if name == "usage" && !m.Permissions.LauncherKeys {
-			bad("contributes.usage needs permissions.launcher_keys (the user agrees that it reads usage with launchers' keys)")
+			for _, u := range m.Usages() {
+				if !u.Direct {
+					bad("launcher-backed contributes.usage needs permissions.launcher_keys")
+					break
+				}
+			}
 		}
 		if name == "api" && !slices.Contains(m.Activation(), OnStartup) {
 			bad("contributes.api: the app's API is there all the time: activation_events on_startup")
@@ -141,6 +154,9 @@ func (m *Manifest) Validate() error {
 				}
 			}
 		}
+		if name == "routine_facts" && !m.Permissions.RoutineFacts {
+			bad("contributes.routine_facts needs permissions.routine_facts")
+		}
 		if name == "error_reports" && !m.Permissions.ErrorReports {
 			bad("contributes.error_reports needs permissions.error_reports (the user agrees that it gets the error and crash reports)")
 		}
@@ -155,6 +171,9 @@ func (m *Manifest) Validate() error {
 					claimed[h] = it.ID
 				}
 			}
+		}
+		if name == "memory_sources" && len(items) > 1 {
+			bad("contributes.memory_sources: one per extension")
 		}
 		if name == "auth_relay" && !m.Permissions.AuthRelay {
 			bad("contributes.auth_relay needs permissions.auth_relay (the user agrees that it completes the authorization links their Agents stop at)")
@@ -257,6 +276,21 @@ func (m *Manifest) Validate() error {
 			bad("secrets: %q is declared by both a fixed secret and an entry list (or by two lists)", name)
 		}
 		seen[name] = true
+	}
+	if schema, err := ParseSchema(m.Configuration); err == nil {
+		for _, u := range m.Usages() {
+			if u.RemoteKey == "" {
+				continue
+			}
+			if schema == nil || !slices.ContainsFunc(schema.Fields, func(f Field) bool {
+				return f.Name == u.RemoteAddress && f.Type == "string" && f.Format == "uri"
+			}) {
+				bad("direct usage %q: remote_address must name a URI setting", u.ID)
+			}
+			if !slices.ContainsFunc(m.Secrets, func(s SecretSpec) bool { return s.Name == u.RemoteKey }) {
+				bad("direct usage %q: remote_key must name a fixed secret", u.ID)
+			}
+		}
 	}
 	errs = append(errs, m.checkConfigured()...)
 	if err := m.Permissions.validate(); err != nil {

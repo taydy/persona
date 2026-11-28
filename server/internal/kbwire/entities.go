@@ -2,6 +2,8 @@ package kbwire
 
 import (
 	"encoding/json"
+	"errors"
+	"slices"
 	"time"
 )
 
@@ -44,6 +46,14 @@ type Detail struct {
 	// Profiles: a person's profiles by writer ("user", "ext:<id>"), as written (Summary shows them too); none when no
 	// one wrote one.
 	Profiles map[string]ProfileRecord `json:"profiles,omitempty"`
+	// Paused: a recording whose stored state is in flight (an upload not complete, minutes or a day recap pending, a
+	// hub transcription not final) while nothing can settle it; "module_off": the recording module is off. Derived
+	// when read, never stored (docs/assistant/knowledge.md "Recordings without the recording module"). Absent otherwise.
+	Paused string `json:"paused,omitempty"`
+	// Speakers: a hub-transcribed meeting's speaker list, state, quality and timeline spans
+	// (docs/assistant/meeting-minutes.md "Speakers (#17674)"), derived on read (Core, with or without the recording
+	// module). Absent when the recording has no speaker data.
+	Speakers *DetailSpeakers `json:"speakers,omitempty"`
 }
 
 // ProfileRecord is one writer's profile of a person and when it was written.
@@ -166,9 +176,14 @@ type RecordingSegment struct {
 	// "The transcript of record"): "hub" or "device"; absent means device. Only the hub sets it, never an upload.
 	Source string `json:"source,omitempty"`
 	// Echo: the line is Persona's own answer as the meeting's microphone heard it (#5905,
-	// docs/assistant/meeting-minutes.md "Persona's echo"), marked by the phone or by the hub's rule (kb/echo.go). Kept,
+	// docs/assistant/meeting-minutes.md "Persona's echo"), marked by the phone or by the hub's rule (modules/recording/writers/echo.go). Kept,
 	// never fed to the minutes, the summary or the follow-up; absent (false) for every other line.
 	Echo bool `json:"echo,omitempty"`
+	// Speaker is the canonical speaker id ("s1", "s2", ...) assigned on read when a speaker timeline exists
+	// (docs/assistant/meeting-minutes.md "Speakers (#17674)"). Only the hub sets it on read; never accepted from uploads.
+	Speaker SpeakerID `json:"speaker,omitempty"`
+	// SpeakerUnsure is true when the speaker label is uncertain or the meeting's separation quality is low.
+	SpeakerUnsure bool `json:"speaker_unsure,omitempty"`
 }
 
 // Hit is one search result.
@@ -200,4 +215,22 @@ type Entry struct {
 	// MeetingID is a recording's imported meeting (#8872): the id of the meetings item it overlaps, as the meetings list
 	// has it, so a Meetings list shows the two as one row. Absent on other kinds, before a match, and from a hub before it.
 	MeetingID string `json:"meeting_id,omitempty"`
+	// Paused: as Detail.Paused, on a recording's list entry.
+	Paused string `json:"paused,omitempty"`
+}
+
+// ErrNotFound: the knowledge base has no such entry. ErrReadOnly: it was opened read-only. The knowledge base returns
+// these values (kb.ErrNotFound and kb.ErrReadOnly are the same errors), so a module that writes through a port can
+// return and test them without importing the knowledge base.
+var (
+	ErrNotFound = errors.New("not found")
+	ErrReadOnly = errors.New("the knowledge base is read-only")
+)
+
+// TaggingFieldLocked: the user set field of t by hand, so no automatic writer changes it.
+func TaggingFieldLocked(t *Tagging, field string) bool {
+	if slices.Contains(t.LockedFields, field) {
+		return true
+	}
+	return t.Locked && (field == "importance" || field == "relevance" || field == "tags")
 }

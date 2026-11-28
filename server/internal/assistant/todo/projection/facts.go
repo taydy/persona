@@ -3,9 +3,9 @@
 // decision table of docs/design/proposals/todos-redesign.md 6.3. The rules are pinned by the shared cases in
 // spec/fixtures/todo-view and spec/fixtures/todo-counts, whose READMEs list every rule, line key and judgement call.
 //
-// It is pure: no IO and no clock (the caller passes now), and it imports only the standard library, proto (the
-// sessions as the apps get them) and assistantwire (the wire types). Its input, Facts, is the to-do as GET
-// /api/v1/todos lists it, decoded from the same JSON, plus what the row does not carry: the linked sessions, the steps
+// It is pure: no IO and no clock (the caller passes now), and it imports only the standard library and wire
+// packages. Its input, Facts, is the to-do as GET /api/v1/todos lists it, decoded from the same JSON, plus what
+// the row does not carry: the linked sessions, the steps
 // and the owner's zone. The manager's adapter (internal/assistant/todo_projection.go) builds it; the legacy triage
 // (internal/assistant/todo_triage.go) keeps serving the direction tree and leader reports until they read the view.
 package projection
@@ -55,6 +55,7 @@ type Facts struct {
 	Kind            string       `json:"kind,omitempty"`
 	SeenAt          *time.Time   `json:"seen_at,omitempty"`
 	PartOf          string       `json:"part_of,omitempty"`
+	After           []string     `json:"after,omitempty"`
 	// Ask is the to-do's own open ask, DecisionReview its decision round and whether the owner chose Don't handle on it.
 	Ask            *Ask            `json:"ask,omitempty"`
 	DecisionReview *DecisionReview `json:"decision_review,omitempty"`
@@ -63,6 +64,19 @@ type Facts struct {
 	// once the hub keeps them (#10226).
 	RestoredAt   *time.Time `json:"restored_at,omitempty"`
 	SomedayUntil *time.Time `json:"someday_until,omitempty"`
+
+	Phase     assistantwire.TaskPhase      `json:"phase,omitempty"`
+	WaitState *assistantwire.TaskWaitState `json:"wait_state,omitempty"`
+	// The current task contract and the provenance of the runtime wait come from the brief and stage ledgers.
+	WorkModeNow       assistantwire.WorkMode       `json:"-"`
+	CompletionModeNow assistantwire.CompletionMode `json:"-"`
+	RuntimeAt         time.Time                    `json:"-"`
+	ObservedWait      bool                         `json:"-"`
+	// RepoGate and ActiveBlockers describe v2 delivery and blocker evidence, as the waits they give the row: RepoGate
+	// the pr_merge wait of the open delivery PR holding the weakest bound repository's gate (RepoGateWait builds it),
+	// ActiveBlockers one wait per persisted blocker (its kind, its display target as WaitingOn, its source as URL).
+	RepoGate       *assistantwire.TodoWait  `json:"-"`
+	ActiveBlockers []assistantwire.TodoWait `json:"-"`
 
 	// Sessions are the to-do's linked runs' sessions as the hub sends them to the apps (state worked out); a linked
 	// run whose session is not among them is offline.
@@ -81,12 +95,23 @@ type Facts struct {
 	Superseded bool `json:"-"`
 	// Loc is the owner's time zone, for a due day; nil is UTC.
 	Loc *time.Location `json:"-"`
+	// TodosV2 gates experimental New To-dos & Tasks projection rules (#14620); false preserves legacy behavior identically.
+	TodosV2 bool `json:"-"`
+	// PendingReviewSLAHours overrides the default 24h pending_review quiet window under todos_v2=true when > 0 (#16098).
+	// PendingReviewSLADisabled disables pending_review quiet sinking so it surfaces immediately to needs_you.
+	PendingReviewSLAHours    int  `json:"-"`
+	PendingReviewSLADisabled bool `json:"-"`
+	// CanWaitSLAHours overrides the default 48h can_wait auto-escalation window under todos_v2=true when > 0 (#16098).
+	// CanWaitSLADisabled disables automatic aging of can_wait decisions into active needs_you.
+	CanWaitSLAHours    int  `json:"-"`
+	CanWaitSLADisabled bool `json:"-"`
 }
 
 // Agent is one of the to-do's runs (an Agent session) as the list links it (agents[]).
 type Agent struct {
 	MachineID   string     `json:"machine_id"`
 	SessionID   string     `json:"session_id"`
+	LinkedAt    *time.Time `json:"linked_at,omitempty"`
 	ReleasedAt  *time.Time `json:"released_at,omitempty"`
 	Title       string     `json:"title"`
 	StartError  string     `json:"start_error,omitempty"`
@@ -119,26 +144,35 @@ type DecisionReview struct {
 // Supervision is a supervised task's ledger: the review state, the park that holds it, the reviews (latest last) and
 // the moments that count as activity.
 type Supervision struct {
+	// Supervisor: the conversation that handed it out and supervises it. Its failed starts and the cards it routes are
+	// that conversation's to handle, not the owner's.
+	Supervisor   string     `json:"supervisor,omitempty"`
 	State        string     `json:"state"`
 	Parked       *Parked    `json:"parked,omitempty"`
 	Reviews      []Review   `json:"reviews"`
 	PendingSince *time.Time `json:"pending_since,omitempty"`
+	FollowedUpAt *time.Time `json:"followed_up_at,omitempty"`
 	UpdatedAt    time.Time  `json:"updated_at"`
 	Progress     *Progress  `json:"progress,omitempty"`
 }
 
 // Parked is what a parked task waits for: why, until when, on what kind of thing.
 type Parked struct {
-	Reason    string        `json:"reason"`
-	Until     time.Time     `json:"until"`
-	WaitingOn string        `json:"waiting_on"`
-	Evidence  *ParkEvidence `json:"evidence,omitempty"`
+	Reason    string                        `json:"reason"`
+	Until     time.Time                     `json:"until"`
+	WaitingOn string                        `json:"waiting_on"`
+	Evidence  *ParkEvidence                 `json:"evidence,omitempty"`
+	Handoff   *assistantwire.TodoHandoffRef `json:"handoff,omitempty"`
 }
 
-// ParkEvidence carries only the owner-request link the projection reads; the other evidence stays on the listed to-do.
+// ParkEvidence carries the fields of parked evidence the projection reads (owner-request link, shared-blocker root cause, and waiting details).
 type ParkEvidence struct {
-	Kind          string `json:"kind,omitempty"`
-	InteractionID string `json:"interaction_id,omitempty"`
+	Kind          string                         `json:"kind,omitempty"`
+	Target        string                         `json:"target,omitempty"`
+	URL           string                         `json:"url,omitempty"`
+	Wake          string                         `json:"wake,omitempty"`
+	InteractionID string                         `json:"interaction_id,omitempty"`
+	Contact       *assistantwire.TodoWaitContact `json:"contact,omitempty"`
 }
 
 // Review is one review of the ledger: when, its verdict, its note (a cancellation's why), and a needs_user review's
@@ -146,6 +180,7 @@ type ParkEvidence struct {
 type Review struct {
 	At        time.Time `json:"at"`
 	Verdict   string    `json:"verdict"`
+	By        string    `json:"by,omitempty"`
 	Note      string    `json:"note,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
 	Recommend string    `json:"recommend,omitempty"`
@@ -167,8 +202,12 @@ type Delivery struct {
 // PRStatus is an observation of one of the task's PRs.
 type PRStatus struct {
 	URL       string    `json:"url"`
+	Title     string    `json:"title,omitempty"`
 	State     string    `json:"state"`
 	Draft     bool      `json:"draft"`
+	Review    string    `json:"review,omitempty"`
+	Checks    string    `json:"checks,omitempty"`
+	Conflicts bool      `json:"conflicts,omitempty"`
 	CheckedAt time.Time `json:"checked_at"`
 }
 
@@ -182,20 +221,29 @@ const (
 
 	reviewPending   = "pending_review"
 	reviewAccepted  = "accepted"
+	reviewUserCheck = "user_check"
 	reviewNeedsUser = "needs_user"
 	reviewCancelled = "cancelled"
 	reviewParked    = "parked"
 
 	parkSomeoneElse   = "someone_else"
 	parkExternalEvent = "external_event"
+	parkDate          = "date"
+	parkTodoHandoff   = "todo_handoff"
+
+	parkEvidencePersonReply   = "person_reply"
+	parkEvidenceMergeReview   = "merge_review"
+	parkEvidenceExternalEvent = "external_event"
+	parkEvidenceDate          = "date"
 
 	outcomeDone   = "done"
 	outcomeCannot = "cannot"
 	outcomeDecide = "decide"
 	defaultTaken  = "taken"
 
-	deliveryLive = "live"
-	prOpen       = "open"
+	deliveryLive   = "live"
+	deliveryMerged = "merged"
+	prOpen         = "open"
 
 	priorityHigh = "high"
 	priorityLow  = "low"

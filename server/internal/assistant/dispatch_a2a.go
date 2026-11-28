@@ -23,7 +23,7 @@ func (s *Service) dispatchTasks(ctx context.Context, ref a2aRef) ([]dispatchTask
 		return tasks, false, nil
 	}
 	cfg := s.a2aConfig(ctx)
-	if !s.a2aAllowed(ctx, cfg, ref) {
+	if !s.a2aToolAllowed(ctx, cfg, ref) {
 		return tasks, false, nil
 	}
 	caller := a2aSessionCaller(ref)
@@ -56,7 +56,10 @@ type dispatchA2AStart struct {
 	task  *a2aTask
 }
 
-func (s *Service) admitDispatchA2A(ctx context.Context, from a2aRef, target, requestID, prompt string, launch a2aLaunch, now time.Time) (*dispatchA2AStart, bool, error) {
+// admitDispatchA2A answers a retry by requestID with its task, or admits a new dispatch and records it: one within the
+// caller's limits, to a computer that is online, which dispatchStartRefusal did not refuse (refused, worked out before
+// the lock so that no launcher list is read under it).
+func (s *Service) admitDispatchA2A(ctx context.Context, from a2aRef, target, requestID, prompt string, launch a2aLaunch, now time.Time, refused error) (*dispatchA2AStart, bool, error) {
 	s.dispatch.admit.Lock()
 	defer s.dispatch.admit.Unlock()
 	digest := sha256.Sum256([]byte(prompt))
@@ -67,10 +70,10 @@ func (s *Service) admitDispatchA2A(ctx context.Context, from a2aRef, target, req
 			row, err := decodeA2A(st.A2ARequest(ctx, caller.Owner, requestID))
 			if row != nil || err != nil {
 				cfg := s.a2aConfig(ctx)
-				if !s.a2aAllowed(ctx, cfg, from) || row != nil && !s.a2aAllowed(ctx, cfg, row.target()) {
+				if !s.a2aToolAllowed(ctx, cfg, from) || row != nil && !s.a2aTaskEndpointAllowed(ctx, cfg, row.target(), row) {
 					return nil, false, errA2AUnavailable
 				}
-				launch.Dispatch = true
+				launch.Dispatch, launch.Subagent = true, true
 				row, err := a2aCheckRetry(row, err, a2aRef{Machine: target}, "", prompt, true, &launch)
 				return &dispatchA2AStart{store: st, task: row}, true, err
 			}
@@ -81,6 +84,9 @@ func (s *Service) admitDispatchA2A(ctx context.Context, from a2aRef, target, req
 	}
 	if dev, ok := s.machineByName(ctx, target); !ok || !dev.Online && !dev.Reachable {
 		return nil, false, fmt.Errorf("%s is offline; nothing was started", target)
+	}
+	if refused != nil {
+		return nil, false, refused
 	}
 	return s.prepareDispatchA2A(ctx, from, target, requestID, prompt, launch)
 }
@@ -120,7 +126,7 @@ func (s *Service) prepareDispatchA2A(ctx context.Context, from a2aRef, target, r
 	caller := a2aSessionCaller(from)
 	to := a2aRef{target, newStartSessionID()}
 	cfg := s.a2aConfig(ctx)
-	if !s.a2aAllowed(ctx, cfg, from) || !s.a2aAllowed(ctx, cfg, to) {
+	if !s.a2aToolAllowed(ctx, cfg, from) || !s.a2aEndpointAllowed(ctx, cfg, to, true) {
 		return nil, false, errA2AUnavailable
 	}
 	if requestID == "" {
@@ -129,7 +135,7 @@ func (s *Service) prepareDispatchA2A(ctx context.Context, from a2aRef, target, r
 	if !a2aValidID(requestID) {
 		return nil, false, errA2AInvalid
 	}
-	launch.Dispatch, launch.Pending = true, true
+	launch.Dispatch, launch.Pending, launch.Subagent = true, true, true
 	now := time.Now().UTC()
 	task := &a2aTask{
 		A2ARow: db.A2ARow{ID: randomHex(16), Owner: caller.Owner, Request: requestID, Context: randomHex(16),
@@ -146,6 +152,7 @@ func (s *Service) prepareDispatchA2A(ctx context.Context, from a2aRef, target, r
 	if err != nil {
 		return nil, false, err
 	}
+	s.recordA2ASubagent(row)
 	return &dispatchA2AStart{store: st, task: row}, row.ID != task.ID, nil
 }
 
@@ -162,10 +169,14 @@ func (s *Service) finishDispatchA2A(ctx context.Context, start *dispatchA2AStart
 		}
 		return
 	}
+	why := session.StartError // a definite failure's reason, on the A2A task as the caller was told it
+	if launchErr != nil {
+		why = launchErr.Error()
+	}
 	for range 5 {
 		task, err := decodeA2A(start.store.A2AGet(ctx, start.task.ID))
 		if err == nil && task != nil && task.Launch.Pending {
-			err = s.a2aLaunched(ctx, start.store, task, session, launchErr != nil || session.StartError != "")
+			err = s.a2aLaunched(ctx, start.store, task, session, launchErr != nil || session.StartError != "", why)
 		}
 		if errors.Is(err, errA2AConflict) {
 			continue

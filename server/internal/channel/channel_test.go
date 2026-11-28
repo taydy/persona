@@ -92,6 +92,60 @@ func TestMentionMessageWithOnlyOriginIsARequest(t *testing.T) {
 	}
 }
 
+func TestMessageGroupTopicRoutingFieldsAndEmpty(t *testing.T) {
+	var m Message
+	raw := `{"id":"om_1","text":"hello","chat_id":"oc_group_1","chat_kind":"topic","topic_id":"omt_42","thread":"legacy_key"}`
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.ChatID != "oc_group_1" || m.ChatKind != ChatKindTopic || m.TopicID != "omt_42" || m.Thread != "legacy_key" {
+		t.Fatalf("decoded routing fields = %+v", m)
+	}
+	// Routing metadata alone does not constitute message content.
+	onlyRouting := Message{ID: "om_2", ChatID: "oc_group_1", ChatKind: ChatKindGroup, TopicID: "omt_42", Thread: "legacy_key"}
+	if !onlyRouting.Empty() {
+		t.Fatalf("message with only routing metadata should be empty: %+v", onlyRouting)
+	}
+}
+
+func TestThreadModeAndIdleHoursValidation(t *testing.T) {
+	for _, tc := range []struct {
+		mode ThreadMode
+		ok   bool
+	}{
+		{ThreadModeChannelDefault, true},
+		{ThreadModePerGroupAndTopic, true},
+		{ThreadModePerTopic, true},
+		{"", false},
+		{"per_group", false},
+	} {
+		if err := tc.mode.Check(); (err == nil) != tc.ok {
+			t.Errorf("ThreadMode(%q).Check() = %v, want ok=%v", tc.mode, err, tc.ok)
+		}
+	}
+	if got := ThreadMode("").Effective(false); got != ThreadModeChannelDefault {
+		t.Fatalf("Effective empty = %q, want %q", got, ThreadModeChannelDefault)
+	}
+	if got := ThreadModePerTopic.Effective(false); got != ThreadModePerTopic {
+		t.Fatalf("Effective per_topic = %q, want %q", got, ThreadModePerTopic)
+	}
+	for _, tc := range []struct {
+		hours int
+		ok    bool
+	}{
+		{0, true},
+		{1, true},
+		{24, true},
+		{MaxThreadIdleHours, true},
+		{-1, false},
+		{MaxThreadIdleHours + 1, false},
+	} {
+		if err := CheckThreadIdleHours(tc.hours); (err == nil) != tc.ok {
+			t.Errorf("CheckThreadIdleHours(%d) = %v, want ok=%v", tc.hours, err, tc.ok)
+		}
+	}
+}
+
 func TestTargetCheck(t *testing.T) {
 	for _, tc := range []struct {
 		t  Target
@@ -324,6 +378,21 @@ func TestAnswerKeepsAReportBeforeAToolCall(t *testing.T) {
 	got := Answer(items)
 	if len(got) != 2 || got[0].Text != report || got[1].Text != "已经发给它了。" {
 		t.Fatalf("answer %+v, want the report then the closing line", got)
+	}
+}
+
+func TestAnswerSeparatesWokenReplyFromPriorDeliveredReply(t *testing.T) {
+	items := []proto.Item{
+		{Role: "user", Kind: proto.KindText, Text: "Run the checks."},
+		{Role: "assistant", Kind: proto.KindText, Text: "Initial complete report."},
+		{Role: "system", Kind: proto.KindNotice, Wake: true, Text: "后台任务有更新"},
+		{Role: "assistant", Kind: proto.KindToolUse, ToolName: "Read"},
+		{Role: "user", Kind: proto.KindToolResult, Text: "ok"},
+		{Role: "assistant", Kind: proto.KindText, Text: "Follow-up task finished."},
+	}
+	got := Answer(items)
+	if len(got) != 1 || got[0].Text != "Follow-up task finished." {
+		t.Fatalf("answer %+v, want only the woken reply after the wake notice", got)
 	}
 }
 

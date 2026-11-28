@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -64,8 +66,11 @@ type TodoRow struct {
 	// Kind is "" for a to-do or a task, or KindConcern (#3561). Set when it is made, never changed.
 	Kind string `json:"kind"`
 	// SeenAt is when the owner last looked at it in Just finished (#5707): Got it, or opening it; nil when never, or
-	// after an Undo. Only SeeTodo writes it.
+	// after an Undo. Only SeeTodo / AutoSeeTodo writes it.
 	SeenAt *time.Time `json:"seen_at"`
+	// AutoSeenUndone records that the owner explicitly called Undo (DELETE /api/v1/todos/{id}/seen) so background
+	// supervision / re-acceptance never silently re-applies auto-seen (#14639).
+	AutoSeenUndone bool `json:"auto_seen_undone,omitempty"`
 	// InboxItem is the id of the Inbox row it was made from (#6480), "" for any other to-do. Set when it is made.
 	InboxItem string `json:"inbox_item"`
 	// PartOf is the to-do whose request this one is a piece of, "" for none; After the pieces of that request it waits
@@ -82,6 +87,14 @@ type TodoRow struct {
 	// Responsible is an external responsible party that is not a Persona-started agent (#12712): a long-running
 	// external session or a person, with optional machine_id / session_id hints; nil while none is set.
 	Responsible *TodoResponsible `json:"responsible,omitempty"`
+	// Audience distinguishes human-facing deliverables ("human") from autonomous engineering tasks ("autonomous"),
+	// or "" for unset/legacy to-dos (#14619).
+	Audience string `json:"audience,omitempty"`
+	// DirectionID is the optional organizational direction this to-do belongs to (#14660), decoupled from runtime
+	// supervision (supervision.supervisor) and origin. Empty for ungrouped/legacy to-dos.
+	DirectionID string `json:"direction_id,omitempty"`
+	// ItemType is the optional explicit 2-type classification ("personal" or "task"), or "" (SQL NULL) when unset (#15758).
+	ItemType string `json:"item_type,omitempty"`
 	// Images are the to-do's pictures, in the order the client supplied them. CreateTodo stores Data atomically with
 	// the row; ListTodos reconstructs only their metadata.
 	Images []TodoImage `json:"images,omitempty"`
@@ -131,6 +144,51 @@ const (
 	PriorityLow  = "low"
 )
 
+// A todo's audience besides unset ("") (#14619).
+const (
+	AudienceHuman      = "human"
+	AudienceAutonomous = "autonomous"
+)
+
+// ErrInvalidTodoAudience is returned when a to-do's audience is not "", AudienceHuman, or AudienceAutonomous.
+var ErrInvalidTodoAudience = errors.New(`audience must be "", "human", or "autonomous"`)
+
+// ValidateTodoAudience reports whether audience is "", AudienceHuman, or AudienceAutonomous.
+func ValidateTodoAudience(audience string) error {
+	switch audience {
+	case "", AudienceHuman, AudienceAutonomous:
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", ErrInvalidTodoAudience, audience)
+	}
+}
+
+// A todo's explicit item type besides unset ("") (#15758).
+const (
+	ItemTypePersonal = "personal"
+	ItemTypeTask     = "task"
+)
+
+// ErrInvalidTodoItemType is returned when a to-do's item_type is not "", ItemTypePersonal, or ItemTypeTask.
+var ErrInvalidTodoItemType = errors.New(`item_type must be "", "personal", or "task"`)
+
+// ValidateTodoItemType reports whether itemType is "", ItemTypePersonal, or ItemTypeTask.
+func ValidateTodoItemType(itemType string) error {
+	switch itemType {
+	case "", ItemTypePersonal, ItemTypeTask:
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", ErrInvalidTodoItemType, itemType)
+	}
+}
+
+func nullableItemType(itemType string) any {
+	if itemType == "" {
+		return nil
+	}
+	return itemType
+}
+
 // DoneByAuto marks a todo the hub closed because its task's work was judged finished (docs/assistant/todos.md "Automatic completion").
 const DoneByAuto = "auto"
 
@@ -164,13 +222,13 @@ type TodoAgentRow struct {
 }
 
 const todoColumns = `id, title, notes, done_at, created_at, updated_at, origin, plan_id, start_error, done_by, done_reason, reopened_at, quiet,
-	due_at, due_date, remind_at, reminded_at, priority, project, kind, seen_at, inbox_item, part_of, after_ids, restored_at, someday_until, require_accepted_after, responsible`
+	due_at, due_date, remind_at, reminded_at, priority, project, kind, seen_at, auto_seen_undone, inbox_item, part_of, after_ids, restored_at, someday_until, require_accepted_after, responsible, audience, direction_id, COALESCE(item_type, '')`
 
 // todoDest is where a row of todoColumns is scanned to.
 func todoDest(r *TodoRow) []any {
 	return []any{&r.ID, &r.Title, &r.Notes, &r.DoneAt, &r.CreatedAt, &r.UpdatedAt, &r.Origin, &r.PlanID, &r.StartError, &r.DoneBy,
 		&r.DoneReason, &r.ReopenedAt, &r.Quiet, &r.DueAt, &r.DueDate, &r.RemindAt, &r.RemindedAt, &r.Priority, &r.Project, &r.Kind,
-		&r.SeenAt, &r.InboxItem, &r.PartOf, &r.After, &r.RestoredAt, &r.SomedayUntil, &r.RequireAcceptedAfter, &r.Responsible}
+		&r.SeenAt, &r.AutoSeenUndone, &r.InboxItem, &r.PartOf, &r.After, &r.RestoredAt, &r.SomedayUntil, &r.RequireAcceptedAfter, &r.Responsible, &r.Audience, &r.DirectionID, &r.ItemType}
 }
 
 // ListTodos returns all todos ordered by created_at DESC, with image metadata but without image bytes.
@@ -250,8 +308,21 @@ func (d *DB) ListAllTodoAgents(ctx context.Context) ([]TodoAgentRow, error) {
 
 // GetTodo returns one todo by id, or ErrTodoNotFound.
 func (d *DB) GetTodo(ctx context.Context, id string) (*TodoRow, error) {
+	return getTodo(ctx, d.pool, id, false)
+}
+
+// LockTodoTx returns a to-do and holds its row lock through the caller's transaction.
+func LockTodoTx(ctx context.Context, tx pgx.Tx, id string) (*TodoRow, error) {
+	return getTodo(ctx, tx, id, true)
+}
+
+func getTodo(ctx context.Context, q queryRower, id string, lock bool) (*TodoRow, error) {
+	query := `SELECT ` + todoColumns + ` FROM todos WHERE id = $1`
+	if lock {
+		query += ` FOR UPDATE`
+	}
 	var r TodoRow
-	err := d.pool.QueryRow(ctx, `SELECT `+todoColumns+` FROM todos WHERE id = $1`, id).
+	err := q.QueryRow(ctx, query, id).
 		Scan(todoDest(&r)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrTodoNotFound
@@ -311,15 +382,21 @@ func CreateTodoTx(ctx context.Context, tx pgx.Tx, t TodoRow) error {
 func createTodo(ctx context.Context, executor interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }, t TodoRow) error {
+	if err := ValidateTodoAudience(t.Audience); err != nil {
+		return err
+	}
+	if err := ValidateTodoItemType(t.ItemType); err != nil {
+		return err
+	}
 	resp, err := responsibleParam(t.Responsible)
 	if err != nil {
 		return err
 	}
 	_, err = executor.Exec(ctx, `INSERT INTO todos (id, title, notes, done_at, created_at, updated_at, origin, plan_id, start_error, done_by,
-		done_reason, reopened_at, quiet, due_at, due_date, remind_at, reminded_at, priority, project, kind, inbox_item, part_of, after_ids, require_accepted_after, responsible)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`,
+		done_reason, reopened_at, quiet, due_at, due_date, remind_at, reminded_at, priority, project, kind, inbox_item, part_of, after_ids, require_accepted_after, responsible, audience, direction_id, item_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)`,
 		t.ID, t.Title, t.Notes, t.DoneAt, t.CreatedAt, t.UpdatedAt, t.Origin, t.PlanID, t.StartError, t.DoneBy, t.DoneReason, t.ReopenedAt, t.Quiet,
-		t.DueAt, t.DueDate, t.RemindAt, t.RemindedAt, t.Priority, t.Project, t.Kind, t.InboxItem, t.PartOf, nonNilIDs(t.After), t.RequireAcceptedAfter, resp)
+		t.DueAt, t.DueDate, t.RemindAt, t.RemindedAt, t.Priority, t.Project, t.Kind, t.InboxItem, t.PartOf, nonNilIDs(t.After), t.RequireAcceptedAfter, resp, t.Audience, strings.TrimSpace(t.DirectionID), nullableItemType(t.ItemType))
 	if err != nil {
 		return err
 	}
@@ -344,6 +421,9 @@ type TodoEdit struct {
 	Title, Notes *string
 	InboxItem    *string
 	Done         *bool
+	// CloseGuard reads the caller's current in-memory close protections while the edit can still be rolled back.
+	// It must not access the database.
+	CloseGuard func() error
 	// RestartWork starts a new work round when Done is false even if the task was already open.
 	RestartWork bool
 	SetDue      bool
@@ -364,6 +444,13 @@ type TodoEdit struct {
 	// SetResponsible updates Responsible (nil clears it); the caller has validated it (assistant/todo_responsible.go).
 	SetResponsible bool
 	Responsible    *TodoResponsible
+	// Audience updates Audience ("" clears it); validated against "", AudienceHuman, AudienceAutonomous (#14619).
+	Audience *string
+	// DirectionID updates organizational direction membership ("" clears it, trimmed of surrounding whitespace)
+	// without touching origin, supervision, or todo_agents (#14660).
+	DirectionID *string
+	// ItemType updates explicit item_type ("" clears it to SQL NULL); validated against "", ItemTypePersonal, ItemTypeTask (#15758).
+	ItemType *string
 }
 
 // Apply makes the edit to cur at the moment at: done stamps done_at (once), not done reopens it (reopened_at, no
@@ -390,6 +477,7 @@ func (e TodoEdit) Apply(cur *TodoRow, at time.Time) {
 		} else {
 			if cur.DoneAt != nil || e.RestartWork {
 				cur.ReopenedAt = &at // the same stretch of work must not close it again
+				cur.SeenAt, cur.AutoSeenUndone = nil, false
 			}
 			cur.DoneAt = nil
 			cur.StartError = "" // reopened: no longer failed
@@ -429,6 +517,15 @@ func (e TodoEdit) Apply(cur *TodoRow, at time.Time) {
 			cur.Responsible = nil
 		}
 	}
+	if e.Audience != nil {
+		cur.Audience = *e.Audience
+	}
+	if e.DirectionID != nil {
+		cur.DirectionID = strings.TrimSpace(*e.DirectionID)
+	}
+	if e.ItemType != nil {
+		cur.ItemType = strings.TrimSpace(*e.ItemType)
+	}
 	cur.UpdatedAt = at
 }
 
@@ -447,63 +544,79 @@ func sameMoment(a, b *time.Time) bool {
 // EditTodo makes edit e to todo id at updatedAt (TodoEdit.Apply) and returns the row as it is now; ErrTodoNotFound when
 // it is not there.
 func (d *DB) EditTodo(ctx context.Context, id string, e TodoEdit, updatedAt time.Time) (*TodoRow, error) {
-	conn, err := d.pool.Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-
-	var updated TodoRow
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		var cur TodoRow
-		err := tx.QueryRow(ctx, `SELECT `+todoColumns+` FROM todos WHERE id = $1 FOR UPDATE`, id).
-			Scan(todoDest(&cur)...)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrTodoNotFound
-		}
-		if err != nil {
-			return err
-		}
-		if cur.Kind == KindConcern && cur.DoneAt == nil && e.Done != nil && *e.Done {
-			return ErrConcernUnreported // only ReportConcern closes it
-		}
-		reopening := e.Done != nil && !*e.Done && (cur.DoneAt != nil || e.RestartWork)
-		e.Apply(&cur, updatedAt)
-		resp, err := responsibleParam(cur.Responsible)
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, `UPDATE todos SET title = $2, notes = $3, done_at = $4, updated_at = $5, start_error = $6,
-			done_by = $7, done_reason = $8, reopened_at = $9, due_at = $10, due_date = $11, remind_at = $12, reminded_at = $13,
-			priority = $14, project = $15, origin = $16, part_of = $17, after_ids = $18, inbox_item = $19,
-			someday_until = $20, require_accepted_after = $21, responsible = $22 WHERE id = $1`,
-			cur.ID, cur.Title, cur.Notes, cur.DoneAt, cur.UpdatedAt, cur.StartError, cur.DoneBy, cur.DoneReason, cur.ReopenedAt,
-			cur.DueAt, cur.DueDate, cur.RemindAt, cur.RemindedAt, cur.Priority, cur.Project, cur.Origin, cur.PartOf, nonNilIDs(cur.After), cur.InboxItem,
-			cur.SomedayUntil, cur.RequireAcceptedAfter, resp)
-		if err != nil {
-			return err
-		}
-		if reopening {
-			// The old Pass is stale as soon as reopened_at advances. Reset its ledger in the same commit.
-			if _, err := tx.Exec(ctx, `UPDATE todo_supervision SET state = '', pending_since = NULL, updated_at = $2
-				WHERE todo_id = $1 AND state = 'user_check' AND updated_at <= $2`, id, updatedAt); err != nil {
-				return err
-			}
-		}
-		updated = cur
-		return nil
+	var row *TodoRow
+	err := d.Transaction(ctx, func(tx pgx.Tx) error {
+		var err error
+		row, err = EditTodoTx(ctx, tx, id, e, updatedAt)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &updated, nil
+	return row, nil
 }
 
-// SeeTodo sets when the owner looked at todo id (#5707, docs/assistant/todo-status-sop.md "Seen"); nil clears it (Undo).
+// EditTodoTx makes the ordinary to-do edit in a caller's transaction.
+func EditTodoTx(ctx context.Context, tx pgx.Tx, id string, e TodoEdit, updatedAt time.Time) (*TodoRow, error) {
+	if e.Audience != nil {
+		if err := ValidateTodoAudience(*e.Audience); err != nil {
+			return nil, err
+		}
+	}
+	if e.ItemType != nil {
+		if err := ValidateTodoItemType(strings.TrimSpace(*e.ItemType)); err != nil {
+			return nil, err
+		}
+	}
+	cur, err := LockTodoTx(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if cur.Kind == KindConcern && cur.DoneAt == nil && e.Done != nil && *e.Done {
+		return nil, ErrConcernUnreported // only ReportConcern closes it
+	}
+	reopening := e.Done != nil && !*e.Done && (cur.DoneAt != nil || e.RestartWork)
+	e.Apply(cur, updatedAt)
+	resp, err := responsibleParam(cur.Responsible)
+	if err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE todos SET title = $2, notes = $3, done_at = $4, updated_at = $5, start_error = $6,
+		done_by = $7, done_reason = $8, reopened_at = $9, due_at = $10, due_date = $11, remind_at = $12, reminded_at = $13,
+		priority = $14, project = $15, origin = $16, part_of = $17, after_ids = $18, inbox_item = $19,
+		someday_until = $20, require_accepted_after = $21, responsible = $22, audience = $23, direction_id = $24, item_type = $25,
+		seen_at = $26, auto_seen_undone = $27 WHERE id = $1`,
+		cur.ID, cur.Title, cur.Notes, cur.DoneAt, cur.UpdatedAt, cur.StartError, cur.DoneBy, cur.DoneReason, cur.ReopenedAt,
+		cur.DueAt, cur.DueDate, cur.RemindAt, cur.RemindedAt, cur.Priority, cur.Project, cur.Origin, cur.PartOf, nonNilIDs(cur.After), cur.InboxItem,
+		cur.SomedayUntil, cur.RequireAcceptedAfter, resp, cur.Audience, cur.DirectionID, nullableItemType(cur.ItemType), cur.SeenAt, cur.AutoSeenUndone)
+	if err != nil {
+		return nil, err
+	}
+	if reopening {
+		// The old Pass is stale as soon as reopened_at advances. Reset its ledger in the same commit.
+		if _, err := tx.Exec(ctx, `UPDATE todo_supervision SET state = '', pending_since = NULL, updated_at = $2
+			WHERE todo_id = $1 AND state = 'user_check' AND updated_at <= $2`, id, updatedAt); err != nil {
+			return nil, err
+		}
+	}
+	if cur.DoneAt != nil && e.Done != nil && *e.Done && e.CloseGuard != nil {
+		if err := e.CloseGuard(); err != nil {
+			return nil, err
+		}
+	}
+	return cur, nil
+}
+
+// SeeTodo sets when the owner looked at todo id (#5707, docs/assistant/todo-status-sop.md "Seen"); nil clears it (Undo)
+// and persists auto_seen_undone = true so auto-seen respects Undo in that completion round (#14639).
+// Manual PUT /seen (at != nil) leaves auto_seen_undone untouched.
 // It is not an edit: updated_at stays, so being seen never counts as activity.
 func (d *DB) SeeTodo(ctx context.Context, id string, at *time.Time) (*TodoRow, error) {
 	var r TodoRow
-	err := d.pool.QueryRow(ctx, `UPDATE todos SET seen_at = $2 WHERE id = $1 RETURNING `+todoColumns, id, at).
+	err := d.pool.QueryRow(ctx, `UPDATE todos
+		SET seen_at = $2,
+			auto_seen_undone = CASE WHEN $2::timestamptz IS NULL THEN true ELSE auto_seen_undone END
+		WHERE id = $1 RETURNING `+todoColumns, id, at).
 		Scan(todoDest(&r)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrTodoNotFound
@@ -512,6 +625,29 @@ func (d *DB) SeeTodo(ctx context.Context, id string, at *time.Time) (*TodoRow, e
 		return nil, err
 	}
 	return &r, nil
+}
+
+// AutoSeeTodo marks the specified completion round seen unless the owner undid it.
+// A reopen, a different completion, or Undo makes the conditional write a no-op.
+func (d *DB) AutoSeeTodo(ctx context.Context, id string, doneAt time.Time, reopenedAt *time.Time, at time.Time) (*TodoRow, bool, error) {
+	var row TodoRow
+	var updated bool
+	err := d.Transaction(ctx, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `UPDATE todos SET seen_at = $2
+			WHERE id = $1 AND done_at IS NOT NULL AND NOT auto_seen_undone AND done_at = $3
+				AND reopened_at IS NOT DISTINCT FROM $4 RETURNING `+todoColumns, id, at, doneAt, reopenedAt).
+			Scan(todoDest(&row)...)
+		if errors.Is(err, pgx.ErrNoRows) {
+			_, err = getTodo(ctx, tx, id, false)
+			return err
+		}
+		updated = err == nil
+		return err
+	})
+	if err != nil || !updated {
+		return nil, false, err
+	}
+	return &row, true, nil
 }
 
 // RestoreTodo records that the owner brought todo id back from Inactive at at (#10226). Like SeeTodo it is not an edit:
@@ -603,7 +739,7 @@ func (d *DB) FailTodo(ctx context.Context, id, startError string, at time.Time) 
 func (d *DB) RetryTodo(ctx context.Context, id string, at time.Time) (*TodoRow, bool, error) {
 	var r TodoRow
 	err := d.pool.QueryRow(ctx, `UPDATE todos SET done_at = NULL, start_error = '', done_by = '', done_reason = '',
-		reopened_at = $2, updated_at = $2, someday_until = NULL WHERE id = $1 AND done_at IS NOT NULL AND start_error <> ''
+		reopened_at = $2, updated_at = $2, someday_until = NULL, seen_at = NULL, auto_seen_undone = false WHERE id = $1 AND done_at IS NOT NULL AND start_error <> ''
 		RETURNING `+todoColumns, id, at).
 		Scan(todoDest(&r)...)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -620,20 +756,37 @@ func (d *DB) RetryTodo(ctx context.Context, id string, at time.Time) (*TodoRow, 
 
 // AutoDoneTodo marks a task done by the hub (DoneByAuto, with why) when it is still open and the user has not
 // reopened it since workSince, the start of the work that was judged; false (and no error) when either changed, or it
-// is a concern (never closed on its own).
-func (d *DB) AutoDoneTodo(ctx context.Context, id, reason string, at, workSince time.Time) (*TodoRow, bool, error) {
+// is a concern (never closed on its own). A final guard can roll back activity arriving during the write.
+func (d *DB) AutoDoneTodo(ctx context.Context, id, reason string, at, workSince time.Time, guard func() error) (*TodoRow, bool, error) {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
 	var r TodoRow
-	err := d.pool.QueryRow(ctx, `UPDATE todos SET done_at = $2, done_by = $3, done_reason = $4, updated_at = $2
+	err = tx.QueryRow(ctx, `UPDATE todos SET done_at = $2, done_by = $3, done_reason = $4, updated_at = $2
 		WHERE id = $1 AND done_at IS NULL AND (reopened_at IS NULL OR reopened_at < $5) AND kind <> 'concern'
 		RETURNING `+todoColumns, id, at, DoneByAuto, reason, workSince).
 		Scan(todoDest(&r)...)
 	if errors.Is(err, pgx.ErrNoRows) {
-		if _, gerr := d.GetTodo(ctx, id); gerr != nil {
-			return nil, false, gerr
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM todos WHERE id = $1)`, id).Scan(&exists); err != nil {
+			return nil, false, err
+		}
+		if !exists {
+			return nil, false, ErrTodoNotFound
 		}
 		return nil, false, nil
 	}
 	if err != nil {
+		return nil, false, err
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return nil, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, false, err
 	}
 	return &r, true, nil

@@ -244,6 +244,25 @@ class HttpMachineManagementTest {
         assertEquals("""{"engine":"herdr"}""", server.takeRequest().body.readUtf8())
     }
 
+    // #17052: a new default inside a set of several engines goes as the set itself, never as one engine that would replace it.
+    @Test fun aNewDefaultKeepsTheSet() = withHub { server, machines ->
+        server.enqueue(MockResponse().setBody("""{"id":"m1","engine":"herdr","engine_hosts":["herdr","orca","paseo"],"engine_default":"herdr"}"""))
+        val saved = machines.setEngineHosts("m1", listOf("herdr", "orca", "paseo"), "herdr")
+        val put = server.takeRequest()
+        assertEquals("PUT", put.method)
+        assertEquals("/api/v1/machines/m1/engine", put.path)
+        assertEquals("""{"hosts":["herdr","orca","paseo"],"default":"herdr"}""", put.body.readUtf8())
+        assertEquals(listOf("herdr", "orca", "paseo"), saved.engineHosts)
+        assertEquals("herdr", saved.engineDefault)
+        // Another machine's state is never taken for this one's.
+        server.enqueue(MockResponse().setBody("""{"id":"other","engine":"orca"}"""))
+        assertTrue(runCatching { machines.setEngineHosts("m1", listOf("herdr", "orca"), "orca") }.exceptionOrNull() is HubFailure)
+        server.takeRequest()
+        // A default outside the set is never sent.
+        assertTrue(runCatching { machines.setEngineHosts("m1", listOf("herdr", "orca"), "paseo") }.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(2, server.requestCount)
+    }
+
     @Test fun putsTheEngineAndDecodesTheMachine() = withHub { server, machines ->
         server.enqueue(MockResponse().setBody("""{"id":"m1","engine":"orca","engines":[{"id":"orca","name":"Orca","available":true}]}"""))
         val saved = machines.setEngine("m1", "orca")
@@ -600,6 +619,22 @@ class HttpModelConfigurationTest {
         server.enqueue(MockResponse().setResponseCode(400).setBody("""{"error":"invalid tier"}"""))
         assertEquals(400, (runCatching { models.saveProfile("performance", input) }.exceptionOrNull() as HubFailure).status)
         server.takeRequest()
+
+        // Capture live configuration sends minimal { revision, name, description?, capture: true }.
+        server.enqueue(MockResponse().setBody(profilesJson.replace("\"revision\": 4", "\"revision\": 6")))
+        val captureInput = ModelProfileSaveInput.capture(revision = 5, name = "Performance", description = "Strong models")
+        val captured = models.saveProfile("performance", captureInput)
+        assertTrue(captured is ModelProfileSave.Saved)
+        assertEquals(6L, (captured as ModelProfileSave.Saved).view.revision)
+        val captureReq = server.takeRequest()
+        assertEquals("PUT", captureReq.method)
+        assertEquals("/api/v1/model-profiles/performance", captureReq.path)
+        val captureBody = JsonCodec.parseToJsonElement(captureReq.body.readUtf8()).jsonObject
+        assertEquals(setOf("revision", "name", "description", "capture"), captureBody.keys)
+        assertEquals(5L, captureBody["revision"]?.jsonPrimitive?.long)
+        assertEquals("Performance", captureBody["name"]?.jsonPrimitive?.content)
+        assertEquals("Strong models", captureBody["description"]?.jsonPrimitive?.content)
+        assertEquals(true, captureBody["capture"]?.jsonPrimitive?.boolean)
         Unit
     }
 }

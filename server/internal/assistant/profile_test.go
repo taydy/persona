@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/nwverse/persona/server/internal/i18n"
 	"github.com/nwverse/persona/server/internal/kb"
+	"github.com/nwverse/persona/server/internal/modelhttp"
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
@@ -69,9 +71,9 @@ func TestPutSettings(t *testing.T) {
 			t.Fatalf("%s: %d %v", bad, code, out)
 		}
 	}
-	code, out := put(`{"launcher":"codex-l","timezone":"Asia/Shanghai","main":"m1","main_tasks_quiet":false,"notes":"关于我"}`)
+	code, out := put(`{"launcher":"codex-l","timezone":"Asia/Shanghai","main":"m1","main_tasks_quiet":false,"approval_mirror_main":false,"notes":"关于我"}`)
 	if code != http.StatusOK || out["launcher"] != "codex-l" || out["timezone"] != "Asia/Shanghai" || out["main"] != "m1" ||
-		out["main_tasks_quiet"] != false || out["notes_effective"] != "关于我" || out["cwd"] != "/home/me/.persona/assistant" {
+		out["main_tasks_quiet"] != false || out["approval_mirror_main"] != false || out["notes_effective"] != "关于我" || out["cwd"] != "/home/me/.persona/assistant" {
 		t.Fatalf("PUT: %d %v", code, out)
 	}
 	if r := modelRecordOf(t, s, "assistant"); r.Binding.Provider != "launcher.codex-l" {
@@ -102,6 +104,31 @@ func TestPutSettings(t *testing.T) {
 	}
 	if code, out := put(`{"main":"-"}`); code != http.StatusOK || out["main"] != nil {
 		t.Fatalf("clear main: %d %v", code, out)
+	}
+}
+
+func TestPutApprovalMirrorTools(t *testing.T) {
+	f := newFakeHub().withMachine()
+	s := newTestService(t, f)
+	put := func(body string) map[string]any {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/assistant", strings.NewReader(body)))
+		out := map[string]any{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", body, rec.Code, rec.Body.String())
+		}
+		return out
+	}
+	out := put(`{"approval_mirror_tools":[" Read ","mcp__persona__Read","Read",""]}`)
+	if got := out["approval_mirror_tools"]; !reflect.DeepEqual(got, []any{"Read"}) {
+		t.Fatalf("normalized allowlist = %#v", got)
+	}
+	if got := put(`{}`)["approval_mirror_tools"]; !reflect.DeepEqual(got, []any{"Read"}) {
+		t.Fatalf("an unrelated write replaced the allowlist: %#v", got)
+	}
+	if got := put(`{"approval_mirror_tools":[]}`)["approval_mirror_tools"]; !reflect.DeepEqual(got, []any{}) {
+		t.Fatalf("empty allowlist = %#v, want []", got)
 	}
 }
 
@@ -215,8 +242,11 @@ func TestRecordingDaysKeepsLastGoodOnReadFailure(t *testing.T) {
 	if _, ok := s.settingsLastGood(ctx); ok {
 		t.Fatal("never read + failure: want !ok")
 	}
-	if d := s.recordingDaysNow(); d != kb.DefaultRecordingDays {
+	if d := s.recordingAudioDaysNow(); d != kb.DefaultRecordingDays {
 		t.Fatalf("never read + failure: days=%d, want %d", d, kb.DefaultRecordingDays)
+	}
+	if d := s.recordingTextDaysNow(); d != 0 { // the text is never pruned on a value that could not be read
+		t.Fatalf("never read + failure: text days=%d, want forever", d)
 	}
 
 	// The user picked 365; a failure past the 5s freshness keeps serving 365 instead of falling back to 14.
@@ -227,7 +257,7 @@ func TestRecordingDaysKeepsLastGoodOnReadFailure(t *testing.T) {
 	if v, ok := s.settingsLastGood(ctx); !ok || v.RecordingDays == nil || *v.RecordingDays != 365 {
 		t.Fatalf("failure with last-good: ok=%v days=%v", ok, v.RecordingDays)
 	}
-	if d := s.recordingDaysNow(); d != 365 {
+	if d := s.recordingAudioDaysNow(); d != 365 {
 		t.Fatalf("failure with last-good: days=%d, want 365", d)
 	}
 
@@ -242,19 +272,19 @@ func TestRecordingDaysKeepsLastGoodOnReadFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	expire()
-	if d := s.recordingDaysNow(); d != 30 {
+	if d := s.recordingAudioDaysNow(); d != 30 {
 		t.Fatalf("successful refresh: days=%d, want 30", d)
 	}
 
 	// Failing again serves the new last-good value (30); once the database recovers the read works again.
 	expire()
 	st.setFailSetting(errors.New("database busy"))
-	if d := s.recordingDaysNow(); d != 30 {
+	if d := s.recordingAudioDaysNow(); d != 30 {
 		t.Fatalf("failure after refresh: days=%d, want 30", d)
 	}
 	st.setFailSetting(nil)
 	expire()
-	if d := s.recordingDaysNow(); d != 30 {
+	if d := s.recordingAudioDaysNow(); d != 30 {
 		t.Fatalf("recovered: days=%d, want 30", d)
 	}
 }
@@ -277,7 +307,8 @@ func TestSendParams(t *testing.T) {
 	setModel(t, s, "assistant", ModelBinding{Provider: "launcher.conv"})
 	p, err := s.SendParams(ctx, SendParams{MachineID: "server", SessionID: "unlisted", Params: map[string]any{"text": "hi"}})
 	_, attested := p["origin_known"]
-	if err != nil || len(p) != 3 || p["is_main"] != false || p["supervision_instructions"] != "" || attested {
+	if err != nil || len(p) != 4 || p["is_main"] != false || p["supervision_instructions"] != "" || attested ||
+		p["model_source"] != (modelhttp.Source{Role: "main", Session: "unlisted"}) {
 		t.Fatalf("unlisted and not yet backfilled must stay unknown: %v %v", p, err)
 	}
 	p, err = s.SendParams(ctx, SendParams{MachineID: "server", SessionID: "side", Params: map[string]any{"text": "hi"}})
@@ -393,7 +424,7 @@ func TestSettingsTool(t *testing.T) {
 	}
 }
 
-// persona_settings' three on/off settings (setBoolSetting): the same value changes nothing and asks nothing; another
+// persona_settings' on/off settings (setBoolSetting): the same value changes nothing and asks nothing; another
 // asks on the phone with the setting's own card, and only an approval saves it; a value that is not a bool is refused.
 func TestBoolSettingsSet(t *testing.T) {
 	ctx := context.Background()
@@ -422,7 +453,7 @@ func TestBoolSettingsSet(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		def  bool
-	}{{"main_tasks_quiet", true}, {"start_requested_tasks", true}, {"interject_background", false}, {"agent_tasks", false}, {"task_lessons", false}, {"close_ended_terminals", false}, {"main_background_folded", true}, {"recent_task_chats", false}, {"inbox_signals", false}, {"main_supervises_own_tasks", false}} {
+	}{{"main_tasks_quiet", true}, {"approval_mirror_main", true}, {"start_requested_tasks", true}, {"interject_background", false}, {"agent_tasks", false}, {"task_lessons", false}, {"close_ended_terminals", false}, {"main_background_folded", true}, {"fold_routine_relay_replies", false}, {"recent_task_chats", false}, {"inbox_signals", false}, {"main_supervises_own_tasks", false}} {
 		key := "assistant." + c.name
 		get := func() string { out, _ := tool(`{"action":"get","key":"` + key + `"}`); return out }
 		set := func(value string) (string, bool) {
@@ -484,6 +515,62 @@ func TestBoolSettingsSet(t *testing.T) {
 		if out, _ := set("true"); !strings.HasPrefix(out, key+" is true") || get() != "true" || s.deliveryGate(ctx) != deliveryGateLive {
 			t.Fatalf("%s approved: %s (gate=%s)", key, out, s.deliveryGate(ctx))
 		}
+	}
+}
+
+// The approval card names the new relay preference in the owner's language, rather than falling back to the English
+// description shown to the assistant. Declining each card leaves the setting ready for the next language case.
+func TestFoldRoutineRelayRepliesApprovalTitleLocalized(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeHub().withMachine()
+	s := newTestService(t, f)
+	const key = "assistant.fold_routine_relay_replies"
+	var setting ownSetting
+	for _, candidate := range s.ownSettings() {
+		if candidate.Key == key {
+			setting = candidate
+			break
+		}
+	}
+	if setting.Key != key {
+		t.Fatalf("%s is not an own setting", key)
+	}
+	for _, lang := range []i18n.Lang{i18n.En, i18n.ZhHans, i18n.Ja} {
+		t.Run(string(lang), func(t *testing.T) {
+			f.mu.Lock()
+			f.hello.Locale = string(lang)
+			f.mu.Unlock()
+			done := make(chan error, 1)
+			go func() {
+				_, err := s.ownSettingAction(ctx, ToolCall{MachineID: "server", SessionID: "c1"}, setting, "set", json.RawMessage(`true`))
+				done <- err
+			}()
+			card, ok := awaitCard(s)
+			if !ok {
+				t.Fatal("the setting change did not wait for approval")
+			}
+			var shown struct{ Setting string }
+			if err := json.Unmarshal(card.ToolInput, &shown); err != nil {
+				t.Fatal(err)
+			}
+			allow := false
+			raw, _ := json.Marshal(proto.Resolution{Allow: &allow})
+			if _, err := s.Action(ctx, Action{Op: "answer", InteractionID: card.ID, Answer: raw}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the declined setting change did not finish")
+			}
+			want := i18n.T(lang, "assistant-settings_tool.title_fold_routine_relay_replies")
+			if shown.Setting != want {
+				t.Errorf("approval setting title = %q, want %q", shown.Setting, want)
+			}
+		})
 	}
 }
 

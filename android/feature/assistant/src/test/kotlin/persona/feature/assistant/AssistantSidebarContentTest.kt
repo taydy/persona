@@ -9,7 +9,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -21,6 +23,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.CoroutineScope
@@ -37,6 +40,9 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.annotation.Config
+import persona.core.contracts.Direction
+import persona.core.contracts.DirectionTree
+import persona.core.contracts.ExternalDirection
 import persona.core.contracts.HubScope
 import persona.core.contracts.Session
 import persona.core.contracts.SessionKey
@@ -158,6 +164,53 @@ class AssistantSidebarContentTest {
         rule.onNodeWithContentDescription("搜索对话").performClick()
         rule.onNodeWithTag("full-search").assertExists()
         rule.onNodeWithTag("full-search-close").performClick()
+        rule.onAllNodesWithTag("full-search").assertCountEquals(0)
+    }
+
+    @Test fun fullWindowSearchListsOutsideDirectionsAndRoutesOnlyCompleteTargets() {
+        val choice = AssistantManagerChoice.current.value
+        val target = SessionKey("work", "outside-agent")
+        val tree = DirectionTree(listOf(
+            Direction("bound", "Release outside", external = ExternalDirection(target.machineId, target.sessionId)),
+            Direction("targetless", "Research outside", external = ExternalDirection()),
+        ))
+        val snapshot = AssistantSnapshot(
+            leaders = tree.ids, directionNames = tree.names, directionTree = tree,
+            manager = choice.manager, managerId = choice.shown,
+        )
+        val repository = object : AssistantRepository {
+            override val assistant = MutableStateFlow(snapshot)
+            override suspend fun refresh() = Unit
+        }
+        val openedChats = mutableListOf<SessionKey>()
+        val openedAgents = mutableListOf<SessionKey>()
+        rule.setContent {
+            PersonaTheme(style = AppStyle.Brief, reduceMotion = true) {
+                Box(Modifier.width(400.dp).height(1200.dp)) {
+                    AssistantSidebarContent(
+                        snapshot, repository, null, operations, demo = true,
+                        onOpen = { openedChats += it }, onAction = {}, onSettings = {},
+                        onInbox = {}, onKnowledge = {}, onTodos = {}, todoCount = 0, showTodos = false,
+                        inboxCount = 0, settingsCount = 0, settingsDot = false, settingsBadge = null,
+                        pages = emptyList(), onPage = {}, onRetired = {},
+                        fullWindowSearch = true, onOpenAgent = { openedAgents += it },
+                    )
+                }
+            }
+        }
+        rule.onNodeWithContentDescription("搜索对话").performClick()
+        rule.onNode(hasSetTextAction() and hasAnyAncestor(hasTestTag("full-search-field"))).performTextInput("outside")
+        val bound = rule.onNode(hasText("Release outside") and hasAnyAncestor(hasTestTag("full-search")))
+        val targetless = rule.onNode(hasText("Research outside") and hasAnyAncestor(hasTestTag("full-search")))
+        bound.assertExists()
+        targetless.assertExists()
+        targetless.performTouchInput { click() }
+        assertTrue(openedChats.isEmpty())
+        assertTrue(openedAgents.isEmpty())
+        rule.onNodeWithTag("full-search").assertExists()
+        bound.performClick()
+        assertEquals(listOf(target), openedAgents)
+        assertTrue(openedChats.isEmpty())
         rule.onAllNodesWithTag("full-search").assertCountEquals(0)
     }
 
@@ -307,6 +360,39 @@ class AssistantSidebarContentTest {
         rule.waitForIdle()
         assertEquals(listOf(second.key), ended)
         assertEquals(listOf(second.key), retired)
+    }
+
+    // The shell draws this sidebar outside AssistantAppHost, so LocalAssistantHost is null there. The management passed
+    // in must keep the conversation menu's Pin/Rename/Archive/End actions instead of falling back to the two copies
+    // (#17123).
+    @Test fun theConversationMenuKeepsManagementActionsWithoutAnAssistantHost() {
+        val choice = AssistantManagerChoice.current.value
+        val main = Session(machineId = "hub", sessionId = "main", title = "主对话", assistant = true)
+        val first = Session(machineId = "hub", sessionId = "first", title = "First conversation", assistant = true)
+        val snapshot = AssistantSnapshot(mainSession = main.key, conversations = listOf(main, first),
+            manager = choice.manager, managerId = choice.shown)
+        val repository = object : AssistantRepository {
+            override val assistant = MutableStateFlow(snapshot)
+            override suspend fun refresh() = Unit
+        }
+        val management = object : AssistantManagement by testManagement(emptyList()) {
+            override fun forManager(manager: String?): AssistantManagement = this
+        }
+        rule.setContent {
+            PersonaTheme(style = AppStyle.Brief, reduceMotion = true) {
+                Box(Modifier.width(400.dp).height(1200.dp)) {
+                    AssistantSidebarContent(snapshot, repository, first.key, operations, demo = false,
+                        onOpen = {}, onAction = {}, onSettings = {}, onInbox = {}, onKnowledge = {}, onTodos = {},
+                        todoCount = 0, showTodos = false, inboxCount = 0, settingsCount = 0, settingsDot = false,
+                        settingsBadge = null, pages = emptyList(), onPage = {}, onRetired = {},
+                        management = management)
+                }
+            }
+        }
+        rule.onAllNodesWithContentDescription("对话操作")[1].performClick()
+        rule.onNodeWithText("重命名…").assertExists()
+        rule.onNodeWithText("归档").assertExists()
+        rule.onNodeWithText("拷贝会话 ID").assertExists()
     }
 
     private fun testManagement(archived: List<Session>) = object : AssistantManagement {

@@ -145,6 +145,7 @@ func (x *featurePatchWorld) checkView(t *testing.T, s FeishuBotSettings) {
 // Pause real BotInfo validation after the real settings route has read its input.
 // The unrelated switch PUT must finish first and survive the late credential commit.
 func TestBotFeaturePatchConcurrentCredentials(t *testing.T) {
+	needsLarkModule(t)
 	for _, tc := range []struct {
 		name                             string
 		features                         string
@@ -158,7 +159,7 @@ func TestBotFeaturePatchConcurrentCredentials(t *testing.T) {
 		{name: "null", features: `,"features":null`, wantRead: true},
 		{name: "empty", features: `,"features":{}`, wantRead: true},
 		{name: "null member", features: `,"features":{"read_group":null}`, wantRead: true},
-		{name: "explicit full replace", features: `,"features":{"main":false,"cards":false,"all_cards":false,"pushes":false,"sync":false,"agents":true,"reports":false,"board":false,"workbench":false,"only_conclusions":false,"report_steps":false,"answer_new_card":false,"topic_cot":false,"read_group":false}`, wantAgents: true},
+		{name: "explicit full replace", features: `,"features":{"main":false,"cards":false,"all_cards":false,"pushes":false,"sync":false,"agents":true,"reports":false,"board":false,"workbench":false,"only_conclusions":false,"report_steps":false,"answer_new_card":false,"topic_cot":false,"dm_cot":false,"cot_answer":false,"read_group":false}`, wantAgents: true},
 		{name: "validation failure", features: `,"features":{"agents":true}`, newApp: true, validationFail: true, wantRead: true},
 		{name: "credential save failure", features: `,"features":{"agents":true}`, newApp: true, saveFail: true, wantRead: true},
 	} {
@@ -241,6 +242,7 @@ func TestBotFeaturePatchConcurrentCredentials(t *testing.T) {
 }
 
 func TestBotFeaturePatchCompatibility(t *testing.T) {
+	needsLarkModule(t)
 	x := newFeaturePatchWorld(t, false)
 	for _, body := range []string{`{"features":{"read_group":true}}`, `{"features":{"main":false}}`, `{}`, `{"features":null}`, `{"features":{}}`} {
 		if w := x.put(body); w.Code != http.StatusOK {
@@ -264,6 +266,7 @@ func TestBotFeaturePatchCompatibility(t *testing.T) {
 }
 
 func TestBotFeaturePatchRejectsInvalidBeforeValidation(t *testing.T) {
+	needsLarkModule(t)
 	for _, features := range []string{`[]`, `true`, `"wrong"`, `{"agents":"wrong"}`, `{"read_group":1}`} {
 		t.Run(features, func(t *testing.T) {
 			x := newFeaturePatchWorld(t, false)
@@ -286,6 +289,7 @@ func TestBotFeaturePatchRejectsInvalidBeforeValidation(t *testing.T) {
 }
 
 func TestBotFeaturePatchSaveFailure(t *testing.T) {
+	needsLarkModule(t)
 	x := newFeaturePatchWorld(t, false)
 	before := x.saved(t)
 	x.store.fail.Store(true)
@@ -302,6 +306,7 @@ func TestBotFeaturePatchSaveFailure(t *testing.T) {
 // The authenticated route keeps the existing boundary: a full device may save bot settings;
 // unknown credentials and even an extension with all scopes cannot change them.
 func TestBotFeaturePatchPermissions(t *testing.T) {
+	needsLarkModule(t)
 	x := newFeaturePatchWorld(t, false)
 	routes := x.h.routes()
 	extensionToken := x.h.extTokens.issueAll("example-extension", "Example")
@@ -330,6 +335,7 @@ func TestBotFeaturePatchPermissions(t *testing.T) {
 // request against the live features, then updateBot's lazy load observes a newer durable
 // settings write. Both entry points use the real RPC/PUT handlers; no transport is started.
 func TestBotFeaturePatchConfigureKeepsCommitState(t *testing.T) {
+	needsLarkModule(t)
 	x := newFeaturePatchWorld(t, false)
 	if w := x.put(`{"features":{"read_group":true}}`); w.Code != http.StatusOK {
 		t.Fatal(w.Code)
@@ -357,6 +363,7 @@ func TestBotFeaturePatchConfigureKeepsCommitState(t *testing.T) {
 }
 
 func TestBotFeaturePatchConfigureSemantics(t *testing.T) {
+	needsLarkModule(t)
 	for _, tc := range []struct {
 		name, params  string
 		initial, want BotFeatures

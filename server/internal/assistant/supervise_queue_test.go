@@ -35,7 +35,23 @@ func queuedDigestFixture(t *testing.T, titles ...string) (*Service, *fakeHub, []
 	if s.queuedFor("conv1") != 1 {
 		t.Fatal("expected one digest")
 	}
+	waitFor(t, "the backfill's read of the to-dos", s.spaceBackfillScanIdle)
 	return s, f, tasks
+}
+
+func TestQueuedRoutineSignalsStayQuietWhenTaskWaitsForUser(t *testing.T) {
+	s, f, tasks := queuedDigestFixture(t, "Waiting for owner", "Still active")
+	if _, _, err := s.updateSupervision(t.Context(), tasks[0].ID, func(v *Supervision) bool {
+		v.State = reviewNeedsUser
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	drainQueuedDigest(t, s, f)
+	got := strings.Join(f.noticesTo("conv1"), "\n")
+	if strings.Contains(got, "Waiting for owner") || !strings.Contains(got, "Still active") {
+		t.Fatalf("queued digest did not follow the current task states: %s", got)
+	}
 }
 
 func drainQueuedDigest(t *testing.T, s *Service, f *fakeHub) {
@@ -123,10 +139,16 @@ func (unreadableDigestTasks) ListTodos(context.Context) ([]db.TodoRow, error) {
 	return nil, errors.New("synthetic unavailable tasks")
 }
 
+// Setting fails too: the settings in effect are the last good ones (settingsLastGood), as with any unreadable store. The
+// drain reads them for the switch for automatic supervision messages.
+func (unreadableDigestTasks) Setting(context.Context, string, any) (bool, error) {
+	return false, errors.New("synthetic unavailable settings")
+}
+
 func TestQueuedDigestKeepsUnreadableTasks(t *testing.T) {
 	s, f, _ := queuedDigestFixture(t, "Recoverable example")
-	oldStore := s.store
-	s.store = func() Store { return unreadableDigestTasks{} }
+	oldStore := s.storeAccessor()
+	s.setStore(func() Store { return unreadableDigestTasks{} })
 	s.todos.mu.Lock()
 	s.todos.loaded = false
 	s.todos.mu.Unlock()
@@ -135,7 +157,7 @@ func TestQueuedDigestKeepsUnreadableTasks(t *testing.T) {
 	if len(f.notices()) != 0 || s.queuedFor("conv1") != 1 {
 		t.Fatal("unknown task state sent or dropped")
 	}
-	s.store = oldStore
+	s.setStore(oldStore)
 	s.todos.mu.Lock()
 	s.todos.loaded = true
 	s.todos.mu.Unlock()
@@ -149,13 +171,13 @@ func TestQueuedDigestKeepsFailedCheckpoint(t *testing.T) {
 	s, f, tasks := queuedDigestFixture(t, "Accepted example", "Recoverable example")
 	closeTodo(t, s, tasks[0].ID)
 	st := &memStore{failPut: errors.New("synthetic checkpoint failure")}
-	oldStore := s.store
-	s.store = func() Store { return st }
+	oldStore := s.storeAccessor()
+	s.setStore(func() Store { return st })
 	drainQueuedDigest(t, s, f)
 	if len(f.notices()) != 0 || s.queuedFor("conv1") != 1 {
 		t.Fatal("failed checkpoint sent or lost work")
 	}
-	s.store = oldStore
+	s.setStore(oldStore)
 	drainQueuedDigest(t, s, f)
 	if len(f.notices()) != 1 || strings.Contains(f.notices()[0], "Accepted example") {
 		t.Fatal("checkpoint recovery failed")
@@ -180,7 +202,7 @@ func TestQueuedDigestKeepsFollowingOwnerMessage(t *testing.T) {
 
 func TestQueuedDigestPersistsAcrossServiceRestart(t *testing.T) {
 	ctx := context.Background()
-	database, err := db.Open(ctx, newDatabase(t), db.AllSets)
+	database, err := db.Open(ctx, newMigratedDatabase(t, db.AllSets), db.AllSets)
 	if err != nil {
 		t.Fatal(err)
 	}

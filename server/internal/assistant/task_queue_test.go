@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,15 +19,20 @@ import (
 // queuedStart builds a supervised todo and a started one-task plan on machine, then runs its start synchronously.
 func queuedStart(t *testing.T, s *Service, machine string) (*TaskPlan, Todo) {
 	t.Helper()
+	return queuedStartFor(t, s, machine, "conv1", "")
+}
+
+func queuedStartFor(t *testing.T, s *Service, machine, conversation, supervisorSource string) (*TaskPlan, Todo) {
+	t.Helper()
 	ctx := context.Background()
-	todo, err := s.createTodo(ctx, "排队活", "排队活", "conv1", "plan_q")
+	todo, err := s.createTodo(ctx, "排队活", "排队活", conversation, "plan_q")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.superviseTodo(ctx, todo.ID, "conv1", nil, 0)
+	s.superviseTodo(ctx, todo.ID, conversation, nil, 0, supervisorSource)
 	task := admissionPlanTask(machine, machineFixed)
 	task.TodoID = todo.ID
-	p := &TaskPlan{ID: "plan_q", Conversation: "conv1", State: planStarted,
+	p := &TaskPlan{ID: "plan_q", Conversation: conversation, State: planStarted,
 		Tasks: []PlanTask{*task}, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	if err := s.savePlan(ctx, p); err != nil {
 		t.Fatal(err)
@@ -54,11 +60,32 @@ func busyHealthy(d *resourceDevs) {
 func TestAdmissionQueueParksInsteadOfFailing(t *testing.T) {
 	s, f, d := admissionHub(t)
 	busyOverloaded(d)
+	// Check the stored plan as the manager publishes each update. Reading just
+	// the final card would miss a refusal published before the queue entry.
+	var premature atomic.Bool
+	f.mu.Lock()
+	f.onBroadcast = func() {
+		plan, err := s.loadPlan(context.Background(), "plan_q")
+		if err == nil {
+			task := plan.Tasks[0]
+			if task.Placement != nil && task.Queue == nil {
+				premature.Store(true)
+			}
+		}
+	}
+	f.mu.Unlock()
 	p, todo := queuedStart(t, s, "busy")
+	if premature.Load() {
+		t.Fatal("published a refusal before its queue entry")
+	}
 
 	pt := p.Tasks[0]
 	if pt.Queue == nil {
 		t.Fatal("the refused task must be queued")
+	}
+	if decision := pt.Placement; decision == nil || decision.Requested != "busy" || decision.Choice != "" ||
+		decision.Reason != pt.Queue.Reason || !decision.WaitAt.Equal(pt.Queue.NextAt) {
+		t.Fatalf("waiting placement = %+v, queue = %+v", decision, pt.Queue)
 	}
 	if pt.Queue.Attempt != 1 || pt.Queue.NextAt.IsZero() || pt.Queue.QueuedAt.IsZero() {
 		t.Fatalf("bad queue record: %+v", pt.Queue)
@@ -460,7 +487,7 @@ func i18nArgsLoad() i18n.Args {
 
 // An old started plan with a current queue record must still be a retry candidate (#7405).
 func TestAdmissionQueueRetryStartsWhenGateOpensOnOlderPlan(t *testing.T) {
-	url := newDatabase(t)
+	url := newMigratedDatabase(t, db.ManagerSet)
 	database, err := db.Open(context.Background(), url, db.ManagerSet)
 	if err != nil {
 		t.Fatal(err)
@@ -494,7 +521,7 @@ func TestAdmissionQueueRetryStartsWhenGateOpensOnOlderPlan(t *testing.T) {
 
 // A durable queue record outlives the recent-update window, so a long outage must not abandon it (#7722).
 func TestAdmissionQueueTimesOutAfterLookbackDowntime(t *testing.T) {
-	url := newDatabase(t)
+	url := newMigratedDatabase(t, db.ManagerSet)
 	database, err := db.Open(context.Background(), url, db.ManagerSet)
 	if err != nil {
 		t.Fatal(err)

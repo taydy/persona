@@ -3,6 +3,7 @@ package assistantwire
 import (
 	"time"
 
+	"github.com/nwverse/persona/server/internal/buswire"
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
@@ -24,6 +25,23 @@ type Profile struct {
 	// Keep are the conversations their machines list however long they are quiet: the main one, the main ones it
 	// replaced, scheduled tasks' own (node.configure keep_sessions: a busy machine's newest transcripts crowd them out).
 	Keep []SessionRef `json:"keep"`
+	// ExtensionOwners lists the extensions the user marked as their own. It carries the legacy trust snapshot for
+	// track reads. Current managers also include the live verdict in extensions.authorize.
+	ExtensionOwners []string `json:"extension_owners,omitempty"`
+	// Attention is the attention mode the user set (attention.go, #13503), which the hub's push filter reads; nil (an
+	// older manager, or never set) is normal. The hub reads its end itself (Attention.Effective).
+	Attention *Attention `json:"attention,omitempty"`
+}
+
+// LabsEventType is the client event discriminator for Labs receipts.
+type LabsEventType string
+
+const LabsSeenEventType LabsEventType = "assistant_labs_seen"
+
+// LabsSeenEvent is the committed read-receipt set sent to connected clients via ws.broadcast.
+type LabsSeenEvent struct {
+	Type     LabsEventType `json:"type"`
+	LabsSeen []string      `json:"labs_seen"`
 }
 
 // MainRouteMachine keeps legacy profiles usable while preferring the confirmed main binding.
@@ -54,10 +72,23 @@ const (
 	MethodKeepUndelivered = "assistant.keep_undelivered"
 )
 
+var (
+	StartMethod           = buswire.Method[StartParams, StartResult]{Name: MethodStart}
+	KeepUndeliveredMethod = buswire.Method[KeepUndeliveredParams, KeepUndeliveredResult]{Name: MethodKeepUndelivered}
+)
+
 // InboxPermissionModeParam is manager-only authorization metadata on assistant.send, session.send and
 // assistant.model. It carries the AI twin's own saved mode separately from the caller-controlled permission_mode.
 // Older nodes ignore it and retain their default clamp; newer nodes never treat its absence as permission to bypass.
 const InboxPermissionModeParam = "inbox_permission_mode"
+
+// DefaultPermissionModeParam carries the manager's current default separately from an explicit permission_mode.
+// PermissionModeExplicitParam marks the latter as a deliberate per-conversation choice. Older nodes ignore both and
+// retain their legacy resume behavior; newer nodes keep the legacy behavior when an older manager omits them.
+const (
+	DefaultPermissionModeParam  = "default_permission_mode"
+	PermissionModeExplicitParam = "permission_mode_explicit"
+)
 
 // CodeUndeliveredAhead: SendParams refuses the owner's message because older ones to the same conversation are kept
 // undelivered (MethodKeepUndelivered): the hub keeps this one behind them instead of sending it first.
@@ -109,6 +140,7 @@ const ConfigDirClaudeOnly = "config_dir is only supported for Claude assistant c
 
 // StartParams is assistant.start's params.
 type StartParams struct {
+	RequireLauncher     bool          `json:"-"` // start on the requested preset or refuse before sending
 	TaskModel           *ModelBinding `json:"-"`
 	Cwd                 string        `json:"-"` // internal scheduled task directory; validated on the target computer
 	TaskExecution       bool          `json:"-"` // refuse execution substitutions
@@ -145,6 +177,12 @@ type StartParams struct {
 	// GuestTools: a guest conversation (assistant/guest.go) that may use only these connector tools; nil is an
 	// ordinary one.
 	GuestTools []string `json:"guest_tools,omitempty"`
+	// GuestHandoff: a proxy reply's guest (assistant/bot_handoff.go). The manager registers it before the node
+	// starts it; never over the bus.
+	GuestHandoff string `json:"-"`
+	// GuestGroup: a group guest's conversation key (chat and thread, assistant/bot_guest.go). The manager registers it
+	// before the node starts it; never over the bus.
+	GuestGroup string `json:"-"`
 	// NewSessionID: start it under this session id (a meeting's follow-up, made once also across a restart); a node
 	// that cannot picks its own. Never over the bus.
 	NewSessionID string `json:"-"`
@@ -154,6 +192,11 @@ type StartParams struct {
 	// Human attributes the first message to an app start vouched for by the hub. It is used for missing replies.
 	// The node adds no client message ID to that input. Never over the bus.
 	Human bool `json:"-"`
+}
+
+// StartResult carries the conversation started for the hub.
+type StartResult struct {
+	Session proto.Session `json:"session"`
 }
 
 // FirstMessageIDPrefix begins the client_msg_id the manager gives the first message of a conversation a person's own
@@ -197,6 +240,11 @@ type KeepUndeliveredParams struct {
 	// nothing was typed, so the message is simply sent again. The original start, not when the connection ended,
 	// covers a slow first attempt.
 	TriedAt time.Time `json:"tried_at,omitempty"`
+}
+
+// KeepUndeliveredResult carries the message kept for later delivery.
+type KeepUndeliveredResult struct {
+	Undelivered *proto.UndeliveredMessage `json:"undelivered"`
 }
 
 // RenameParams is assistant.rename's params: Params are the app's ({title?, tab_name?}).

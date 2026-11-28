@@ -39,6 +39,7 @@ nonisolated enum ServerEvent: Sendable {
     case interaction(Interaction)
     /// assistant: what the assistant answered and why, when it answered the question for the user (#544).
     case interactionResolved(String, assistant: AssistantAnswer?)
+    case interactionResolvedOccurrence(String, assistant: AssistantAnswer?, createdAt: String)
     /// The user changed the assistant's answer, on this device or another: only the questions that changed (#544).
     case interactionReanswered(id: String, answers: [String: String])
     case toolCall(callID: String, name: String, args: JSONValue)
@@ -87,6 +88,14 @@ nonisolated enum ServerEvent: Sendable {
     /// The direction tree changed on the hub (#4352): a to-do, an Agent's session, a direction or its name. No payload:
     /// the clients read `GET /api/v1/assistant/directions/tree` again, and on every (re)connect.
     case directions
+    /// Intake changed; values and notes are read through the health route, never broadcast.
+    case healthIntake
+    case healthItems
+    case healthStrength
+    /// The kept Dashboards pages changed (#15017): one kept, pinned, unpinned, renamed, removed or restored, or the switch
+    /// turned. No payload: the places (`GET /api/v1/extensions/-/ui`) are read again. A page's content comes as
+    /// `extension_ui` with extension `-pages`.
+    case assistantPages
     case assistantFeed(FeedItem)
     case assistantView(ExtensionAssistantView)
     case assistantViewAction(conversation: String, action: ExtensionViewAction)
@@ -101,6 +110,9 @@ nonisolated enum ServerEvent: Sendable {
     /// An extension's data changed (`ui.invalidate`, docs/extensions/extensions.md「ui.invalidate」): its interface `id` (nil: all of
     /// them) is drawn again where it is shown.
     case extensionInvalidate(extension: String, id: String?)
+    /// The text_lookup extension point changed (turned on or off, another contribution, its saved words or its
+    /// underline setting, #10977): the app reads `GET /api/v1/text-lookup` again.
+    case textLookupChanged
     /// A meeting's conversation changed (#3862, docs/assistant/meeting-minutes.md「The `meeting_live` event」): content-free,
     /// only the parts that changed (an open set) and their revisions; the app reads the newer parts with `GET …/live?parts=`.
     case meetingLive(recordingID: String, changed: [String], revs: [String: Int64])
@@ -124,7 +136,8 @@ nonisolated enum ServerEvent: Sendable {
         var live: SessionLive?
         var upsert: [Session]?
         var remove: [String]?
-        var revision: String?
+        /// Session-list revisions are opaque strings; health-item revisions are integers.
+        var revision: JSONValue?
         var items: [Item]?
         var backlog: Bool?
         var hasMore: Bool?
@@ -195,6 +208,7 @@ nonisolated enum ServerEvent: Sendable {
         var git: Bool?
         /// interaction_resolved's, for a question the assistant answered; raw so no other event's keys can break the envelope.
         var answeredBy: JSONValue?
+        var createdAt: String?
         var reason: JSONValue?
         var answers: JSONValue?
         /// interaction_reanswered's.
@@ -214,7 +228,7 @@ nonisolated enum ServerEvent: Sendable {
             case features, epoch, seq, full, cols, rows, data, unsupported, state, desktops, mesh, channel, build, update, item, view, action, key, conversation, plan
             case plugin, badge, invalidate, cwd, dirs, git, operation, auth, source, conversations, account, reason, answers, resolution, manager
             case effective, changed, since
-            case answeredBy = "answered_by", recordingID = "recording_id"
+            case answeredBy = "answered_by", createdAt = "created_at", recordingID = "recording_id"
             case extensionID = "extension"
             case hubID = "hub_id", hubName = "hub_name", protocolVersion = "protocol", minAppBuild = "min_app_build", publicURL = "public_url"
             case settingsChanged = "settings_changed", olAccount = "ol_account"
@@ -241,7 +255,7 @@ nonisolated enum ServerEvent: Sendable {
 
     static func decode(_ data: Data) -> ServerEvent? {
         // A source subscription was saved, ran or was deleted (#2041): its pages are drawn again, as an invalidate of theirs.
-        // Read before the envelope, whose `revision` is a string where this event's is a number; the hub's compact JSON is
+        // Read before the envelope, whose fields may belong to other event shapes; the hub's compact JSON is
         // looked for first, so every other message skips the extra decode.
         if data.range(of: subscriptionType) != nil, (try? JSON.decoder.decode(EventType.self, from: data))?.type == "subscription" {
             return .extensionInvalidate(extension: SubscriptionsUI.id, id: nil)
@@ -263,7 +277,7 @@ nonisolated enum ServerEvent: Sendable {
         case "sessions":
             guard let m = e.machineID else { return nil }
             return .sessions(machineID: m, (e.sessions ?? []).map { var s = $0; s.machineID = m; return s })
-        case "sessions_list": return e.revision.map { .sessionsList(revision: $0, changes: SessionListChanges(since: e.since, changed: e.changed)) }
+        case "sessions_list": return e.revision?.string.map { .sessionsList(revision: $0, changes: SessionListChanges(since: e.since, changed: e.changed)) }
         case "sessions_delta":
             guard let m = e.machineID else { return nil }
             return .sessionsDelta(machineID: m, upsert: (e.upsert ?? []).map { var s = $0; s.machineID = m; return s }, remove: e.remove ?? [])
@@ -285,6 +299,9 @@ nonisolated enum ServerEvent: Sendable {
             guard let id = e.id else { return nil }
             let assistant = e.answeredBy?.string == AssistantAnswer.assistant
                 ? AssistantAnswer(answers: Delegated.answers(in: e.answers), reason: e.reason?.string ?? "") : nil
+            if let createdAt = e.createdAt {
+                return .interactionResolvedOccurrence(id, assistant: assistant, createdAt: createdAt)
+            }
             return .interactionResolved(id, assistant: assistant)
         case "interaction_reanswered":
             guard let id = e.id else { return nil }
@@ -311,12 +328,18 @@ nonisolated enum ServerEvent: Sendable {
         case "todos": return .todos
         case "assistant_saved_prompts": return .savedPrompts(manager: e.manager?.string)
         case "assistant_starred": return .starredMessages(manager: e.manager?.string)
+        case "text_lookup_changed": return .textLookupChanged
         case "personas": return .personas
         case "look":
             guard (e.effective ?? e.id).map({ !$0.isEmpty }) == true else { return nil }
             return .look(id: e.id, effective: e.effective)
         case "managers": return .managers
         case "directions": return .directions
+        // The app refreshes the home totals and any open reserved intake page for this hub.
+        case "health_strength": return .healthStrength
+        case "health_items": return .healthItems
+        case "health_intake": return .healthIntake
+        case "assistant_pages": return .assistantPages
         case "assistant_feed": return e.item.map { .assistantFeed($0) }
         case "assistant_view":
             guard let view = e.view, !view.id.isEmpty, view.version > 0,
@@ -389,9 +412,10 @@ nonisolated extension ServerEvent {
         case .sessionsDelta(let machine, let upsert, let remove):
             return .sessionsDelta(machineID: machine, upsert: upsert.map { var s = $0; s.group = group; return s }, remove: remove)
         case .sendReceipt(let receipt): var receipt = receipt; receipt.key.group = group; return .sendReceipt(receipt)
-        case .sessionsList, .hello, .interactionResolved, .interactionReanswered, .toolCall, .revs, .lark, .messaging, .agents, .inbox, .fleet, .hubUpdate, .desktops, .todos,
-             .personas, .look, .managers, .directions, .assistantFeed, .assistantView, .assistantViewAction, .assistantViewBlock, .taskPlan, .pluginBadge,
-             .extensionInvalidate, .fsChanged, .extensionOperation, .extensionAuth, .meetingLive, .urgentCall, .savedPrompts, .starredMessages: return self
+        case .sessionsList, .hello, .interactionResolved, .interactionResolvedOccurrence, .interactionReanswered, .toolCall, .revs, .lark, .messaging, .agents, .inbox, .fleet, .hubUpdate, .desktops, .todos,
+             .personas, .look, .managers, .directions, .healthIntake, .healthItems, .healthStrength, .assistantPages, .assistantFeed, .assistantView, .assistantViewAction, .assistantViewBlock, .taskPlan, .pluginBadge,
+             .extensionInvalidate, .fsChanged, .extensionOperation, .extensionAuth, .meetingLive, .urgentCall, .savedPrompts, .starredMessages,
+             .textLookupChanged: return self
         }
     }
 }
@@ -752,7 +776,8 @@ final class LiveConnection {
     /// where to resume the broadcasts from once a hello gave a stream.
     static func queryItems(_ cursor: EventCursor, sessionList: Bool = false, extensionStream: Bool = false, sessionLive: Bool = false,
                            todoReceipts: Bool = false) -> [URLQueryItem] {
-        [URLQueryItem(name: "features", value: (extensionStream ? "extension_ui_stream_v1," : "") + (sessionLive ? "session_live," : "") + (sessionList ? "sessions_list," + SessionListChanges.feature + "," : "") + (todoReceipts ? SendReceipt.todoFeature + "," : "") + "sessions_delta,extension_operations,managers,desktops_link," + HubNaming.feature)] + cursor.queryItems
+        let approvalMirrors = helloFeatures(RequestClientMetadata.current).contains(approvalMirrorsFeature) ? "," + approvalMirrorsFeature : ""
+        return [URLQueryItem(name: "features", value: (extensionStream ? "extension_ui_stream_v1," : "") + (sessionLive ? "session_live," : "") + (sessionList ? "sessions_list," + SessionListChanges.feature + "," : "") + (todoReceipts ? SendReceipt.todoFeature + "," : "") + "sessions_delta,extension_operations,managers,desktops_link," + HubNaming.feature + approvalMirrors)] + cursor.queryItems
     }
 
     private func heartbeat(_ t: URLSessionWebSocketTask, _ gen: Int) {
@@ -1035,10 +1060,14 @@ final class LiveConnection {
     /// `persona_card_ring` (```persona-card rings, `PersonaCard.swift`) from the apps that build the chat (iOS, Mac,
     /// visionOS), not the watch or the extensions: a client without it gets each ring as a stacked bar (the hub's
     /// card_compat.go), which every build before the ring draws.
+    /// `tool_views` (out-of-band declarative UI views on tool results, e.g. UI version 12 maps) from the iOS app alone
+    /// in this release; watch, widgets, extensions and un-updated apps omit it so hubs filter those fields out.
     nonisolated static func helloFeatures(_ client: RequestClientMetadata) -> [String] {
         let iOSApp = RequestClientMetadata.Platform.iOS.rawValue + "-" + RequestClientMetadata.Surface.app.rawValue
         let chatApps = [RequestClientMetadata.Platform.iOS, .macOS, .visionOS].map { $0.rawValue + "-" + RequestClientMetadata.Surface.app.rawValue }
-        return [HubNaming.feature] + (client.platform == iOSApp ? ["elicitation", UndeliveredMessage.agentHoldFeature, SendReceipt.todoFeature] : []) + (chatApps.contains(client.platform) ? [cardRingFeature, "closeout.markdown.v1"] : [])
+        return [HubNaming.feature]
+            + (client.platform == iOSApp ? ["elicitation", UndeliveredMessage.agentHoldFeature, SendReceipt.todoFeature, toolViewsFeature] : [])
+            + (chatApps.contains(client.platform) ? [cardRingFeature, "closeout.markdown.v1", approvalMirrorsFeature] : [])
     }
 
     /// Whether this app asks for `todo_send_state` (`helloFeatures`), which the socket's URL then says as well.
@@ -1048,6 +1077,11 @@ final class LiveConnection {
 
     /// The client_hello feature that says this app draws ```persona-card rings (#3068).
     nonisolated static let cardRingFeature = "persona_card_ring"
+    /// The client_hello / X-Persona-Features feature that says this app draws `tool_views` inline in chats.
+    nonisolated static let toolViewsFeature = "tool_views"
+
+    /// Main-conversation display copies are sent only to clients that deduplicate their aggregate views.
+    nonisolated static let approvalMirrorsFeature = "approval_mirrors"
 
     func send(_ object: [String: Any]) {
         if let local {

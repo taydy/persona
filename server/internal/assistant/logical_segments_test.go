@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/nwverse/persona/server/internal/devicewire"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/rpc"
+	"github.com/nwverse/persona/server/internal/transcript"
 )
 
 func logicalPair(t *testing.T, engine string, source ...string) (*Service, *fakeHub, *db.DB, *db.LogicalConversation) {
@@ -40,7 +43,7 @@ func logicalPair(t *testing.T, engine string, source ...string) (*Service, *fake
 	if err := d.PutConversationHandoff(ctx, "server", "side-chat", "operation", json.RawMessage(`{"summary":"fake source summary","recent":[{"role":"user","text":"same conversation"}]}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.PrepareConversationSegment(ctx, "server", "side-chat", "operation", conversationlog.Segment{ID: "two", MachineID: "server", SessionID: "target-chat", Engine: engine, SourceHistory: "h2", Launcher: engine, Model: "target-model", Effort: "medium"}, 6); err != nil {
+	if err := d.PrepareConversationSegment(ctx, "server", "side-chat", "operation", logicalFixtureTarget(engine), 6); err != nil {
 		t.Fatal(err)
 	}
 	c, err := d.LogicalConversation(ctx, "server", "side-chat")
@@ -49,6 +52,11 @@ func logicalPair(t *testing.T, engine string, source ...string) (*Service, *fake
 	}
 	return s, f, d, c
 }
+
+func logicalFixtureTarget(engine string) conversationlog.Segment {
+	return conversationlog.Segment{ID: "two", MachineID: "server", SessionID: "target-chat", Engine: engine, SourceHistory: "h2", Launcher: engine, Model: "target-model", Effort: "medium"}
+}
+
 func activatePair(t *testing.T, d *db.DB) *db.LogicalConversation {
 	t.Helper()
 	ctx := t.Context()
@@ -60,6 +68,53 @@ func activatePair(t *testing.T, d *db.DB) *db.LogicalConversation {
 		t.Fatal(err)
 	}
 	return c
+}
+
+func TestLogicalUserInputsKeepsExcerptsWithinVisibleSegments(t *testing.T) {
+	s, f, d, _ := logicalPair(t, "pi")
+	c := activatePair(t, d)
+	f.answerNode(DeviceSessionItems, func(_ string, raw json.RawMessage) (any, error) {
+		var p historyParams
+		if err := json.Unmarshal(raw, &p); err != nil || !p.UserInputs {
+			t.Fatalf("not an input index request: %s, %v", raw, err)
+		}
+		if p.SessionID == "target-chat" {
+			if p.Before != nil {
+				t.Fatalf("active source was bounded: %s", raw)
+			}
+			return proto.UserInputIndex{Total: 2, History: "h2", Inputs: []proto.UserInputPosition{
+				{ID: "input#0", Seq: 1, Attachments: 2, Answer: "I see the files."},
+				{ID: "legacy#0", Seq: 4},
+			}}, nil
+		}
+		if p.SessionID != "side-chat" || p.Before == nil || *p.Before != 7 {
+			t.Fatalf("retired source must stop at its frozen boundary: %s", raw)
+		}
+		items := []proto.Item{
+			{ID: "input#0", Seq: 1, Role: "user", Kind: proto.KindText, Text: "First question"},
+			{ID: "reply#0", Seq: 6, Role: "assistant", Kind: proto.KindText, Text: "**Visible** reply"},
+			{ID: "late#0", Seq: 7, Role: "assistant", Kind: proto.KindText, Text: "Private retired reply"},
+		}
+		items = slices.DeleteFunc(items, func(it proto.Item) bool { return it.Seq >= *p.Before })
+		inputs := transcript.UserInputPositions(items)
+		return proto.UserInputIndex{Total: len(inputs), History: "h1", Inputs: inputs}, nil
+	})
+	raw, err := s.logicalHistoryCall(t.Context(), d, c, DeviceSessionItems, json.RawMessage(`{"user_inputs":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var index proto.UserInputIndex
+	if err := json.Unmarshal(raw, &index); err != nil {
+		t.Fatal(err)
+	}
+	want := []proto.UserInputPosition{
+		{ID: "input#0", Seq: 1, Preview: "First question", Answer: "Visible reply"},
+		{ID: "segment:two:input#0", Seq: 7, Attachments: 2, Answer: "I see the files."},
+		{ID: "segment:two:legacy#0", Seq: 10},
+	}
+	if index.Total != len(want) || !slices.Equal(index.Inputs, want) || index.History != c.History {
+		t.Fatalf("user input index %+v, want %+v", index, want)
+	}
 }
 
 func TestLogicalHistoryProjectsDatabaseAcrossSegmentsAndFrozenTail(t *testing.T) {
@@ -290,6 +345,65 @@ func TestLogicalSummaryWaitsOnPausedFakeModel(t *testing.T) {
 	}
 }
 
+func TestLogicalHandoffSummaryEndsOnUnavailableModel(t *testing.T) {
+	h := mainHandoff{}
+	h.Recent = append(h.Recent, struct {
+		Role string `json:"role"`
+		Text string `json:"text"`
+	}{Role: "user", Text: "fake recent turn"})
+	calls := 0
+	out, fellBack, err := summarizeLogicalHandoff(t.Context(), h, "fake earlier summary", func() (assistantwire.ModelCompleteResult, error) {
+		calls++
+		return assistantwire.ModelCompleteResult{}, &rpc.Error{Code: assistantwire.CodeModelUnavailable, Message: "fake: nothing to call"}
+	})
+	if err != nil || !fellBack || calls != 1 {
+		t.Fatalf("unavailable model must end the wait after one call: calls=%d fellBack=%v err=%v", calls, fellBack, err)
+	}
+	if out.Summary != "fake earlier summary" || !out.Partial || len(out.Recent) != 1 || out.Recent[0].Text != "fake recent turn" {
+		t.Fatalf("fallback handoff lost the recent turns or earlier summary: %+v", out)
+	}
+	if text := renderLogicalHandoff("en", out, "next message"); !strings.Contains(text, "fake recent turn") || !strings.Contains(text, "Some history is unavailable.") {
+		t.Fatalf("fallback handoff renders without the recent turns or the partial note: %q", text)
+	}
+	// Other failures still go back to the sweep for a retry.
+	_, fellBack, err = summarizeLogicalHandoff(t.Context(), h, "", func() (assistantwire.ModelCompleteResult, error) {
+		return assistantwire.ModelCompleteResult{}, &rpc.Error{Code: assistantwire.CodeModelFailed, Message: "fake upstream failure"}
+	})
+	var re *rpc.Error
+	if fellBack || !errors.As(err, &re) || re.Code != assistantwire.CodeModelFailed {
+		t.Fatalf("a failed call must be retried, not skipped: fellBack=%v err=%v", fellBack, err)
+	}
+}
+
+func TestLogicalHandoffSummaryKeepsWaitingOnPausedModel(t *testing.T) {
+	calls := 0
+	out, fellBack, err := summarizeLogicalHandoff(t.Context(), mainHandoff{}, "fake earlier summary", func() (assistantwire.ModelCompleteResult, error) {
+		calls++
+		if calls == 1 {
+			// Paused until now: the wait is the one-second floor, then the call is made again.
+			until := time.Now().UTC().Format(time.RFC3339)
+			return assistantwire.ModelCompleteResult{}, &rpc.Error{Code: assistantwire.CodeModelPaused, Message: "fake quota pause", Data: json.RawMessage(`{"until":"` + until + `"}`)}
+		}
+		return assistantwire.ModelCompleteResult{Text: "fake new summary"}, nil
+	})
+	if err != nil || fellBack || calls != 2 {
+		t.Fatalf("paused model must be waited out and asked again: calls=%d fellBack=%v err=%v", calls, fellBack, err)
+	}
+	if out.Summary != "fake new summary" || out.Partial {
+		t.Fatalf("summary after the pause: %+v", out)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	calls = 0
+	_, fellBack, err = summarizeLogicalHandoff(ctx, mainHandoff{}, "", func() (assistantwire.ModelCompleteResult, error) {
+		calls++
+		cancel()
+		return assistantwire.ModelCompleteResult{}, &rpc.Error{Code: assistantwire.CodeModelPaused, Message: "fake quota pause", Data: json.RawMessage(`{"until":"2099-01-01T00:00:00Z"}`)}
+	})
+	if fellBack || !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("paused model must keep the switch waiting, not fall back: calls=%d fellBack=%v err=%v", calls, fellBack, err)
+	}
+}
+
 func TestLogicalRuntimeEngineTransitionsPreserveRoleAndMessageIdentity(t *testing.T) {
 	engines := []string{"claude", "codex", "agy", "pi", "opencode"}
 	for i, source := range engines {
@@ -336,6 +450,55 @@ func TestLogicalOperationReceiptIsScopedToConversation(t *testing.T) {
 	}
 	if logicalNodeOperation(first, "same-id") != logicalNodeOperation(first, "same-id") {
 		t.Fatal("receipt changed after restart")
+	}
+}
+
+func TestLogicalQueuedInputKeepsModeProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		engine      string
+		wantMode    any
+		wantDefault any
+	}{
+		{engine: "claude", wantDefault: proto.ModePlan},
+		{engine: "codex", wantMode: proto.ModeBypass},
+	} {
+		t.Run(tc.engine, func(t *testing.T) {
+			s, f, d, _ := logicalPair(t, tc.engine)
+			ctx := t.Context()
+			c := activatePair(t, d)
+			if err := d.ResolveConversationSwitch(ctx, "server", "side-chat", "operation", "accepted", ""); err != nil {
+				t.Fatal(err)
+			}
+			f.setSessions("server",
+				proto.Session{SessionID: "side-chat", Assistant: true, Agent: "claude", Status: proto.StatusIdle},
+				proto.Session{SessionID: "target-chat", Assistant: true, Agent: tc.engine, Status: proto.StatusIdle})
+			f.answerNode("session.modes", func(string, json.RawMessage) (any, error) { return map[string]bool{"ok": true}, nil })
+			_, handled, err := s.logicalCall(ctx, "server", "session.modes", json.RawMessage(`{"session_id":"side-chat","permission_mode":"bypassPermissions"}`))
+			if err != nil || !handled {
+				t.Fatalf("seed the inherited segment mode: handled=%v err=%v", handled, err)
+			}
+			c, err = d.LogicalConversation(ctx, "server", "side-chat")
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.answerNode(DeviceAssistantSend, func(_ string, raw json.RawMessage) (any, error) {
+				var got map[string]any
+				_ = json.Unmarshal(raw, &got)
+				if got["permission_mode"] != tc.wantMode || got["default_permission_mode"] != tc.wantDefault || got["permission_mode_explicit"] != nil {
+					t.Fatalf("queued mode provenance changed: %v", got)
+				}
+				return map[string]bool{"ok": true}, nil
+			})
+			payload, _ := json.Marshal(logicalInput{Method: DeviceAssistantSend, Params: map[string]any{
+				"text": "continue", "client_msg_id": "queued", "default_permission_mode": proto.ModePlan,
+			}})
+			if err := d.EnqueueConversationInput(ctx, c.MachineID, c.SessionID, "queued", c.Epoch, payload); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.drainLogicalInput(ctx, d, c); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -742,6 +905,535 @@ func TestLogicalRetiredCardControlsNeverReachTheActiveSegment(t *testing.T) {
 	}
 }
 
+func TestLogicalAnswerRetainsOccurrenceFence(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := t.Context()
+	created := time.Now().UTC()
+	ix := proto.Interaction{ID: "logical-occurrence-answer", MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: created, Resumable: true}
+	if err := d.InsertInteraction(ctx, ix); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, ix.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	p := &pending{ix: ix, done: make(chan proto.Resolution, 1)}
+	s.fleet.mu.Lock()
+	s.ixMapLocked()[ix.ID] = p
+	s.fleet.mu.Unlock()
+
+	stale := created.Add(time.Second)
+	err := s.resolveAnswerAt(ctx, ix.ID, proto.Resolution{Dismiss: true}, true, nil, nil, &interactionExpectation{createdAt: &stale})
+	if !errors.Is(err, errNotPending) {
+		t.Fatalf("stale occurrence answer = %v, want errNotPending", err)
+	}
+	if current, ok := s.pendingIx(ix.ID); !ok || !current.CreatedAt.Equal(created) {
+		t.Fatalf("stale occurrence changed the pending card: %+v, pending=%v", current, ok)
+	}
+	if err := s.resolveAnswerAt(ctx, ix.ID, proto.Resolution{Dismiss: true}, true, nil, nil, &interactionExpectation{createdAt: &created}); err != nil {
+		t.Fatalf("matching occurrence answer = %v", err)
+	}
+	if _, ok := s.pendingIx(ix.ID); ok {
+		t.Fatal("matching occurrence did not resolve the logical card")
+	}
+}
+
+func TestLogicalRetiredAnswerUsesOccurrenceAwareResolver(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	ctx := t.Context()
+	ix := proto.Interaction{ID: "logical-retired-occurrence-answer", MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: time.Now().UTC(), Resumable: true}
+	if err := d.InsertInteraction(ctx, ix); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, ix.ID, "server", "side-chat", "server", "side-chat", 1); err != nil {
+		t.Fatal(err)
+	}
+	p := &pending{ix: ix, done: make(chan proto.Resolution, 1)}
+	s.fleet.mu.Lock()
+	s.ixMapLocked()[ix.ID] = p
+	s.fleet.mu.Unlock()
+	activatePair(t, d)
+
+	err := s.resolveAnswerAt(ctx, ix.ID, proto.Resolution{Dismiss: true}, true, nil, nil, &interactionExpectation{occurrence: &ix})
+	if err == nil || errors.Is(err, errNotPending) {
+		t.Fatalf("retired logical answer = %v, want epoch refusal", err)
+	}
+	if _, ok := s.pendingIx(ix.ID); !ok {
+		t.Fatal("retired logical answer resolved the pending card")
+	}
+}
+
+func TestLogicalReusedIDDoesNotOverwriteDurableOccurrenceBeforeRejection(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	created := time.Now().UTC()
+	original := proto.Interaction{ID: "logical-reused-id-publication", MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: created, Resumable: true, Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, original.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	p := &pending{ix: original, done: make(chan proto.Resolution, 1)}
+	s.fleet.mu.Lock()
+	s.ixMapLocked()[original.ID] = p
+	s.fleet.mu.Unlock()
+
+	replacement := original
+	replacement.CreatedAt = created.Add(time.Second)
+	if _, err := s.waitInteraction(ctx, replacement); !errors.Is(err, errInteractionIDReused) {
+		t.Fatalf("reused logical ID = %v, want occurrence rejection", err)
+	}
+	record, err := d.InteractionRecord(ctx, original.ID)
+	if err != nil || record == nil {
+		t.Fatalf("durable original after rejection: %+v, %v", record, err)
+	}
+	if !record.Interaction.CreatedAt.Equal(created) || record.Status != "pending" {
+		t.Fatalf("rejected publication replaced the durable occurrence: %+v", record)
+	}
+	if current, ok := s.pendingIx(original.ID); !ok || !current.CreatedAt.Equal(created) {
+		t.Fatalf("rejected publication changed the live original: %+v, pending=%v", current, ok)
+	}
+}
+
+type logicalPublicationBarrierStore struct {
+	*db.DB
+	mu      sync.Mutex
+	armed   bool
+	reads   int
+	release chan struct{}
+}
+
+func (s *logicalPublicationBarrierStore) InteractionOutcome(ctx context.Context, id string) (string, *proto.Resolution, error) {
+	s.mu.Lock()
+	armed := s.armed
+	s.mu.Unlock()
+	if !armed {
+		return s.DB.InteractionOutcome(ctx, id)
+	}
+	status, resolution, err := s.DB.InteractionOutcome(ctx, id)
+	if err != nil {
+		return "", nil, err
+	}
+	s.mu.Lock()
+	s.reads++
+	n := s.reads
+	if n == 2 {
+		close(s.release)
+	}
+	s.mu.Unlock()
+	if n <= 2 {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return "", nil, ctx.Err()
+		}
+	}
+	return status, resolution, nil
+}
+
+func (s *logicalPublicationBarrierStore) InteractionRecord(ctx context.Context, id string) (*db.InteractionRecord, error) {
+	s.mu.Lock()
+	armed := s.armed
+	s.mu.Unlock()
+	if !armed {
+		return s.DB.InteractionRecord(ctx, id)
+	}
+	record, err := s.DB.InteractionRecord(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.reads++
+	n := s.reads
+	if n == 2 {
+		close(s.release)
+	}
+	s.mu.Unlock()
+	if n <= 2 {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return record, nil
+}
+
+func TestLogicalConcurrentManagersAdmitOnlyOneOccurrence(t *testing.T) {
+	testLogicalConcurrentManagersAdmitOnlyOneOccurrence(t, true)
+}
+
+func TestLogicalConcurrentNonResumableManagersAdmitOnlyOneOccurrence(t *testing.T) {
+	testLogicalConcurrentManagersAdmitOnlyOneOccurrence(t, false)
+}
+
+func testLogicalConcurrentManagersAdmitOnlyOneOccurrence(t *testing.T, resumable bool) {
+	_, f, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	created := time.Now().UTC()
+	first := proto.Interaction{ID: "logical-concurrent-manager-occurrence", MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: created, Resumable: resumable, Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.PutConversationInteraction(t.Context(), first.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	store := &logicalPublicationBarrierStore{DB: d, release: make(chan struct{})}
+	newManager := func() *Service {
+		return New(Options{Hub: f, Store: func() Store { return store }})
+	}
+	managers := []*Service{newManager(), newManager()}
+	store.mu.Lock()
+	store.armed = true
+	store.mu.Unlock()
+	second := first
+	second.CreatedAt = created.Add(time.Second)
+	type result struct {
+		res proto.Resolution
+		err error
+	}
+	results := make(chan result, 2)
+	consumed := 0
+	var cancels []context.CancelFunc
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+		for ; consumed < 2; consumed++ {
+			select {
+			case <-results:
+			case <-time.After(time.Second):
+				return
+			}
+		}
+	}()
+	for i, ix := range []proto.Interaction{first, second} {
+		ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+		ctx, cancel := context.WithCancel(ctx)
+		cancels = append(cancels, cancel)
+		go func() {
+			res, err := managers[i].waitInteraction(ctx, ix)
+			results <- result{res: res, err: err}
+		}()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var early *result
+	if !ownerActionPoll(t, time.Until(deadline), func() bool {
+		select {
+		case got := <-results:
+			consumed++
+			early = &got
+			return true
+		default:
+		}
+		_, firstPending := managers[0].pendingIx(first.ID)
+		_, secondPending := managers[1].pendingIx(first.ID)
+		if firstPending && secondPending {
+			t.Fatal("two managers admitted different occurrences as fresh actionable cards")
+		}
+		return false
+	}) {
+		t.Fatal("concurrent publication neither rejected one occurrence nor admitted both")
+	}
+	if early == nil {
+		t.Fatal("concurrent publication neither rejected one occurrence nor admitted both")
+	}
+	if !errors.Is(early.err, errInteractionIDReused) {
+		t.Fatalf("losing occurrence = %+v, %v; want occurrence rejection", early.res, early.err)
+	}
+	var secondPending bool
+	if !ownerActionPoll(t, time.Until(deadline), func() bool {
+		_, firstPending := managers[0].pendingIx(first.ID)
+		_, secondPending = managers[1].pendingIx(first.ID)
+		return firstPending != secondPending
+	}) {
+		t.Fatal("the rejected occurrence did not leave exactly one live waiter")
+	}
+	record, err := d.InteractionRecord(t.Context(), first.ID)
+	winner := 0
+	want := created
+	if secondPending {
+		winner = 1
+		want = second.CreatedAt
+	}
+	if err != nil || record == nil || !record.Interaction.CreatedAt.Equal(want) || record.Status != "pending" {
+		t.Fatalf("winning durable occurrence: %+v, %v", record, err)
+	}
+	expected := first
+	if winner == 1 {
+		expected = second
+	}
+	if err := managers[winner].resolveAnswerAt(t.Context(), first.ID, proto.Resolution{Dismiss: true}, true, nil, nil, &interactionExpectation{occurrence: &expected}); err != nil {
+		t.Fatalf("winning occurrence answer = %v", err)
+	}
+	select {
+	case got := <-results:
+		consumed++
+		if got.err != nil || !got.res.Dismiss {
+			t.Fatalf("winning waiter = %+v, %v", got.res, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("winning waiter did not receive its answer")
+	}
+	record, err = d.InteractionRecord(t.Context(), first.ID)
+	if err != nil || record == nil || record.Status != "dismissed" || !record.Interaction.CreatedAt.Equal(want) {
+		t.Fatalf("answered durable occurrence: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalNonResumableGraceEndDoesNotReopenCancelledRow(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	original := proto.Interaction{ID: "logical-grace-ended-replay", MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishInteraction(ctx, original.ID, "cancelled", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, original.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	p := &pending{ix: original, done: make(chan proto.Resolution, 1), graceEnded: true}
+	s.fleet.mu.Lock()
+	s.ixMapLocked()[original.ID] = p
+	s.fleet.mu.Unlock()
+
+	res, err := s.waitInteraction(ctx, original)
+	if err != nil || !res.Dismiss {
+		t.Fatalf("grace-ended replay = %+v, %v; want dismissal", res, err)
+	}
+	record, err := d.InteractionRecord(ctx, original.ID)
+	if err != nil || record == nil || record.Status != "cancelled" {
+		t.Fatalf("grace-ended replay reopened the durable row: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalUnreachableElicitationDoesNotPersistPendingRow(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	ix := proto.Interaction{ID: "logical-unreachable-elicitation", MachineID: "server", SessionID: "side-chat", Kind: proto.IxElicitation, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if s.elicitationReachable(ix) {
+		t.Fatal("test requires an unreachable elicitation client")
+	}
+	if err := d.PutConversationInteraction(ctx, ix.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.waitInteraction(ctx, ix)
+	if err != nil || !res.Dismiss {
+		t.Fatalf("unreachable elicitation = %+v, %v; want dismissal", res, err)
+	}
+	record, err := d.InteractionRecord(ctx, ix.ID)
+	if err != nil || record != nil {
+		t.Fatalf("unreachable elicitation left a durable pending row: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalUnreachableElicitationReplayDoesNotReopenCancelledRow(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	ix := proto.Interaction{ID: "logical-unreachable-elicitation-cancelled", MachineID: "server", SessionID: "side-chat", Kind: proto.IxElicitation, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, ix); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishInteraction(ctx, ix.ID, "cancelled", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, ix.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.waitInteraction(ctx, ix)
+	if err != nil || !res.Dismiss {
+		t.Fatalf("cancelled unreachable elicitation replay = %+v, %v; want dismissal", res, err)
+	}
+	record, err := d.InteractionRecord(ctx, ix.ID)
+	if err != nil || record == nil || record.Status != "cancelled" {
+		t.Fatalf("unreachable replay reopened the cancelled row: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalUnreachableElicitationResolvesRecordedPendingRow(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	ix := proto.Interaction{ID: "logical-unreachable-elicitation-pending", MachineID: "server", SessionID: "side-chat", Kind: proto.IxElicitation, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, ix); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, ix.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.waitInteraction(ctx, ix)
+	if err != nil || !res.Dismiss {
+		t.Fatalf("pending unreachable elicitation replay = %+v, %v; want dismissal", res, err)
+	}
+	record, err := d.InteractionRecord(ctx, ix.ID)
+	if err != nil || record == nil || record.Status != "dismissed" || record.Resolution == nil || !record.Resolution.Dismiss {
+		t.Fatalf("unreachable replay stranded the durable pending row: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalUnreachableElicitationDoesNotReplaceTerminalOccurrence(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	original := proto.Interaction{ID: "logical-unreachable-elicitation-terminal", MachineID: "server", SessionID: "side-chat", Kind: proto.IxElicitation, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishInteraction(ctx, original.ID, "dismissed", &proto.Resolution{Dismiss: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, original.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original
+	replacement.CreatedAt = original.CreatedAt.Add(time.Second)
+	res, err := s.waitInteraction(ctx, replacement)
+	if err != nil || !res.Dismiss {
+		t.Fatalf("terminal unreachable elicitation replacement = %+v, %v; want dismissal", res, err)
+	}
+	record, err := d.InteractionRecord(ctx, original.ID)
+	if err != nil || record == nil || record.Status != "dismissed" || !record.Interaction.CreatedAt.Equal(original.CreatedAt) {
+		t.Fatalf("unreachable replacement created a new durable occurrence: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalTerminalDetachableReplayDoesNotReopen(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	original := proto.Interaction{ID: "logical-terminal-detachable-replay", MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour), Resumable: true, Detachable: true, ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"write-file"}`), ExecutionCwd: "/workspace"}
+	if err := d.InsertInteraction(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	allow := true
+	if err := d.FinishInteraction(ctx, original.ID, "approved", &proto.Resolution{Allow: &allow}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, original.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	replay := original
+	replay.CreatedAt = original.CreatedAt.Add(time.Second)
+	fresh, err := s.logicalPublishInteraction(ctx, replay)
+	if err != nil || fresh {
+		t.Fatalf("terminal detachable replay: fresh=%v err=%v", fresh, err)
+	}
+	record, err := d.InteractionRecord(ctx, original.ID)
+	if err != nil || record == nil || record.Status != "approved" || !record.Interaction.CreatedAt.Equal(original.CreatedAt) {
+		t.Fatalf("terminal detachable replay reopened the operation: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalTerminalPersistentOwnerReplayDoesNotReopen(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	original := proto.Interaction{ID: ownerActionInteractionID("logical-owner-batch", "item"), MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour), Resumable: true, NoExpiry: true, OwnerProposal: true, ApprovalBatchID: "logical-owner-batch", ApprovalItemID: "item", ToolName: "persona_settings"}
+	if err := d.InsertInteraction(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	allow := true
+	if err := d.FinishInteraction(ctx, original.ID, "approved", &proto.Resolution{Allow: &allow}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, original.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	replay := original
+	replay.CreatedAt = original.CreatedAt.Add(time.Second)
+	fresh, err := s.logicalPublishInteraction(ctx, replay)
+	if err != nil || fresh {
+		t.Fatalf("terminal persistent-owner replay: fresh=%v err=%v", fresh, err)
+	}
+	record, err := d.InteractionRecord(ctx, original.ID)
+	if err != nil || record == nil || record.Status != "approved" || !record.Interaction.CreatedAt.Equal(original.CreatedAt) {
+		t.Fatalf("terminal persistent-owner replay reopened the operation: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalUnreachableClaimedLiveCardDoesNotWriteDismissal(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	ix := proto.Interaction{ID: "logical-unreachable-claimed-live", MachineID: "server", SessionID: "side-chat", Kind: proto.IxElicitation, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, ix); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, ix.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	p := &pending{ix: ix, done: make(chan proto.Resolution, 1), claimed: true}
+	s.fleet.mu.Lock()
+	s.ixMapLocked()[ix.ID] = p
+	s.fleet.mu.Unlock()
+	fresh, err := s.logicalPublishInteraction(ctx, ix)
+	if err != nil || fresh {
+		t.Fatalf("claimed live unreachable publication: fresh=%v err=%v", fresh, err)
+	}
+	record, err := d.InteractionRecord(ctx, ix.ID)
+	if err != nil || record == nil || record.Status != "pending" {
+		t.Fatalf("unreachable replay contradicted the claimed live answer: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalUnreachableZeroTimeLiveReplayUsesLiveResolver(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	original := proto.Interaction{ID: "logical-unreachable-zero-live", MachineID: "server", SessionID: "side-chat", Kind: proto.IxElicitation, CreatedAt: time.Now().UTC(), Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, original.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	p := &pending{ix: original, done: make(chan proto.Resolution, 1)}
+	s.fleet.mu.Lock()
+	s.ixMapLocked()[original.ID] = p
+	s.fleet.mu.Unlock()
+	replay := original
+	replay.CreatedAt = time.Time{}
+	res, err := s.waitInteraction(ctx, replay)
+	if err != nil || !res.Dismiss {
+		t.Fatalf("zero-time live unreachable replay = %+v, %v; want live dismissal", res, err)
+	}
+	record, err := d.InteractionRecord(ctx, original.ID)
+	if err != nil || record == nil || record.Status != "dismissed" {
+		t.Fatalf("zero-time live replay did not resolve through the live occurrence: %+v, %v", record, err)
+	}
+}
+
+func TestLogicalNonResumableNewOccurrenceReplacesEndedRecord(t *testing.T) {
+	s, _, d, _ := logicalPair(t, "codex")
+	activatePair(t, d)
+	ctx := context.WithValue(t.Context(), logicalAuthenticatedKey{}, logicalAuthenticated{Machine: "server", Session: "side-chat", PhysicalMachine: "server", PhysicalSession: "target-chat", Epoch: 2})
+	created := time.Now().UTC()
+	original := proto.Interaction{ID: "logical-nonresumable-new-occurrence", MachineID: "server", SessionID: "side-chat", Kind: proto.IxPermission, CreatedAt: created, Private: true, ExpiresAt: time.Now().Add(time.Hour)}
+	if err := d.InsertInteraction(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishInteraction(ctx, original.ID, "cancelled", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutConversationInteraction(ctx, original.ID, "server", "side-chat", "server", "target-chat", 2); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original
+	replacement.CreatedAt = created.Add(time.Second)
+	fresh, err := s.logicalPublishInteraction(ctx, replacement)
+	if err != nil || !fresh {
+		t.Fatalf("new non-resumable occurrence publication: fresh=%v err=%v; a replacement must announce, not restore", fresh, err)
+	}
+	record, err := d.InteractionRecord(ctx, original.ID)
+	if err != nil || record == nil || !record.Interaction.CreatedAt.Equal(replacement.CreatedAt) || record.Status != "pending" {
+		t.Fatalf("new non-resumable durable occurrence: %+v, %v", record, err)
+	}
+}
+
 func TestLogicalPublicationLeavesOrdinaryCardLifetimeUnchanged(t *testing.T) {
 	s, _, _, _ := logicalPair(t, "codex")
 	ctx, cancel := context.WithCancel(t.Context())
@@ -929,5 +1621,107 @@ func TestSegmentReadExposesEpochWithoutPhysicalIdsOrStartingAnything(t *testing.
 	defer f.mu.Unlock()
 	if len(f.sends) != 0 {
 		t.Fatal("snapshot read sent model input")
+	}
+}
+
+func TestLogicalHistoryFoldRangeSkipsPriorFrozenSegmentsAndBoundsMore(t *testing.T) {
+	s, f, d, _ := logicalPair(t, "claude")
+	ctx := t.Context()
+	// Persist segment 1 through seq 6 (frozen) and advance segment 2's live revision past durable history
+	// so fold reads miss the Postgres cache and read through the node.
+	if err := d.PutConversationPage(ctx, db.ConversationPage{
+		MachineID: "server", SessionID: "side-chat", History: "h1", Revision: 100, ThroughSeq: 6, Tail: true,
+		Items: []proto.Item{
+			{ID: "u1#0", Seq: 1, Role: "user", Kind: proto.KindText, Text: "start"},
+			{ID: "t2#0", Seq: 2, Role: "assistant", Kind: proto.KindToolUse, ToolUseID: "c1", ToolName: "Bash"},
+			{ID: "r3#0", Seq: 3, Role: "user", Kind: proto.KindToolResult, ToolUseID: "c1", Text: "ok"},
+			{ID: "t4#0", Seq: 4, Role: "assistant", Kind: proto.KindToolUse, ToolUseID: "c2", ToolName: "Read"},
+			{ID: "a6#0", Seq: 6, Role: "assistant", Kind: proto.KindText, Text: "done"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := activatePair(t, d)
+	f.setSessions("server",
+		proto.Session{SessionID: "side-chat", Assistant: true, Agent: "claude", Rev: 100},
+		proto.Session{SessionID: "target-chat", Assistant: true, Agent: "claude", Rev: 101},
+	)
+	var called []string
+	f.answerNode(DeviceSessionItems, func(_ string, raw json.RawMessage) (any, error) {
+		var p historyParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+		called = append(called, p.SessionID)
+		if p.SessionID != "target-chat" {
+			t.Fatalf("retired prior segment %q should not be queried for a fold in segment 2: %s", p.SessionID, raw)
+		}
+		if intValue(p.From) != 2 || intValue(p.Through) != 4 {
+			t.Fatalf("segment 2 fold range = (%v..%v), want 2..4", p.From, p.Through)
+		}
+		fromSeq, toSeq := 1, 4
+		return historyPage{
+			History: "h2",
+			FromSeq: &fromSeq,
+			ToSeq:   &toSeq,
+			Items: []proto.Item{
+				{ID: "b2#0", Seq: 2, Role: "assistant", Kind: proto.KindToolUse, ToolUseID: "c3", ToolName: "Bash"},
+				{ID: "b3#0", Seq: 3, Role: "user", Kind: proto.KindToolResult, ToolUseID: "c3", Text: "ran"},
+				{ID: "b4#0", Seq: 4, Role: "assistant", Kind: proto.KindThinking, Text: "checking"},
+			},
+		}, nil
+	})
+	from, through := 8, 10
+	page, err := s.logicalHistoryPage(ctx, d, c, historyParams{From: &from, Through: &through, LazyImages: true})
+	if err != nil {
+		t.Fatalf("segment 2 fold read failed: %v", err)
+	}
+	if !slices.Equal(called, []string{"target-chat"}) {
+		t.Fatalf("called segments = %v, want [target-chat]", called)
+	}
+	if len(page.Items) != 3 || page.Items[0].ID != "segment:two:b2#0" || page.Items[0].Seq != 8 || page.Items[2].Seq != 10 || page.More || page.Partial {
+		t.Fatalf("segment 2 fold page = %+v", page)
+	}
+	// Expanding a fold strictly inside retired segment 1 (2..4 within FrozenEnd=6) must not report more=true.
+	called = nil
+	seg1From, seg1Through := 2, 4
+	seg1Page, err := s.logicalHistoryPage(ctx, d, c, historyParams{From: &seg1From, Through: &seg1Through, LazyImages: true})
+	if err != nil {
+		t.Fatalf("segment 1 fold read failed: %v", err)
+	}
+	if len(called) != 0 {
+		t.Fatalf("cached retired segment fold read hit node: %v", called)
+	}
+	if len(seg1Page.Items) != 3 || seg1Page.Items[0].Seq != 2 || seg1Page.Items[2].Seq != 4 || seg1Page.More || seg1Page.Partial {
+		t.Fatalf("segment 1 fold page = %+v", seg1Page)
+	}
+}
+
+func TestLogicalHistoryFoldRangeFinishesFrozenSegmentBeforeSuccessor(t *testing.T) {
+	service, fleet, store, _ := logicalPair(t, "claude")
+	conversation := activatePair(t, store)
+	var called []string
+	fleet.answerNode(DeviceSessionItems, func(_ string, raw json.RawMessage) (any, error) {
+		var params historyParams
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return nil, err
+		}
+		called = append(called, params.SessionID)
+		if params.SessionID != "side-chat" {
+			t.Fatalf("successor queried before frozen segment completed: %s", raw)
+		}
+		fromSeq, toSeq := 1, 6
+		return historyPage{
+			History: "h1", FromSeq: &fromSeq, ToSeq: &toSeq, More: true,
+			Items: []proto.Item{{ID: "step#0", Seq: 2, Role: "assistant", Kind: proto.KindText, Text: "progress"}},
+		}, nil
+	})
+	from, through := 2, 9
+	page, err := service.logicalHistoryPage(t.Context(), store, conversation, historyParams{From: &from, Through: &through, LazyImages: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(called, []string{"side-chat"}) || len(page.Items) != 1 || page.Items[0].Seq != 2 || !page.More {
+		t.Fatalf("incomplete frozen fold page = %+v, calls = %v", page, called)
 	}
 }

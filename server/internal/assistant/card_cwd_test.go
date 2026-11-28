@@ -15,6 +15,7 @@ import (
 // node lists, for every node version. An agent's card, another manager's conversation's and one with no row keep
 // their own; a card from inside a health space keeps that (a mix-up can only hide more).
 func TestNodeCardsArePlacedInTheConversationsDirectory(t *testing.T) {
+	needsLarkLayer(t) // the chat is the lark module's
 	ft := newFleetTest(t)
 	const health, assistant = "/home/u/.persona/health", "/home/u/.persona/assistant"
 	ft.sessions("mac",
@@ -49,7 +50,7 @@ func TestNodeCardsArePlacedInTheConversationsDirectory(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ask := func(id, session, cwd string) {
-		ix := proto.Interaction{ID: id, SessionID: session, Cwd: cwd, Kind: proto.IxPermission, ToolName: "Bash",
+		ix := proto.Interaction{ID: id, SessionID: session, Cwd: cwd, Kind: proto.IxPermission, OutwardWrite: true, ToolName: "Bash",
 			ExpiresAt: time.Now().Add(time.Hour)}
 		params, _ := json.Marshal(map[string]any{"interaction": ix})
 		go func() { _, _, _ = ft.s.NodeRequest(ctx, "mac", "interaction.create", params) }()

@@ -19,11 +19,11 @@ func deployedForReview(t *testing.T, s *Service, f *fakeHub, todo string) {
 	s.ownerVerifiesAll = true
 	f.judge = `{"changed":"飞书机器人多了任务进展开关","link":"https://hub.example.com/settings?tab=feishu","how":"打开设置看开关"}`
 	agentTurn(s, f, proto.StatusWorking, "", 0)
-	agentTurn(s, f, proto.StatusDone, deployedReply, 0)
+	turnWithRecordedDeployment(t, s, f)
 	waitFor(t, "the 请验收 card", func() bool { a := askOf(s, todo); return a != nil && a.MessageID != "" })
 	f.judge = `{"verdict":"done","reason":"已部署"}`
 	agentTurn(s, f, proto.StatusWorking, "", 0)
-	agentTurn(s, f, proto.StatusDone, deployedReply, 0)
+	turnWithRecordedDeployment(t, s, f)
 	waitFor(t, "the review", func() bool { return todoNow(s, todo).Supervision.State == reviewPending })
 }
 
@@ -53,6 +53,7 @@ func waitingForOwner(s *Service) int {
 // The supervisor's accepted, having checked the evidence, passes the deployed task's "Please verify": the task is
 // verified, the card says the supervisor passed it, and nothing waits for the owner's "Pass" (#3240).
 func TestSupervisorAcceptedPassesPleaseVerify(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, todo, posts, _ := conclusionService(t, false)
 	updated := updatedCards(f)
 	deployedForReview(t, s, f, todo.ID)
@@ -87,6 +88,7 @@ func TestSupervisorAcceptedPassesPleaseVerify(t *testing.T) {
 	s.accept.mu.Lock()
 	s.accept.asks[todo.ID].AskedAt = time.Now().Add(-30 * time.Hour)
 	s.accept.mu.Unlock()
+	waitReportQueue(t, s) // report cards go out on their own timer: count only after them (#14138)
 	n := len(posts())
 	ctx := context.Background()
 	now := time.Now().In(s.location(ctx))
@@ -99,6 +101,7 @@ func TestSupervisorAcceptedPassesPleaseVerify(t *testing.T) {
 // An ask left waiting by a hub from before #3240 (the supervisor accepted, the owner was still asked) is passed by the
 // sweep; so is one whose card went out after the review.
 func TestSupervisedBacklogIsPassedBySweep(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, todo, _, _ := conclusionService(t, false)
 	deployedForReview(t, s, f, todo.ID)
 	reviewTask(t, s, todo.ID, map[string]any{"verdict": "accepted", "note": "上线了", "checks": completeReviewChecks(todoNow(s, todo.ID))})
@@ -120,6 +123,7 @@ func TestSupervisedBacklogIsPassedBySweep(t *testing.T) {
 // user_check: the supervisor accepted, but the owner is to look themselves: the "Please verify" keeps waiting for them;
 // with none up yet, one is asked.
 func TestSupervisorUserCheckStillAsksTheOwner(t *testing.T) {
+	needsLarkLayer(t)
 	t.Run("deployed", func(t *testing.T) {
 		s, f, todo, posts, _ := conclusionService(t, false)
 		deployedForReview(t, s, f, todo.ID)
@@ -146,14 +150,14 @@ func TestSupervisorUserCheckStillAsksTheOwner(t *testing.T) {
 		s, f, todo, posts, _ := conclusionService(t, false)
 		f.judge = `{"changed":"飞书机器人多了任务进展开关","link":"https://hub.example.com/settings?tab=feishu","how":"打开设置看开关"}`
 		agentTurn(s, f, proto.StatusWorking, "", 0)
-		agentTurn(s, f, proto.StatusDone, deployedReply, 0)
+		turnWithRecordedDeployment(t, s, f)
 		waitFor(t, "the assistant's acceptance", func() bool { a := askOf(s, todo.ID); return a != nil && !a.AcceptedAt.IsZero() })
 		if n := countAcceptCards(posts()); n != 0 {
 			t.Fatalf("%d 请验收 cards before the review", n)
 		}
 		f.judge = `{"verdict":"done","reason":"已部署"}`
 		agentTurn(s, f, proto.StatusWorking, "", 0)
-		agentTurn(s, f, proto.StatusDone, deployedReply, 0)
+		turnWithRecordedDeployment(t, s, f)
 		waitFor(t, "the review", func() bool { return todoNow(s, todo.ID).Supervision.State == reviewPending })
 		f.judge = `{"changed":"飞书机器人多了任务进展开关","link":"https://hub.example.com/settings?tab=feishu","how":"打开设置看开关"}`
 		reviewTask(t, s, todo.ID, map[string]any{"verdict": "accepted", "note": "界面改好了", "user_check": true, "checks": completeReviewChecks(todoNow(s, todo.ID))})
@@ -194,6 +198,7 @@ func TestSupervisorUserCheckStillAsksTheOwner(t *testing.T) {
 // A big feature (high priority) is the owner's to try (#3205): its "Please verify" waits for them after the supervisor
 // accepted too; its conclusion would not, but it has none (the card is that).
 func TestSupervisorAcceptedLeavesABigFeatureToTheOwner(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, todo, _, _ := conclusionService(t, false)
 	s.todos.mu.Lock()
 	s.todos.todos[todo.ID].Priority = "high"
@@ -221,13 +226,14 @@ func TestSupervisorAcceptedLeavesABigFeatureToTheOwner(t *testing.T) {
 
 // A task with no supervisor keeps asking the owner: closed by the auto judge, its "Please verify" waits for their "Pass".
 func TestUnsupervisedTaskStillAsksTheOwner(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, posts := acceptService(t) // its deployed work asks the owner (ownerVerifiesAll), as a big feature's does
 	todo := startedTask(t, s, f)
 	if todo.Supervision != nil && todo.Supervision.Supervisor != "" {
 		t.Fatalf("the task has a supervisor: %+v", todo.Supervision)
 	}
 	agentTurn(s, f, proto.StatusWorking, "", 0)
-	agentTurn(s, f, proto.StatusDone, deployedReply, 0)
+	turnWithRecordedDeployment(t, s, f)
 	waitAcceptCard(t, s, todo.ID, posts)
 	ctx := context.Background()
 	if ok, err := s.autoDoneTodo(ctx, todo.ID, "做完了", time.Now().Add(-time.Minute)); err != nil || !ok {

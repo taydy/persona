@@ -1,6 +1,7 @@
 package assistant
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,9 +12,13 @@ import (
 	"time"
 
 	"github.com/nwverse/persona/server/internal/apierr"
+	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/db"
 	"github.com/nwverse/persona/server/internal/i18n"
+	"github.com/nwverse/persona/server/internal/identity"
+	"github.com/nwverse/persona/server/internal/lazyre"
 	"github.com/nwverse/persona/server/internal/proto"
+	"github.com/nwverse/persona/server/internal/repositorywire"
 	"github.com/nwverse/persona/server/internal/rpc"
 	"github.com/nwverse/persona/server/internal/taskworkspace"
 )
@@ -53,11 +58,29 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 		if task.CloseTabOnAccept && (task.ReuseTodo != "" || task.Continues != "" || task.Parent != "") {
 			return nil, planInvalid{errors.New("close_tab_on_accept requires a new to-do from this plan")}
 		}
+		if task.Continues != "" && task.HandoffOperationID != "" {
+			if strings.TrimSpace(task.Permission) == "plan" {
+				task.Readonly = true
+			}
+			if strings.TrimSpace(task.Permission) != "" || task.Readonly {
+				task.preservePermission = true
+			}
+		}
 		p.Tasks[i].normalizeReadonlyPermission(readonlyModeOf(s.settings(ctx)))
+		p.Tasks[i].Machine = strings.TrimSpace(p.Tasks[i].Machine)
+		if err := s.normalizePlacementConstraints(ctx, &p.Tasks[i]); err != nil {
+			return nil, planInvalid{err}
+		}
 		if err := p.Tasks[i].normalizeMachinePolicy(); err != nil {
 			return nil, planInvalid{err}
 		}
+		if p.Tasks[i].Machine == "" && (p.Tasks[i].backendWorkspace() || p.Tasks[i].containerWorkspace()) {
+			return nil, planInvalid{errors.New("workspace.backend and workspace.container require an explicit machine")}
+		}
 		if err := checkModelID(p.Tasks[i].Model); err != nil { // typed on the card (#1644): refused before anything starts
+			return nil, planInvalid{err}
+		}
+		if err := p.Tasks[i].ModelAliases.Validate(); err != nil {
 			return nil, planInvalid{err}
 		}
 		params := map[string]any{"speed": p.Tasks[i].Speed}
@@ -72,23 +95,40 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 			// An unknown tier has always been recorded as the task's start failure below, not an HTTP refusal here.
 			checkSpeed = false
 		}
-		if checkSpeed {
+		if checkSpeed && p.Tasks[i].Machine != "" {
 			if _, err := s.fitPlanTaskSpeed(ctx, &p.Tasks[i]); err != nil {
 				return nil, planInvalid{err}
 			}
 		}
 		p.Tasks[i].Permission = strings.TrimSpace(p.Tasks[i].Permission)
-		if m, ok := s.machineByName(ctx, p.Tasks[i].Machine); ok && p.Tasks[i].Role == roleLeader && s.isWorkMachine(m.ID) {
-			return nil, planInvalid{fmt.Errorf("task %d: role \"leader\" cannot run on %s: a work-trust computer gives its agents only "+
-				"the reporting tools, so it could not supervise workers. Put the task leader on a computer you own", i+1, m.Name)}
-		}
-		if !s.placeTask(ctx, &p.Tasks[i]) {
-			return nil, i18n.Err("assistant-tasks.task_no_machine", i18n.Args{"task": p.Tasks[i].Title, "machine": strconv.Quote(p.Tasks[i].Machine)})
+		if p.Tasks[i].Machine != "" {
+			if m, ok := s.machineByName(ctx, p.Tasks[i].Machine); ok && p.Tasks[i].Role == roleLeader && s.isWorkMachine(m.ID) {
+				return nil, planInvalid{fmt.Errorf("task %d: role \"leader\" cannot run on %s: a work-trust computer gives its agents only "+
+					"the reporting tools, so it could not supervise workers. Put the task leader on a computer you own", i+1, m.Name)}
+			}
+			if !s.placeTask(ctx, &p.Tasks[i]) {
+				return nil, i18n.Err("assistant-tasks.task_no_machine", i18n.Args{"task": p.Tasks[i].Title, "machine": strconv.Quote(p.Tasks[i].Machine)})
+			}
 		}
 		// Recheck waiting cards, including ones saved before continuations always reused their original to-do.
 		if p.Tasks[i].Parent == "" {
 			if err := s.takeOver(ctx, p.Conversation, &p.Tasks[i]); err != nil {
 				return nil, planInvalid{fmt.Errorf("task %d: %w", i+1, err)}
+			}
+		}
+		if task.Continues != "" {
+			if prevTodo, ok := s.todoNow(task.Continues); ok {
+				resolvedLauncher := cmp.Or(task.Launcher, preview.Launcher)
+				providerSwitch := s.isProviderSwitchContinuation(ctx, prevTodo, task.Machine, resolvedLauncher) || task.HandoffOperationID != ""
+				if providerSwitch && task.Permission == "plan" {
+					task.Readonly = true
+				}
+				if err := s.checkContinuationBlockers(ctx, prevTodo, task.Permission, task.Readonly, providerSwitch); err != nil {
+					return nil, planInvalid{fmt.Errorf("task %d: %w", i+1, err)}
+				}
+				if providerSwitch && task.HandoffOperationID == "" {
+					task.HandoffOperationID = "op_" + randomHex(12)
+				}
 			}
 		}
 		task.RequestGate = s.planRequestGate(*task)
@@ -106,10 +146,28 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 				return nil, planInvalid{err}
 			}
 		}
-		if err := s.resolveTaskWorkspace(ctx, &p.Tasks[i]); err != nil {
-			return nil, planInvalid{err}
+		if task.scratchWorkspace() && task.Cwd != "" && (task.WorkspaceResolved == nil || (!task.WorkspaceResolved.Created && !task.WorkspaceResolved.Reused)) {
+			if identity.IsAssistantDir(task.Cwd) {
+				return nil, planInvalid{i18n.Err("rpc-errors.agent_assistant_workspace")}
+			}
+			if task.Machine != "" {
+				if m, ok := s.machineByName(ctx, task.Machine); ok && assistantWorkspace(m, proto.ExpandHome(task.Cwd, m.Home)) {
+					return nil, planInvalid{i18n.Err("rpc-errors.agent_assistant_workspace")}
+				}
+			}
+			return nil, planInvalid{fmt.Errorf("workspace %q cannot be combined with cwd; omit cwd to use a managed scratch directory", workspaceScratch)}
 		}
-		s.resolveTaskRepo(ctx, &p.Tasks[i]) // where it runs after the card's edits (its workspace, not the plan's cwd)
+		if strings.TrimSpace(task.Cwd) == "" && !task.backendWorkspace() && !s.canInferContainerWorkspace(ctx, *task) && !task.scratchWorkspace() {
+			return nil, planInvalid{errors.New("title, prompt and cwd are required")}
+		}
+		if p.Tasks[i].Machine != "" {
+			if err := s.resolveTaskWorkspace(ctx, &p.Tasks[i]); err != nil {
+				return nil, planInvalid{err}
+			}
+			s.resolveTaskRepo(ctx, &p.Tasks[i]) // where it runs after the card's edits (its workspace, not the plan's cwd)
+		} else if p.Tasks[i].ReservedTodoID == "" {
+			p.Tasks[i].ReservedTodoID = firstNonEmpty(p.Tasks[i].ReuseTodo, p.Tasks[i].TodoID, "todo_"+randomHex(8))
+		}
 		if task.Continues != "" && task.Brief == nil {
 			// Cards saved before briefs must bind the current scope before they can start.
 			if err := s.planBriefs(ctx, "", p.Conversation, p.Tasks[i:i+1]); err != nil {
@@ -122,6 +180,10 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 		if supervisors[i], err = s.planTaskSupervisor(ctx, p.Conversation, *task); err != nil {
 			return nil, err
 		}
+	}
+	// Waiting cards may have changed, or gained a conflicting association, since planning.
+	if err := s.checkPlanRepositoryDuplicates(ctx, p.Tasks); err != nil {
+		return nil, planInvalid{err}
 	}
 	p.State = planStarted
 	for i := range p.Tasks {
@@ -142,20 +204,49 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 	}
 	planOwners := map[string]Todo{}
 	planQueuedKeys := map[string]bool{}
+	pendingPlacementBatchSize := 0
+	for i := range p.Tasks {
+		if p.Tasks[i].Machine == "" && p.Tasks[i].RequestGate == "" {
+			pendingPlacementBatchSize++
+		}
+	}
+	pendingPlacementBatchIdx := 0
 	for i := range p.Tasks {
 		t := &p.Tasks[i]
+		s.refreshSoftInbox(ctx, t)
+		if t.InboxNotice != "" {
+			if _, err := s.appendFeedOnce(ctx, p.ID+fmt.Sprintf("-inbox-%d", i), p.Conversation, feedNotice, p.ID, noticeBody{Text: i18n.T(s.lang(ctx), "assistant-tasks.inbox_link_removed")}); err != nil {
+				s.logf("Inbox link notice: %v", err)
+			}
+		}
 		if err := s.checkPlannedInbox(ctx, p.Conversation, *t); err != nil {
 			t.Error = err.Error()
 			continue
 		}
 		var todo Todo
 		if t.ReuseTodo != "" {
+			var pred todoPredecessorInfo
+			var hasPred bool
+			if curTodo, ok := s.todoNow(t.ReuseTodo); ok {
+				pred, hasPred = s.todoPredecessor(ctx, curTodo)
+			}
 			// The todo is already there with its own title, notes and task card in the conversation's feed (a Lark topic
 			// opened it): the task runs on it, and nothing is made or shown twice.
 			todo, err = s.takeTodoForTask(ctx, p.ID, p.Conversation, *t)
 			if err != nil {
 				t.Error = err.Error()
 				continue
+			}
+			s.applyTodosV2DispatchDefaults(ctx, p.Conversation, supervisors[i], t, &todo)
+			if t.Continues != "" && (t.HandoffOperationID != "" || s.isProviderSwitchContinuation(ctx, todo, t.Machine, t.Launcher)) {
+				if err := s.prepareContinuationHandoff(ctx, t, todo, pred, hasPred); err != nil {
+					t.Error = err.Error()
+					s.releaseTakenTodo(t.ReuseTodo)
+					continue
+				}
+				if t.HandoffID != "" && (t.Permission != "" || t.Readonly) {
+					t.preservePermission = true
+				}
 			}
 			if t.Project != "" && todo.Project != t.Project {
 				if moved, err := s.editTodo(ctx, todo.ID, db.TodoEdit{Project: &t.Project}); err != nil {
@@ -164,7 +255,22 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 					todo = moved
 				}
 			}
+			if t.Audience != "" && todo.Audience != t.Audience {
+				if updated, err := s.editTodo(ctx, todo.ID, db.TodoEdit{Audience: &t.Audience}); err != nil {
+					s.logf("task %s: audience: %v", todo.ID, err)
+				} else {
+					todo = updated
+				}
+			}
+			if t.DirectionID != "" && todo.DirectionID != t.DirectionID {
+				if updated, err := s.editTodo(ctx, todo.ID, db.TodoEdit{DirectionID: &t.DirectionID}); err != nil {
+					s.logf("task %s: direction_id: %v", todo.ID, err)
+				} else {
+					todo = updated
+				}
+			}
 		} else {
+			s.applyTodosV2DispatchDefaults(ctx, p.Conversation, supervisors[i], t, nil)
 			title, retitle := s.taskTitle(ctx, t.Title, t.Prompt) // the assistant's own title stays when it is a real one
 			if t.InboxItem != "" {
 				s.tasks.mu.Lock()
@@ -172,9 +278,9 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 				s.tasks.mu.Unlock()
 			}
 			if t.containerWorkspace() && len(t.Workspace.Container.SelectedRepoIDs) > 0 {
-				todo, err = s.createTaskTodoWithRepositories(ctx, t.ReservedTodoID, title, t.Prompt, p.Conversation, p.ID, t.Project, t.InboxItem, t.Workspace.Container.SelectedRepoIDs)
+				todo, err = s.createTaskTodoWithRepositoriesAndAudience(ctx, t.ReservedTodoID, title, t.Prompt, p.Conversation, p.ID, t.Project, t.InboxItem, t.Audience, t.DirectionID, t.Workspace.Container.SelectedRepoIDs)
 			} else {
-				todo, err = s.createTaskTodoAs(ctx, t.ReservedTodoID, title, t.Prompt, p.Conversation, p.ID, t.Project, t.InboxItem)
+				todo, err = s.createTaskTodoAs(ctx, t.ReservedTodoID, title, t.Prompt, p.Conversation, p.ID, t.Project, t.InboxItem, t.Audience, t.DirectionID)
 			}
 			if err != nil {
 				if t.InboxItem != "" {
@@ -211,11 +317,23 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 			continue
 		}
 		t.TodoID = todo.ID
+		s.saveApprovedPRBlockers(ctx, todo.ID, t.BlockedByPR, true)
+		if s.settings(ctx).todosV2On() {
+			afterIDs := cleanIDs(slices.Concat(t.After, todo.After))
+			if len(afterIDs) > 0 {
+				s.syncAfterBlockers(ctx, todo.ID, afterIDs, t.UnlockStage, t.UnlockContracts)
+			}
+		}
 		if t.RequestGate != "" {
 			// Persist the approved edges, including edges inherited from a reused to-do.
 			t.After = cleanIDs(slices.Concat(t.After, todo.After))
 			t.Queue = s.prerequisiteQueue(ctx, *t, s.requestBlockers(ctx, *t))
-		} else if t.Workspace != nil && t.Workspace.Mode == workspaceExisting && !t.WorkspaceInferred && t.WorkspaceResolved != nil {
+		} else if t.Machine == "" {
+			q := s.pendingPlacementQueueEntry(ctx, p.ID, pendingPlacementBatchSize, pendingPlacementBatchIdx, s.placementNow())
+			pendingPlacementBatchIdx++
+			t.Queue = &q
+		}
+		if t.Queue == nil && t.Workspace != nil && t.Workspace.Mode == workspaceExisting && (!t.WorkspaceInferred || t.Workspace.Queue) && t.WorkspaceResolved != nil {
 			effMachine := s.effectiveBoardMachine(t.Machine)
 			wsPath := t.WorkspaceResolved.Path
 			wsKey := effMachine + "\x00" + s.taskDirKey(ctx, t.Machine)(wsPath)
@@ -234,11 +352,23 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 				planOwners[wsKey] = Todo{ID: todo.ID, Title: todo.Title}
 			}
 		}
+		if t.Queue == nil {
+			readiness, err := s.taskTodoReadiness(ctx, todo, *t)
+			if err != nil {
+				s.logf("task %s: approved start: read prerequisites: %v", todo.ID, err)
+			}
+			if err != nil || !readiness.ready() {
+				t.Queue = s.blockerWaitQueue(ctx, readiness.refs())
+			}
+		}
+		if t.Queue != nil {
+			t.Placement = queuedPlacement(*t, t.Queue)
+		}
 		s.briefStarted(ctx, p, t, todo) // what was asked, kept from now on (task_brief_plan.go)
 		// Its stage kind from that brief; how it is handed out is kept for every later look (task_stage_kind.go).
 		s.restage(ctx, todo.ID, func(st *todoStage) { st.Readonly = t.Readonly })
-		// Every conversation-dispatched task is supervised by the main conversation; its origin still names where it
-		// was handed out (#5732). A task leader's worker keeps its leader Agent through supervisors[i].
+		// The planning lead owns its task from the first dispatch; main owns its own plans. A task leader's worker
+		// keeps its leader Agent through supervisors[i].
 		if sup := supervisors[i]; sup != "" {
 			if t.Parent == "" && t.ReuseTodo == "" && sup != p.Conversation {
 				s.taskCard(ctx, sup, todo.ID, "")
@@ -269,6 +399,8 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 			}
 			return nil, err
 		}
+	} else {
+		s.rememberPlannedWriteScopes(ctx, p)
 	}
 	s.event(ctx, map[string]any{"type": "task_plan", "plan": s.planWithSpace(ctx, p)})
 	// Pre-claim workspaces that have a later queued sibling in this same plan so deterministic FIFO order holds
@@ -276,7 +408,7 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 	for i := range p.Tasks {
 		task := p.Tasks[i]
 		if task.TodoID == "" || task.Error != "" || task.Queue != nil || task.Workspace == nil ||
-			task.Workspace.Mode != workspaceExisting || task.WorkspaceInferred || task.WorkspaceResolved == nil {
+			task.Workspace.Mode != workspaceExisting || (task.WorkspaceInferred && !task.Workspace.Queue) || task.WorkspaceResolved == nil {
 			continue
 		}
 		effMachine := s.effectiveBoardMachine(task.Machine)
@@ -288,6 +420,30 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 	var queuedRecheck []workspaceTarget
 	for i := range p.Tasks {
 		if task := p.Tasks[i]; task.TodoID != "" && task.Error == "" {
+			if task.Queue != nil && task.Placement != nil {
+				s.savePlacement(ctx, task.Placement)
+			}
+			if task.Queue != nil && task.Queue.Key == pendingPlacementQueueKey {
+				held := task.ReuseTodo
+				if held == "" && task.InboxItem != "" {
+					held = task.TodoID
+				}
+				s.releaseTakenTodo(held)
+				batchSize := pendingPlacementBatchSize
+				if task.Queue.Placement != nil && task.Queue.Placement.BatchSize > 0 {
+					batchSize = task.Queue.Placement.BatchSize
+				}
+				s.onPendingPlacementEnqueued(ctx, p.ID, task.TodoID, batchSize)
+				continue
+			}
+			if task.Queue != nil && task.Queue.Key == blockerWaitQueueKey {
+				held := task.ReuseTodo
+				if held == "" && task.InboxItem != "" {
+					held = task.TodoID
+				}
+				s.releaseTakenTodo(held)
+				continue
+			}
 			if task.Queue != nil && task.Queue.Key == workspaceQueueKey && task.Queue.Workspace != nil {
 				held := task.ReuseTodo
 				if held == "" && task.InboxItem != "" {
@@ -310,6 +466,32 @@ func (s *Service) startPlan(ctx context.Context, id string, edits []PlanTask, re
 		s.drainWorkspaceQueue(ctx, target.machine, target.path)
 	}
 	return p, nil
+}
+
+// applyTodosV2DispatchDefaults fills default direction_id and audience for a planned task when todos_v2 is enabled (#15654).
+// It never overwrites an explicit caller value or an existing reused to-do's non-empty value, and is a complete no-op when
+// todos_v2 is off.
+func (s *Service) applyTodosV2DispatchDefaults(ctx context.Context, conversation, supervisor string, t *PlanTask, existing *Todo) {
+	if !s.settings(ctx).todosV2On() {
+		return
+	}
+	effSup := supervisor
+	if effSup == "" {
+		effSup = cmp.Or(t.Supervisor, conversation)
+	}
+	isLeaderSup := effSup != "" && s.isLeader(ctx, effSup)
+	if t.DirectionID == "" && (existing == nil || existing.DirectionID == "") && isLeaderSup {
+		t.DirectionID = effSup
+	}
+	if t.Audience == "" && (existing == nil || existing.Audience == "") {
+		partOf := t.PartOf
+		if partOf == "" && existing != nil {
+			partOf = existing.PartOf
+		}
+		if isLeaderSup || !t.UserRequested || partOf != "" || t.Parent != "" {
+			t.Audience = db.AudienceAutonomous
+		}
+	}
 }
 
 // failPlanSupervision closes a prepared card whose required ledger could not be stored. Keeping TodoID preserves the
@@ -339,6 +521,14 @@ func (s *Service) failPlanSupervision(ctx context.Context, todo Todo, t *PlanTas
 // if the scope changed between accepting the card and preparing dispatch.
 func (s *Service) supervisePlanTask(ctx context.Context, id, supervisor string, t *PlanTask) error {
 	_, _, err := s.updateSupervision(ctx, id, func(v *Supervision) bool {
+		if v.assigned() {
+			supervisor = v.Supervisor // a transfer that won before this write stays authoritative
+		} else if s.isLeader(ctx, supervisor) || s.liveSideSupervisor(ctx, supervisor) {
+			v.SupervisorSource = "plan"
+		}
+		if t.MultiIssueReport && v.Investigation == nil {
+			v.Investigation = &investigationFindings{}
+		}
 		if t.Continues == "" {
 			v.Supervisor, v.DoneWhen, v.ExpectMinutes = supervisor, cleanDoneWhen(t.DoneWhen), t.ExpectMinutes
 			return true
@@ -403,6 +593,9 @@ func (s *Service) reusableTodo(ctx context.Context, conversation, id string, tak
 	if s.workspaceQueuePending(ctx, t) {
 		return nil, notReusable(id, "a start for this to-do is already queued for its workspace")
 	}
+	if s.pendingPlacementPending(ctx, t) {
+		return nil, notReusable(id, "a start for this to-do is already queued for automatic machine placement")
+	}
 	if s.startRemedying(ctx, t) {
 		return nil, notReusable(id, "its start is being remedied in the tab its computer keeps: use task_retry")
 	}
@@ -451,22 +644,170 @@ func (s *Service) startRemedying(ctx context.Context, t Todo) bool {
 }
 
 // todoAgentStopped: nothing runs agent a now, so a new agent may take over its to-do: its session is listed stopped
-// (switchStopped) or archived, or its computer is gone from the hub. Not listed at all, or the computer not reached,
-// is not known to be stopped.
+// (switchStopped) or archived, its computer is gone from the hub, or its computer authoritatively confirms via
+// session.info that no such session exists there. An unlisted session whose existence cannot be ruled out (for
+// example, an aged-out Antigravity session still on disk beyond the recent list cap, an away runtime, a known
+// no_transcript session, or an unreachable computer) stays fail-closed as not stopped.
 func (s *Service) todoAgentStopped(ctx context.Context, a TodoAgent) bool {
+	_, stopped, listed, listErr := s.todoAgentStopPresenceRow(ctx, a)
+	if stopped || listed || listErr != nil {
+		return stopped
+	}
+	return s.todoAgentConfirmedMissing(ctx, a)
+}
+
+// todoAgentStopPresence is todoAgentStopped plus listed: listed says a session list answered and some row names
+// a.SessionID as its own id or one of its aliases. Aliases matter for Antigravity: while an agy-<conversation> runs
+// in a terminal pane, the node lists the pane row and puts agy-<conversation> in its aliases, so matching the row id
+// alone would call a live Agent absent. A listed live session therefore stays fail-closed against a contradictory
+// stop answer; an id no row or alias names can still be settled by the computer's authoritative "no such session"
+// stop answer.
+func (s *Service) todoAgentStopPresence(ctx context.Context, a TodoAgent) (stopped, listed bool) {
+	_, stopped, listed, _ = s.todoAgentStopPresenceRow(ctx, a)
+	return stopped, listed
+}
+
+// todoAgentStopPresenceRow checks a's computer session list once, matching by SessionID or Aliases so an Antigravity
+// conversation running in a terminal pane under a pane row is still seen as live. Any live matching row wins, and among
+// live matches a terminal-backed row takes precedence so continuation never routes a terminal pane to session.close.
+func (s *Service) todoAgentStopPresenceRow(ctx context.Context, a TodoAgent) (row proto.Session, stopped, listed bool, listErr error) {
 	list, err := s.sessions(ctx, a.MachineID)
 	if errors.Is(err, ErrNoDevice) {
+		return proto.Session{}, true, false, nil
+	}
+	if err != nil {
+		return proto.Session{}, false, false, err
+	}
+	// Every row naming the id counts: a stopped alias row can sort before the live exact row (runtime
+	// fork aliases), so one stopped match must not hide another live match. Any live match wins.
+	live := false
+	liveHasTerminal := false
+	for _, c := range list {
+		if !sessionNamesID(c, a.SessionID) {
+			continue
+		}
+		cLive := !(c.Archived || switchStopped(c))
+		cTerm := c.PaneID != "" || (c.Capabilities != nil && c.Capabilities.Terminal)
+		if !listed {
+			row = c
+			listed = true
+		}
+		if cLive {
+			if !live || (cTerm && !liveHasTerminal) {
+				row = c
+				liveHasTerminal = cTerm
+			}
+			live = true
+		}
+	}
+	if !listed {
+		return proto.Session{}, false, false, nil
+	}
+	return row, !live, true, nil
+}
+
+// sessionNamesID reports whether row is id or names id as another of its machine-known ids (proto.Session.Aliases).
+func sessionNamesID(row proto.Session, id string) bool {
+	if row.SessionID == id {
 		return true
 	}
+	return slices.Contains(row.Aliases(), id)
+}
+
+// otherTodoOwnsNamedSession reports whether an ACTIVE row id/alias the machine lists for a.SessionID is
+// already the live Agent of another open to-do. It closes the agy companion-uuid vs pane-row split that
+// the exact-id activeBySession guard cannot see. A list error returns false and leaves the existing
+// fail-closed stop path in charge.
+func (s *Service) otherTodoOwnsNamedSession(ctx context.Context, a TodoAgent, todoID string) bool {
+	list, err := s.sessions(ctx, a.MachineID)
 	if err != nil {
 		return false
 	}
+	ids := map[string]struct{}{a.SessionID: {}}
 	for _, c := range list {
-		if c.SessionID == a.SessionID {
-			return c.Archived || switchStopped(c)
+		if !sessionNamesID(c, a.SessionID) {
+			continue
+		}
+		ids[c.SessionID] = struct{}{}
+		for _, al := range c.Aliases() {
+			ids[al] = struct{}{}
+		}
+	}
+	s.todos.mu.RLock()
+	defer s.todos.mu.RUnlock()
+	for id := range ids {
+		if owner := s.todos.activeBySession[[2]string{a.MachineID, id}]; owner != "" && owner != todoID {
+			return true
 		}
 	}
 	return false
+}
+
+// todoAgentConfirmedMissing probes a's computer directly via session.info to confirm that no such session exists
+// there. Only an authoritative missing-session refusal (not_found with confirmed_missing=true or reason=unknown_session)
+// returns true; existing/aged-out sessions, no_transcript, away runtimes, older nodes, and transport errors stay false.
+func (s *Service) todoAgentConfirmedMissing(ctx context.Context, a TodoAgent) bool {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	err := s.call(cctx, a.MachineID, "session.info", map[string]any{"session_id": a.SessionID}, nil)
+	return sessionConfirmedMissing(err)
+}
+
+// sessionConfirmedMissing reports whether err is a node's authoritative confirmation that a session does not exist.
+func sessionConfirmedMissing(err error) bool {
+	var re *rpc.Error
+	if !errors.As(err, &re) || re.Code != codeSessionNotFound || len(re.Data) == 0 {
+		return false
+	}
+	var data struct {
+		Reason           string `json:"reason"`
+		ConfirmedMissing bool   `json:"confirmed_missing"`
+	}
+	if json.Unmarshal(re.Data, &data) != nil {
+		return false
+	}
+	return data.ConfirmedMissing || data.Reason == proto.NotFoundUnknownSession
+}
+
+// agyCompanionIDRe is the Antigravity companion row id agy-<conversation-uuid> shape the node's
+// agyConversationID recognizes. For this id the node's plain "invalid session id" stop answer is not
+// proof the conversation is gone: a live pane normally carries it only as an alias, and when two panes
+// report one conversation the node leaves that alias off both rows. Pane/worker-derived agy ids (the
+// form a task links, e.g. the short agy-<8hex> worker id) are instead checked by the node's agyPaneRow,
+// so the same text is an id-specific "no such live pane" answer for them.
+var agyCompanionIDRe = lazyre.New(`^agy-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// stopErrSaysSessionGone reports whether a session.stop error is the reached computer's authoritative answer that
+// the target session does not exist there: the typed not_found code current nodes and runtimes return
+// (sessionNotFound) for every id form, or the legacy plain "invalid session id %q" text older Persona nodes send
+// for a non-standard row id they no longer know. The legacy branch is tightly bounded (review P2): a plain handler
+// error crosses RPC with an EMPTY code (re.Code == "" is required), the text must name this exact session id, and
+// the id must be an Antigravity pane/worker row (agy- prefix, but not the companion agy-<uuid> form the node cannot
+// certify from that text alone). Other non-hex otherSession ids such as omp-w1-p2 stay fail-closed: their legacy
+// text is not an id-specific gone answer this hub may forgive. Transport, timeout, offline and refusal errors are
+// none of these, so a computer that cannot be reached is never read as a stopped agent.
+func stopErrSaysSessionGone(err error, sessionID string) bool {
+	if err == nil {
+		return false
+	}
+	if sessionNotFound(err) {
+		return true
+	}
+	var re *rpc.Error
+	if !errors.As(err, &re) {
+		return false
+	}
+	if re.Code != "" || re.Message != fmt.Sprintf("invalid session id %q", sessionID) {
+		return false
+	}
+	return legacyAgyPaneID(sessionID)
+}
+
+// legacyAgyPaneID reports whether id is an Antigravity pane/worker-derived row id: agy-prefixed but not
+// the companion agy-<conversation-uuid> shape. Only this form may use the node's legacy empty-code
+// invalid-id text as an authoritative gone signal.
+func legacyAgyPaneID(id string) bool {
+	return strings.HasPrefix(id, "agy-") && !agyCompanionIDRe.MatchString(id)
 }
 
 // takeTodoForTask is the todo a started plan's task runs on (PlanTask.ReuseTodo), checked again now (it may have been
@@ -560,6 +901,77 @@ func (s *Service) takeTodoForTask(ctx context.Context, planID, conversation stri
 	return formatTodo(t), nil
 }
 
+// runtimeCanClose reports whether c is a non-terminal runtime session that explicitly advertises session.close.
+// Terminal-backed sessions (including pi/omp inside a terminal pane) and assistant conversations never match.
+func runtimeCanClose(c proto.Session) bool {
+	return c.SourceKind == proto.SourceRuntime &&
+		!c.Assistant &&
+		c.PaneID == "" &&
+		c.Capabilities != nil &&
+		!c.Capabilities.Terminal &&
+		c.Capabilities.Close != nil && *c.Capabilities.Close
+}
+
+// runtimeCanInterruptOnly reports whether c is a non-terminal runtime session without session.close
+// (such as Antigravity Desktop, DSH, Managed Agents, or opencode TUI) whose execution is controlled by session.interrupt.
+func runtimeCanInterruptOnly(c proto.Session) bool {
+	return c.SourceKind == proto.SourceRuntime &&
+		!c.Assistant &&
+		c.PaneID == "" &&
+		c.Capabilities != nil &&
+		!c.Capabilities.Terminal &&
+		(c.Capabilities.Close == nil || !*c.Capabilities.Close) &&
+		c.Capabilities.Interrupt
+}
+
+// runtimeSessionBusy reports whether a runtime session has active or queued work that must be interrupted before
+// releasing its to-do link.
+func runtimeSessionBusy(c proto.Session) bool {
+	return c.Status == proto.StatusWorking ||
+		c.Status == proto.StatusBlocked ||
+		c.Starting ||
+		c.State == proto.StateWorking ||
+		c.State == proto.StateNeedsYou ||
+		c.BackgroundWorking ||
+		len(c.Background) > 0 ||
+		len(c.Queued) > 0
+}
+
+// stopContinuedAgent stops one active predecessor Agent during a task_plan(continues=...) handoff (#16231).
+// Terminal-backed Agents always use session.stop so their terminal pane stays open (#4754).
+// Non-terminal runtime sessions use their declared lifecycle control: session.close when Capabilities.Close is true
+// (e.g. native Antigravity companion, Paseo, Opencode companion, Grok, Orca, T3Code, Cindy, Pi Web), or
+// session.interrupt when Close is unavailable and Interrupt is true while busy (e.g. Antigravity Desktop, DSH,
+// Managed Agents, Opencode TUI). When an unlisted non-terminal session answers no_terminal to session.stop,
+// session.close is attempted only if the live session list confirmed no terminal pane exists for it.
+func (s *Service) stopContinuedAgent(ctx context.Context, a TodoAgent, sess proto.Session, listed bool, listErr error) error {
+	targetID := a.SessionID
+	if listed && sess.SessionID != "" && (sess.PaneID != "" || runtimeCanClose(sess) || runtimeCanInterruptOnly(sess)) {
+		targetID = sess.SessionID
+	}
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	switch {
+	case listErr == nil && runtimeCanClose(sess):
+		return s.call(cctx, a.MachineID, "session.close", map[string]any{"session_id": targetID}, nil)
+	case listed && runtimeCanInterruptOnly(sess):
+		if !runtimeSessionBusy(sess) {
+			return nil
+		}
+		return s.call(cctx, a.MachineID, "session.interrupt", map[string]any{"session_id": targetID}, nil)
+	default:
+		err := s.call(cctx, a.MachineID, deviceSessionStop, map[string]any{"session_id": targetID}, nil)
+		canFallbackClose := listErr == nil &&
+			!sess.Assistant &&
+			sess.PaneID == "" &&
+			(sess.Capabilities == nil || (!sess.Capabilities.Terminal && (sess.Capabilities.Close == nil || *sess.Capabilities.Close)))
+		if canFallbackClose && isNoTerminalStopError(err) {
+			return s.call(cctx, a.MachineID, "session.close", map[string]any{"session_id": targetID}, nil)
+		}
+		return err
+	}
+}
+
 // stopContinuedTaskAgents is an explicit handoff, not the idle task-closure pass: stop the old process but keep its
 // terminal and history. A refusal leaves the handoff failed on this to-do, with no replacement Agent.
 func (s *Service) stopContinuedTaskAgents(ctx context.Context, todo Todo) ([]TodoAgent, error) {
@@ -578,21 +990,94 @@ func (s *Service) stopContinuedTaskAgents(ctx context.Context, todo Todo) ([]Tod
 			stopped = append(stopped, a)
 			continue
 		}
+		if agyCompanionIDRe.MatchString(a.SessionID) && s.otherTodoOwnsNamedSession(ctx, a, todo.ID) {
+			// The exact-id guard misses the agy companion-uuid vs live pane-row alias split: the node
+			// would resolve the uuid to that other to-do's pane and quit its Agent. Release only this
+			// stale link without the stop, as in the exact-id cross-to-do case.
+			stopped = append(stopped, a)
+			continue
+		}
 		if _, ok := s.device(ctx, a.MachineID); !ok {
 			return nil, fmt.Errorf("continues: cannot confirm agent %s/%s stopped: its computer is unavailable", a.MachineID, a.SessionID)
 		}
-		if !s.todoAgentStopped(ctx, a) {
-			cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			err := s.call(cctx, a.MachineID, deviceSessionStop, map[string]any{"session_id": a.SessionID}, nil)
-			cancel()
-			if err != nil {
-				return nil, fmt.Errorf("continues: cannot stop agent %s/%s on to-do %s: %w", a.MachineID, a.SessionID, todo.ID, err)
+		var sess proto.Session
+		var hasSess bool
+		if c, ok := s.decoratedSession(a.MachineID, a.SessionID); ok {
+			sess, hasSess = c, true
+		} else if c, ok := s.session(ctx, a.MachineID, a.SessionID); ok {
+			sess, hasSess = c, true
+		}
+		liveRow, isStopped, listed, listErr := s.todoAgentStopPresenceRow(ctx, a)
+		if !hasSess {
+			if listed {
+				sess, hasSess = liveRow, true
+			} else {
+				sess = proto.Session{MachineID: a.MachineID, SessionID: a.SessionID}
 			}
+		}
+		if refused, why := sessionSafetyRefusal(sess); refused {
+			return nil, handoffBlockerError{
+				code: "safety_refusal",
+				msg:  fmt.Sprintf("continues: agent %s/%s on to-do %s is blocked by a provider safety refusal (%s); safety refusals remain recorded blockers", a.MachineID, short(a.SessionID), todo.ID, why),
+			}
+		}
+		if listed {
+			if refused, why := sessionSafetyRefusal(liveRow); refused {
+				return nil, handoffBlockerError{
+					code: "safety_refusal",
+					msg:  fmt.Sprintf("continues: agent %s/%s on to-do %s is blocked by a provider safety refusal (%s); safety refusals remain recorded blockers", a.MachineID, short(a.SessionID), todo.ID, why),
+				}
+			}
+		}
+		if s.sessionUnresolvedApproval(sess) || (listed && s.sessionUnresolvedApproval(liveRow)) {
+			return nil, handoffBlockerError{
+				code: "unresolved_approval",
+				msg:  fmt.Sprintf("continues: agent %s/%s on to-do %s has an unresolved approval or question; resolve it first", a.MachineID, short(a.SessionID), todo.ID),
+			}
+		}
+		// A list row that is live (listed and not stopped) contradicting the stop answer stays hard.
+		// "listed but stopped" only reaches stop for the companion-uuid verification call and may be
+		// reconciled by an authoritative not_found from the node.
+		liveListed := listed && !isStopped
+		confirmedMissing := false
+		if !isStopped && !listed && listErr == nil && s.todoAgentConfirmedMissing(ctx, a) {
+			s.logf("continues: agent %s/%s on to-do %s is confirmed missing on its computer; letting its stale link go", a.MachineID, a.SessionID, todo.ID)
 			s.endSessionCards(a.MachineID, a.SessionID)
+			isStopped = true
+			confirmedMissing = true
+		}
+		// For the companion agy-<uuid> form a stopped exact row can coexist with two live panes whose
+		// double attribution made the node omit the alias, so presence alone cannot certify it stopped:
+		// always ask the node's raw-pane authority for that form even when the list says stopped, unless
+		// session.info already certified confirmed_missing (which vetoes on raw pane attribution and presence lock).
+		if (!isStopped || agyCompanionIDRe.MatchString(a.SessionID)) && !confirmedMissing {
+			target := sess
+			if listed {
+				target = liveRow
+			}
+			err := s.stopContinuedAgent(ctx, a, target, listed, listErr)
+			switch {
+			case err == nil:
+				s.endSessionCards(a.MachineID, a.SessionID)
+			case liveListed || !stopErrSaysSessionGone(err, a.SessionID):
+				// A session the list shows live, or any uncertain/refusal error, stays fail-closed: the handoff fails
+				// and a retry can reconcile it. Only an absent row plus the computer's own "no such session" answer is
+				// the idempotent already-gone case (an orphaned agy worker after its companion restarted).
+				return nil, fmt.Errorf("continues: cannot stop agent %s/%s on to-do %s: %w", a.MachineID, a.SessionID, todo.ID, err)
+			default:
+				s.logf("continues: agent %s/%s on to-do %s is no longer on its computer; letting its stale link go: %v",
+					a.MachineID, a.SessionID, todo.ID, err)
+				s.endSessionCards(a.MachineID, a.SessionID)
+			}
 		}
 		stopped = append(stopped, a)
 	}
 	return stopped, nil
+}
+
+func isNoTerminalStopError(err error) bool {
+	var re *rpc.Error
+	return errors.As(err, &re) && re.Code == "no_terminal"
 }
 
 // todoAgentReleaser is the store's letting go of one agent link (released_at only); a store without it keeps that in
@@ -663,6 +1148,26 @@ func (s *Service) releaseTakenTodo(id string) {
 // (node's claudeStartWait, #1396).
 var taskStartTimeout = 5 * time.Minute
 
+func (t *PlanTask) planStartTimeout() time.Duration {
+	repositories := 0
+	if w := t.WorkspaceResolved; w != nil {
+		repositories = len(w.Repositories)
+	}
+	if t.containerWorkspace() {
+		repositories = max(repositories, len(t.Workspace.Container.SelectedRepoIDs))
+	}
+	if repositories == 0 && t.WorkspaceResolved == nil && t.backendOperationID() != "" {
+		// Admission loads an unresolved operation's frozen repository set after the start deadline is set.
+		repositories = repositorywire.MaxTaskRepositories
+	}
+	if repositories == 0 {
+		return taskStartTimeout
+	}
+	// Leave room for an old workspace's cancellation and the new workspace's acquisition,
+	// in addition to mirror preparation, direct checkout, and launching the agent.
+	return taskStartTimeout + assistantwire.BackendWorkspacePrepareTimeout(repositories) + 2*assistantwire.BackendWorkspaceRPCTimeout
+}
+
 // taskFailTimeout bounds recording a failed start (the todo, the plan, the receipt), after the start's own time.
 const taskFailTimeout = 30 * time.Second
 
@@ -691,10 +1196,68 @@ func (s *Service) startPlanTaskAsync(planID, conversation string, i int, t PlanT
 	}()
 }
 
+// activateDeferredTaskStart attaches the Companion's MCP servers and starts its first turn through the same ordinary
+// send path a later message uses. Its client_msg_id is the id session.start carried, so an uncertain answer is never
+// retried into a second first turn.
+func (s *Service) activateDeferredTaskStart(ctx context.Context, t *PlanTask, mid, sid string) error {
+	d := t.deferredStart
+	if d == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), taskStartTimeout)
+	defer cancel()
+	params := map[string]any{"session_id": sid, "text": d.text, "client_msg_id": d.clientMsgID}
+	if d.permissionMode != "" {
+		params["permission_mode"] = d.permissionMode
+	}
+	if len(d.images) > 0 {
+		params["images"] = d.images
+	}
+	return s.call(ctx, mid, DeviceSessionSend, params, nil)
+}
+
+// closeDeferredTaskStart discards a newly created ACP session that provably never got its first prompt. It stops only
+// the Agent and leaves the user's terminal open. It is not used for an uncertain activation: that session may already
+// be running and remains linked for recovery instead.
+func (s *Service) closeDeferredTaskStart(ctx context.Context, t *PlanTask, mid, sid string) {
+	if t.deferredStart == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
+	defer cancel()
+	if err := s.call(ctx, mid, deviceSessionStop, map[string]any{"session_id": sid}, nil); err != nil {
+		s.logf("task %s: close deferred Companion session %s/%s: %v", t.TodoID, mid, sid, err)
+	}
+}
+
+// deferBlockedTaskStart returns a known-unsent start to a retryable queue.
+func (s *Service) deferBlockedTaskStart(ctx context.Context, t PlanTask, blocked *todoStartBlocked, retry bool) {
+	if blocked.err != nil {
+		s.logf("task %s: defer start: read prerequisites: %v", t.TodoID, blocked.err)
+	}
+	q := s.blockerWaitQueue(ctx, blocked.refs)
+	q.Retry = retry
+	policy := queueCAS
+	switch {
+	case t.RequestGate != "" && t.Queue != nil:
+		policy = queueOwnerStart
+	case t.claimedGatewayStart():
+		policy = queueQuotaStart
+	}
+	if t.Queue != nil && (blocked.err != nil || blocked.after && t.Queue.Workspace != nil) {
+		*q = *t.Queue
+		q.Claimed, q.NextAt = false, time.Now().UTC()
+		if ws := t.Queue.Workspace; ws != nil && len(blocked.refs) > 0 {
+			*q = s.workspaceAfterWaitEntry(ctx, ws.Machine, ws.Path, blocked.refs, t.Queue)
+		}
+	}
+	s.replaceTaskQueue(ctx, t, q, policy)
+}
+
 // runPlanTaskStart is the shared start body; its caller owns the idle reservation through every return path.
 func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTask, retry bool) {
 	t.planID, t.planIndex = planID, i
-	ctx, cancel := context.WithTimeout(context.Background(), taskStartTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), t.planStartTimeout())
 	defer cancel()
 	if t.RequestGate != "" {
 		queued := t.Queue
@@ -726,6 +1289,7 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 	}
 	t.Permission = strings.TrimSpace(t.Permission)
 	mid, sid, err := s.startTaskAgent(ctx, &t, retry)
+	var blocked *todoStartBlocked
 	var lost startLinkLost
 	var quota *gatewayQuotaWaitError
 	var wsWait *workspaceBusyQueueError
@@ -734,11 +1298,12 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 		// a whole start's time of its own (the first may have spent its own on the dead link). Not counted against
 		// the launcher (#7511).
 		s.logf("task %s: start: %v; the link to %s dropped and came back without the agent; starting once more", t.TodoID, err, t.Machine)
-		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), taskStartTimeout)
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), t.planStartTimeout())
 		defer rcancel()
 		ctx = rctx
 		mid, sid, err = s.startTaskAgent(ctx, &t, retry)
-	} else if !t.startWithoutReplay() && err != nil && ctx.Err() == nil && !startStalled(err) && !errors.As(err, &quota) && !errors.As(err, &wsWait) {
+	} else if !t.startWithoutReplay() && err != nil && ctx.Err() == nil && !startStalled(err) &&
+		!errors.As(err, &quota) && !errors.As(err, &wsWait) && !errors.As(err, &blocked) {
 		// The machine's link dropped (a node restarting, a tunnel blinking): try once more after a moment. Any other
 		// launcher failure may move a flexible task, after verifying its directory on the destination.
 		// An unknown result (the wait ran out or the link dropped while the answer was out) already went through
@@ -747,7 +1312,7 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 		unknown := startResultUnknown(err)
 		shouldRetry := transientStartErr(err) && !unknown
 		if !shouldRetry && t.MachinePolicy == machineFlexible && !unknown {
-			shouldRetry = s.healthyPlace(ctx, &t)
+			shouldRetry = s.previewHealthPlacement(ctx, &t)
 		}
 		if shouldRetry && (errors.Is(err, errMachineOffline) || errors.Is(err, apierr.ErrOffline)) {
 			// Not sent: no connection to the machine. The retry waits a moment and then for the link to come back
@@ -773,6 +1338,10 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 			}
 		}
 	}
+	if errors.As(err, &blocked) {
+		s.deferBlockedTaskStart(ctx, t, blocked, retry)
+		return
+	}
 	if errors.As(err, &quota) {
 		if saveErr := s.persistGatewayWait(ctx, t, quota.queue); saveErr != nil {
 			s.logf("task %s: save gateway quota wait: %v", t.TodoID, saveErr)
@@ -790,15 +1359,53 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 		s.logf("task %s: queued launch eligibility unconfirmed: %v", t.TodoID, quotaState)
 		return
 	}
-	if t.Machine != placed || t.Why != placedWhy || t.Permission != placedPermission { // workspace admission already persisted the actual checkout
-		s.updatePlanTask(ctx, planID, i, t)
+	// The admission and workspace queues publish the refusal together with its
+	// retry time. A changed launch target still follows the usual plan update.
+	planUpdate := t
+	if isAdmissionDenied(err) || errors.As(err, &wsWait) {
+		planUpdate.Placement = nil
+	}
+	if t.Machine != placed || t.Why != placedWhy || t.Permission != placedPermission {
+		s.updatePlanTask(ctx, planID, i, planUpdate)
+	} else if planUpdate.Placement != nil {
+		// Recording the decision must not pin launch defaults or overwrite a workspace saved at admission.
+		write, stop := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
+		if err := s.patchPlanTask(write, planID, i, func(pt *PlanTask) {
+			if pt.TodoID == t.TodoID {
+				pt.Placement = t.Placement
+			}
+		}); err != nil {
+			s.logf("task %s: save placement on plan: %v", t.TodoID, err)
+		}
+		stop()
 	}
 	launched := err == nil
+	linkedDone := false
+	if !launched && t.Dispatch != nil {
+		// A failed start keeps its dispatch, with the candidate's failed starts in a row, for the next try to read
+		// (candidate_keep.go: three re-pick).
+		write, stop := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
+		if saveErr := s.patchPlanTask(write, planID, i, func(pt *PlanTask) {
+			if pt.TodoID == t.TodoID {
+				pt.Dispatch = t.Dispatch
+			}
+		}); saveErr != nil {
+			s.logf("task %s: record dispatch: %v", t.TodoID, saveErr)
+		}
+		stop()
+	}
 	if launched {
 		// The start's own context can be spent already: an unanswered start whose session was just reconciled
 		// (#6540) reaches here after taskStartTimeout, and a database write on that context fails at once, which
 		// would fail the task although its agent is running. The link gets its own time, like the bookkeeping below.
 		linkCtx, linkCancel := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
+		if saveErr := s.patchPlanTask(linkCtx, planID, i, func(pt *PlanTask) {
+			if pt.TodoID == t.TodoID {
+				pt.Dispatch = t.Dispatch // the latest start's: a start on no tier clears an earlier one
+			}
+		}); saveErr != nil {
+			s.logf("task %s: record dispatch: %v", t.TodoID, saveErr)
+		}
 		if t.TerminalTarget.Machine != "" {
 			if saveErr := s.patchPlanTask(linkCtx, planID, i, func(pt *PlanTask) {
 				if pt.TodoID == t.TodoID && pt.CloseTabOnAccept && pt.TerminalCleanup == "" && pt.TerminalTarget.Machine == "" {
@@ -816,12 +1423,43 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 			retryCtx, retryCancel := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
 			err = s.linkPlanAgent(retryCtx, t, mid, sid, true)
 			retryCancel()
+			linkedDone = err == nil
 			if err != nil {
 				s.logf("task %s: link to the finished task: %v", t.TodoID, err)
 			}
 		}
 	}
+	if err == nil && t.deferredStart != nil {
+		if linkedDone {
+			// The owner finished the task while its ACP identity was being created. No first prompt is needed now.
+			s.closeDeferredTaskStart(ctx, &t, mid, sid)
+		} else {
+			err = s.activateDeferredTaskStart(ctx, &t, mid, sid)
+			if err != nil && sendUnknown(err) {
+				// The role link is durable and the send may already be running. Keep it exactly as an adopted unknown start:
+				// no close, failure receipt or blind second Agent; a later send uses the now-linked identity.
+				s.logf("task %s: deferred Companion activation has an unknown result; keeping the linked session: %v", t.TodoID, err)
+				err = nil
+			}
+		}
+	}
+	if err != nil && t.deferredStart != nil {
+		// Linking failed before any prompt, or activation definitely refused it: this new ACP session is safe to reclaim.
+		s.closeDeferredTaskStart(ctx, &t, mid, sid)
+	}
 	if err == nil {
+		if !linkedDone && s.settings(ctx).todosV2On() {
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
+			if recErr := s.RecordSupervisedTaskActive(rctx, t.TodoID, mid, sid, s.runtimeBootEpoch()); recErr != nil {
+				s.logf("task %s: record todos_v2 active checkpoint: %v", t.TodoID, recErr)
+			}
+			rcancel()
+		}
+		if t.HandoffID != "" {
+			hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
+			_, _ = s.recordTodoHandoffDelivery(hctx, t.HandoffID, mid, sid, t.startedAgent, handoffDeliveryAccepted, "")
+			hcancel()
+		}
 		if t.Queue != nil { // a queued retry made it through the gate and linked: its waiting record is done
 			s.clearAdmissionQueue(context.WithoutCancel(ctx), planID, i, t.TodoID)
 		}
@@ -839,6 +1477,11 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 		var remote *rpc.Error
 		if launched || startResultUnknown(err) || errors.As(err, &lost) || nodeMayHaveTaken(err) ||
 			errors.As(err, &remote) && remote.Code == "identity_conflict" {
+			if t.HandoffID != "" {
+				hctx, hcancel := context.WithTimeout(context.WithoutCancel(ctx), taskFailTimeout)
+				_, _ = s.recordTodoHandoffDelivery(hctx, t.HandoffID, t.Machine, "", "", handoffDeliveryUnknown, err.Error())
+				hcancel()
+			}
 			s.logf("task %s: queued launch unconfirmed, not replaying: %v", t.TodoID, err)
 			return
 		}
@@ -880,7 +1523,7 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 		}
 		args["launcher"] = s.startLauncher(ctx, t.Launcher)
 	}
-	if !t.backendWorkspace() && t.RequestGate == "" && s.beginRemedy(ctx, planID, i, t, err, code, args, reason) {
+	if !t.usesPreparedWorkspace() && t.RequestGate == "" && s.beginRemedy(ctx, planID, i, t, err, code, args, reason) {
 		return
 	}
 	// A retry the assistant asked for that failed so its tab is gone: the start fails for good, and the supervisor and
@@ -894,15 +1537,12 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 		failed.ErrorCode, failed.ErrorArgs = code, args
 		retryWith = s.retryLaunchers(ctx, m, failed, err)
 	}
-	if ferr := s.failTodo(ctx, t.TodoID, reason); ferr != nil {
-		s.logf("task %s: fail: %v", t.TodoID, ferr)
-	}
 	if perr := s.patchPlanTask(ctx, planID, i, func(pt *PlanTask) {
 		pt.Error = err.Error()
 		var problem *taskworkspace.Problem
 		if errors.As(err, &problem) {
 			pt.WorkspaceError = problem
-		} else if t.backendWorkspace() && t.backendRequest != nil {
+		} else if t.usesPreparedWorkspace() && t.backendRequest != nil {
 			pt.WorkspaceError = taskworkspace.Failure("engine_start_failed", "start", t.backendRequest.OperationID, "", t.Cwd)
 		}
 		pt.ErrorCode, pt.ErrorArgs, pt.RetryWith = code, args, retryWith
@@ -911,6 +1551,12 @@ func (s *Service) runPlanTaskStart(planID, conversation string, i int, t PlanTas
 		}
 	}); perr != nil {
 		s.logf("plan %s: task %d's start error: %v", planID, i, perr)
+	}
+	if ferr := s.failTodo(ctx, t.TodoID, reason); ferr != nil {
+		s.logf("task %s: fail: %v", t.TodoID, ferr)
+	}
+	if t.HandoffID != "" {
+		_, _ = s.recordTodoHandoffDelivery(ctx, t.HandoffID, t.Machine, "", "", handoffDeliveryRejected, err.Error())
 	}
 	s.tasks.mu.Lock()
 	s.tasks.receipted[t.TodoID] = time.Now()
@@ -1145,6 +1791,63 @@ func (s *Service) retryTaskStart(ctx context.Context, todoID string, with retryW
 		return nil, false, retryRefused{i18n.Err("assistant-tasks.request_new_plan")}
 	}
 	t.Permission = strings.TrimSpace(t.Permission)
+	if t.Machine == "" {
+		if with.answer != "" {
+			return nil, false, errAnswerNotWaiting
+		}
+		if with.launcher == "" && with.model != "" {
+			return nil, false, planInvalid{i18n.Err("assistant-tasks.retry_model_without_launcher")}
+		}
+		if err := checkModelID(with.model); err != nil {
+			return nil, false, planInvalid{err}
+		}
+		from := s.ranLauncher(ctx, t)
+		if with.launcher != "" {
+			t.Launcher, t.Model, t.Tier = with.launcher, with.model, ""
+			t.LauncherDefaultModel = with.model == ""
+			t.RetryWith = nil
+		}
+		reopened, ok, err := s.reopenFailedTodo(ctx, todoID)
+		if err != nil {
+			return nil, false, err
+		}
+		view, err := json.Marshal(reopened)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return view, false, nil
+		}
+		q := s.pendingPlacementQueueEntry(ctx, p.ID, 1, 0, s.placementNow())
+		q.Retry = true
+		var savedPlacement *placement
+		if err := s.patchPlanTask(ctx, p.ID, i, func(pt *PlanTask) {
+			*pt = t
+			pt.Queue = &q
+			pt.Placement = nil
+			pt.Placement = queuedPlacement(*pt, &q)
+			savedPlacement = pt.Placement
+			pt.WorkspaceError = nil
+			pt.Error, pt.ErrorCode, pt.ErrorArgs, pt.RetryWith = "", "", nil, nil
+		}); err != nil {
+			s.logf("task %s: retry placement requeue failed (plan %s): %v", todoID, p.ID, err)
+			if ferr := s.failTodo(ctx, todoID, err.Error()); ferr != nil {
+				s.logf("task %s: retry placement rollback fail: %v", todoID, ferr)
+			}
+			return nil, false, err
+		}
+		if savedPlacement != nil {
+			s.savePlacement(ctx, savedPlacement)
+		}
+		if with.launcher != "" && with.launcher != from && with.by != "" {
+			s.remedyStep(ctx, p.Conversation, todoID, startRemedyBody{Action: "retry", By: with.by, LauncherFrom: from, LauncherTo: with.launcher})
+		}
+		s.logf("task %s: retrying its start via placement queue (plan %s)", todoID, p.ID)
+		started = true
+		s.endTaskStart(todoID, st, proto.Session{})
+		s.onPendingPlacementEnqueued(ctx, p.ID, todoID, 1)
+		return view, true, nil
+	}
 	m, ok := s.machineByName(ctx, t.Machine)
 	if !ok {
 		return nil, false, i18n.Err("assistant-tasks.no_machine", i18n.Args{"machine": strconv.Quote(t.Machine)})

@@ -1,6 +1,6 @@
 {
   "name": "decisions_query",
-  "description": "Decisions; scope:{executor,machine[],project[],personal}.",
+  "description": "memory[] full scan: tag ranks all-term matches first, backfilling partial/rank hits. by/trust/non-active: memory_omitted=ledger_filters; retry tag alone. scope=ledger-only",
   "input_schema": {
     "type": "object",
     "properties": {

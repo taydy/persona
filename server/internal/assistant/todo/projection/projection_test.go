@@ -19,9 +19,9 @@ import (
 // manager, so the same facts always give the same view and the hub's contract types are all it shares. The standard
 // library it may use is listed, so a package that reads the disk, the network or randomness never gets in unnoticed.
 func TestProjectionStaysPure(t *testing.T) {
-	allowed := []string{"cmp", "errors", "fmt", "maps", "reflect", "regexp", "slices", "sort", "strconv", "strings",
+	allowed := []string{"cmp", "errors", "fmt", "maps", "net/url", "reflect", "regexp", "slices", "sort", "strconv", "strings",
 		"sync", "time", "unicode/utf8", "github.com/nwverse/persona/server/internal/proto",
-		"github.com/nwverse/persona/server/internal/assistantwire"}
+		"github.com/nwverse/persona/server/internal/assistantwire", "github.com/nwverse/persona/server/internal/wireids"}
 	clock := []string{"Now", "Since", "Until", "Sleep", "After", "AfterFunc", "Tick", "NewTimer", "NewTicker", "LoadLocation"}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -40,8 +40,7 @@ func TestProjectionStaysPure(t *testing.T) {
 		for _, imp := range f.Imports {
 			path, _ := strconv.Unquote(imp.Path.Value)
 			if !slices.Contains(allowed, path) {
-				t.Errorf("%s imports %s: the projection reads only its facts (the listed standard library, proto and "+
-					"assistantwire)", name, path)
+				t.Errorf("%s imports %s: the projection reads only its facts (the listed standard library and wire packages)", name, path)
 			}
 			if path == "time" {
 				timeAs = "time"
@@ -178,6 +177,28 @@ func TestOwnerDecidesWithoutAReview(t *testing.T) {
 	if v := View(f, testNow); v.Reason != assistantwire.TodoReasonOwnerDecides || v.Line == nil ||
 		v.Line.Key != assistantwire.TodoLineKeyDecision || v.Line.Args != nil || !v.Since.IsZero() {
 		t.Fatalf("%+v", v)
+	}
+}
+
+// TestPersonalVerificationStaysOutOfNeedsYou is the #15680 (#15638) resolution of the placement #16002 briefly gave
+// personal verification: the owner chose a calm, separate "to verify" layer (tree review + counts.user_check, a calm
+// web tray), so an open user_check must not be counted as red Needs you. #16080 explicitly left that product call to
+// #15680. Reintroducing the ownerDecides verify placement makes these assertions fail.
+func TestPersonalVerificationStaysOutOfNeedsYou(t *testing.T) {
+	f := Facts{ID: "todo_verify", Origin: "conv_lead", CreatedAt: hours(-5), UpdatedAt: hours(-1),
+		Delivery: &Delivery{State: deliveryLive, At: hours(-2)},
+		Ask:      &Ask{Verdict: "Please verify the result", AskedAt: hours(-1)}}
+	if v := View(f, testNow); v.Section != assistantwire.TodoListSectionJustFinished {
+		t.Fatalf("ordinary verification section = %q", v.Section)
+	}
+	f.Supervision = &Supervision{State: reviewUserCheck, UpdatedAt: hours(-1), Reviews: []Review{{Verdict: reviewAccepted, At: hours(-1)}}}
+	views := Views([]Facts{f}, testNow)
+	v := views[0]
+	if v.Section == assistantwire.TodoListSectionNeedsYou || v.Phase == assistantwire.TodoPhaseNeedsYou || v.Reason == assistantwire.TodoReasonVerify {
+		t.Fatalf("personal verification must stay out of Needs you under #15680, view: %+v", v)
+	}
+	if c := Counts([]Facts{f}, views); c.NeedsYou != 0 {
+		t.Fatalf("personal verification counts = %+v, want NeedsYou=0", c)
 	}
 }
 

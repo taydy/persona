@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/nwverse/persona/server/internal/i18n"
-	"github.com/nwverse/persona/server/internal/prompts"
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
@@ -16,7 +15,7 @@ import (
 func judgedTask(t *testing.T, s *Service, f *fakeHub, text, judge string) (Todo, time.Time) {
 	t.Helper()
 	todo := startedTask(t, s, f)
-	s.taskWorking(context.Background(), "box", "s1")
+	s.taskWorking(context.Background(), "box", "s1", startRow{})
 	s.tasks.mu.Lock()
 	work := s.tasks.working[todo.ID]
 	s.tasks.mu.Unlock()
@@ -99,7 +98,7 @@ func TestAutoFinishKeepsNoStaleCheck(t *testing.T) {
 	f.hookReads(receiptHooks{before: func(int) {
 		if !turned {
 			turned = true
-			s.taskWorking(context.Background(), "box", "s1")
+			s.taskWorking(context.Background(), "box", "s1", startRow{})
 		}
 	}})
 	s.autoFinishTask(todo, work, true)
@@ -120,7 +119,7 @@ func TestTaskCheckClearedByANewTurnAndAReopen(t *testing.T) {
 	if todoNow(s, todo.ID).Check == nil {
 		t.Fatal("no check")
 	}
-	s.taskWorking(ctx, "box", "s1")
+	s.taskWorking(ctx, "box", "s1", startRow{})
 	if got := todoNow(s, todo.ID); got.Check != nil || keptCheck(s, todo.ID) != nil || got.Stage != "develop" {
 		t.Fatalf("after a new turn: %+v %+v", got.Check, keptCheck(s, todo.ID))
 	}
@@ -176,7 +175,7 @@ func TestSupervisedTaskKeepsTheCheck(t *testing.T) {
 func TestTaskDoneJudgeAsksInTheUsersLanguage(t *testing.T) {
 	for _, tc := range []struct{ locale, want string }{{"en", "用English写"}, {"ja", "用" + i18n.Lang("ja").Name() + "写"}, {"zh-Hans", ""}} {
 		m := &cannedJSON{answer: `{"verdict":"waiting","reason":"Waiting for CI"}`}
-		in := taskDoneInput{Owner: "User", Language: answerLanguage(tc.locale), Title: "Fix login", Replies: []prompts.TaskDoneReply{doneReply("PR open")}}
+		in := taskDoneInput{Owner: "User", Language: answerLanguage(tc.locale), Title: "Fix login", Replies: []taskDoneReply{doneReply("PR open")}}
 		if _, err := judgeTaskDoneWith(context.Background(), m, in); err != nil {
 			t.Fatal(err)
 		}

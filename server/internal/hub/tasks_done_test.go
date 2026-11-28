@@ -31,6 +31,9 @@ type judgeStub struct {
 	input      atomic.Value
 }
 
+// infoTagPromptStart is how the information tagging prompt (prompts/assistant/info_tag.md) starts.
+const infoTagPromptStart = "You tag a piece of text from the owner's conversations"
+
 func stubJudge(t *testing.T, h *Hub, status int, reply string) *judgeStub {
 	t.Helper()
 	js := &judgeStub{}
@@ -40,6 +43,12 @@ func stubJudge(t *testing.T, h *Hub, status int, reply string) *judgeStub {
 			return
 		}
 		raw, _ := io.ReadAll(r.Body)
+		// Information tagging (info.tag) inherits Sorting's model too, and tags a text leaving a conversation
+		// (#13246); its requests are answered here and do not change the judge's count or input.
+		if strings.Contains(string(raw), infoTagPromptStart) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"content": []any{map[string]any{"type": "text", "text": `{"categories":[]}`}}})
+			return
+		}
 		js.input.Store(string(raw))
 		js.calls.Add(1)
 		if status != http.StatusOK {
@@ -125,7 +134,14 @@ func receipts(h *Hub) int { return strings.Count(strings.Join(feedKinds(h, "conv
 // The judge finds the work delivered: the todo stays open for review or explicit user completion, with its conclusion and live link.
 // The agent remains attached to the task until the user or main actually accepts it (#5732).
 func TestTaskAutoDone(t *testing.T) {
-	h, _ := newTaskHub(t)
+	h, node := newTaskHub(t)
+	// The fake node confirms the task Agent owns the published PR before the judge uses it.
+	node.mu.Lock()
+	node.prOwnership = json.RawMessage(`{
+		"branch":"fix-login","head_oid":"1111111111111111111111111111111111111111","viewer":"example-author",
+		"pr":{"url":"https://github.com/o/r/pull/901","author":"example-author","head":"fix-login","head_oid":"1111111111111111111111111111111111111111"}
+	}`)
+	node.mu.Unlock()
 	js := stubJudge(t, h, http.StatusOK, `{"verdict":"done","reason":"已合并 PR 并发了 TestFlight"}`)
 	todo := startedTask(t, h)
 	runTurn(h, "修好了，PR https://github.com/o/r/pull/901 已合并，TestFlight 构建号 202611041200")

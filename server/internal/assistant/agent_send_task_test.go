@@ -214,9 +214,8 @@ func TestAgentSendTaskFromSideIsSupervisedByMain(t *testing.T) {
 	}
 }
 
-// Without a configured main, a leader's hand-off keeps its origin but never makes that leader the acceptance authority.
-// The task can be accepted after main is configured; the empty supervisor is not a delivery route (#5732).
-func TestAgentSendTaskFromLeaderWithoutMainHasNoLeaderSupervisor(t *testing.T) {
+// A direction lead owns its own hand-off even before a main conversation has been configured.
+func TestAgentSendTaskFromLeaderWithoutMainKeepsItsSupervisor(t *testing.T) {
 	s, f := newQuietService(t)
 	secretary(f)
 	f.known["lead1"] = true
@@ -230,12 +229,11 @@ func TestAgentSendTaskFromLeaderWithoutMainHasNoLeaderSupervisor(t *testing.T) {
 	if todo.Origin != "lead1" {
 		t.Fatalf("the hand-off lost its origin: %+v", todo)
 	}
-	if todo.Supervision == nil || todo.Supervision.Supervisor != "" {
-		t.Errorf("the calling leader became the supervisor without main: %+v", todo.Supervision)
+	if todo.Supervision == nil || todo.Supervision.Supervisor != "lead1" {
+		t.Errorf("the lead lost supervision without main: %+v", todo.Supervision)
 	}
-	if _, err := runJSON(t, s, "lead1", "task_review", map[string]any{"todo_id": todo.ID, "verdict": "accepted"}); err == nil ||
-		!strings.Contains(err.Error(), "not handed out") {
-		t.Errorf("the calling leader accepted its own assistant-dispatched task: %v", err)
+	if _, err := runJSON(t, s, "lead1", "task_review", map[string]any{"todo_id": todo.ID, "verdict": "cancelled", "note": "Cancel this task"}); err != nil {
+		t.Errorf("the planning lead could not cancel its task: %v", err)
 	}
 }
 
@@ -436,7 +434,12 @@ func taskLedger(t *testing.T, s *Service, convs ...string) string {
 	s.todos.mu.RLock()
 	todos := make([]Todo, 0, len(s.todos.todos))
 	for _, td := range s.todos.todos {
-		todos = append(todos, copyTodoLocked(td))
+		copy := copyTodoLocked(td)
+		if copy.Supervision != nil {
+			// These snapshots guard ownership and lifecycle; task_followup_test.go checks send receipts separately.
+			copy.Supervision.FollowedUpAt = nil
+		}
+		todos = append(todos, copy)
 	}
 	s.todos.mu.RUnlock()
 	slices.SortFunc(todos, func(a, b Todo) int { return strings.Compare(a.ID, b.ID) })

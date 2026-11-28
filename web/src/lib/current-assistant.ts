@@ -7,6 +7,7 @@ import { useChosenManager, useShownManager } from "./manager-choice";
 import { installedManagers, managerOf, multiManager, ownerIn, useRoster, type Manager, type ManagerList } from "./managers";
 import { directoryVisibleCards, stateCounts, useAgentListStatus, useAgentSessions, useCounts, useFullAgentSessions, type AgentList } from "./sessions";
 import { useStore } from "./store";
+import { userCards } from "./supervisor-held";
 import type { Session } from "./types";
 
 export interface Scope {
@@ -69,7 +70,7 @@ export function useScopedTodos() {
   return useScoped(useStore((s) => s.todos));
 }
 
-/** The current assistant's pending cards. */
+/** The current assistant's authoritative pending cards. Conversation views read the store directly so they can show copies. */
 export function useScopedInteractions() {
   return useScoped(useStore((s) => directoryVisibleCards(s.interactions)));
 }
@@ -90,7 +91,7 @@ export function useScopedCounts(): ReturnType<typeof useCounts> {
   const { sessions } = useFullAgentSessions(scope.several);
   const allInteractions = useStore((s) => s.interactions);
   const grading = useStore((s) => s.pushGrading);
-  const interactions = useScopedInteractions().length;
+  const interactions = userCards(useScopedInteractions()).length;
   return useMemo(
     () => (scope.several ? { ...stateCounts(scoped(sessions, scope), allInteractions, grading), interactions, quietCounted: false } : whole),
     [scope, sessions, allInteractions, grading, interactions, whole],

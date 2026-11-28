@@ -18,6 +18,7 @@ import (
 
 // Drive the real ask-answer route: the card must describe the relay result, not guess it from the answer's spelling.
 func TestCheckDecisionWordsCardDelivery(t *testing.T) {
+	needsLarkLayer(t)
 	for _, tc := range []struct {
 		name, kind, supervisor string
 		stop                   func(*fakeHub)
@@ -101,6 +102,9 @@ func TestCheckDecisionWordsCardDelivery(t *testing.T) {
 				mu.Unlock()
 				return map[string]any{}, nil
 			})
+			// An undelivered decision's handoff skips the gather (#17099), so the hour above no longer keeps it
+			// pending for the checks below: hold the digest timer itself. The explicit sendDigest below still runs.
+			s.stopSuperviseTimers()
 			before := len(sentToAgent(f))
 			raw, _ := json.Marshal(input)
 			rec := answerTodoAsk(s, todo.ID, askDecisionPrefix+a.AskedAt.Format(timeKeyLayout), string(raw))

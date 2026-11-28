@@ -7,12 +7,13 @@ import { useSyncExternalStore } from "react";
 import { t } from "../i18n";
 import { api, credentialOwner, enc, onCredentialChange } from "./api";
 import { isDelegating } from "./delegate";
+import { supervisorHeld } from "./supervisor-held";
 import { deviceId } from "./device-id";
 import { sessionTitle } from "./format";
 import { interactionAsk } from "./inbox";
 import { plainMarkdown } from "./plain-markdown";
 import { byTime } from "./times";
-import { requestHome } from "./child-sessions";
+import { requestHome, requestHomeMachine } from "./child-sessions";
 import type { Interaction, Session } from "./types";
 
 export type DonePref = "off" | "long" | "always";
@@ -493,10 +494,11 @@ export interface Waiting {
 }
 
 /** The session's card the notification is about: the oldest one pending for it (the one the overview lists first), not
- *  one the assistant is still looking at (nothing is pushed for those). A child session's card is its parent's (#5120). */
+ *  one the assistant is still looking at nor one a task's supervisor holds (nothing is pushed for those). A child
+ *  session's card is its parent's (#5120). */
 export function waitingCard(interactions: readonly Interaction[], s: Pick<Session, "machine_id" | "session_id">): Interaction | undefined {
   return interactions
-    .filter((ix) => ix.machine_id === s.machine_id && requestHome(ix) === s.session_id && !isDelegating(ix))
+    .filter((ix) => requestHomeMachine(ix) === s.machine_id && requestHome(ix) === s.session_id && !isDelegating(ix) && !supervisorHeld(ix))
     .sort((a, b) => byTime(a.created_at, b.created_at) || a.id.localeCompare(b.id))[0];
 }
 
@@ -537,7 +539,7 @@ function buttonsOnNotifications(): boolean {
  * gets Allow / Deny where the browser can draw them (#4464): the worker shows it and an open page answers a button
  * (lib/notification-answer.ts); elsewhere it is the plain one.
  */
-export function postNotification(n: { title: string; body: string; tag: string; url: string; icon?: string; ix?: string; silent?: boolean }, open: () => void): void {
+export function postNotification(n: { title: string; body: string; tag: string; url: string; icon?: string; ix?: string; created_at?: string; silent?: boolean }, open: () => void): void {
   if (!systemNotifyActive()) return;
   if (typeof window !== "undefined" && !(n.ix && buttonsOnNotifications()) && window.personaDesktop?.notify({ title: n.title, body: n.body, tag: n.tag, route: n.url, silent: n.silent, ix: n.ix })) return;
   if (n.ix && buttonsOnNotifications()) {
@@ -545,8 +547,8 @@ export function postNotification(n: { title: string; body: string; tag: string; 
     closePageNotification(n.tag);
     const actions = [{ action: "allow", title: t("chat-interactions.allow") }, { action: "deny", title: t("chat-interactions.deny") }];
     navigator.serviceWorker.ready
-      .then((reg) => reg.showNotification(n.title, { body: n.body, tag: n.tag, icon: n.icon, silent: n.silent, data: { url: n.url, ix: n.ix }, actions } as NotificationOptions))
-      .catch(() => postNotification({ ...n, ix: undefined }, open));
+      .then((reg) => reg.showNotification(n.title, { body: n.body, tag: n.tag, icon: n.icon, silent: n.silent, data: { url: n.url, ix: n.ix, ...(n.created_at ? { created_at: n.created_at } : {}) }, actions } as NotificationOptions))
+      .catch(() => postNotification({ ...n, ix: undefined, created_at: undefined }, open));
     return;
   }
   try {

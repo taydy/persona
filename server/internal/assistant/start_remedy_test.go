@@ -3,11 +3,13 @@ package assistant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/db"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/rpc"
 )
@@ -182,7 +184,8 @@ func TestRemedyToolsAnswerAndRetryInTheSameTab(t *testing.T) {
 }
 
 // The supervision turn that heard of the failure ends with no retry going: the start fails for good, with its
-// receipt. A turn that never told the user gets the hub's notice and push; one that did, none.
+// receipt. A turn that never told the user gets the hub's notice in the conversation; one that did, none. Neither is
+// pushed to the owner: the supervisor gave up on its own task, and only its needs_user brings that to the owner.
 func TestRemedyEndsWithTheTurnThatSawIt(t *testing.T) {
 	for _, told := range []bool{false, true} {
 		s, f := newQuietService(t)
@@ -211,7 +214,7 @@ func TestRemedyEndsWithTheTurnThatSawIt(t *testing.T) {
 		if notice := slices.Contains(kinds, feedNotice); notice == told {
 			t.Errorf("told=%v: the hub's notice %v", told, kinds)
 		}
-		if pushed := len(f.pushed()) > pushes; pushed == told {
+		if len(f.pushed()) > pushes {
 			t.Errorf("told=%v: pushed %v", told, f.pushed())
 		}
 	}
@@ -368,5 +371,206 @@ func TestRemedyIsNotEndedByAnotherConversationsTurn(t *testing.T) {
 	s.remedyTurnEnded(ctx, "conv1")
 	if got := todoNow(s, todo.ID); got.DoneAt == nil || got.StartError == "" {
 		t.Fatalf("not ended by the turn that saw it: %+v", got)
+	}
+}
+
+// A supervised task whose agent stopped on a dialog the computer did not know, and whose start cannot be remedied (no
+// tab kept), fails for good: the supervisor's message still shows the agent's screen as its rows, every choice of the
+// dialog on its own line, not only the one clipped line of the reason; with no retries offered for a tab that is gone.
+func TestAStalledStartThatFailsForGoodShowsItsScreen(t *testing.T) {
+	s, f := newQuietService(t)
+	shown := " Make auto mode your default permission mode?\n ❯ 1. Yes, make auto mode my default\n   2. Something new\n Enter to confirm · Esc to cancel"
+	data, _ := json.Marshal(map[string]any{"screen": shown})
+	failure := &rpc.Error{Code: proto.CodeAgentStartStalled, Data: data,
+		Message: "an unrecognized dialog blocks the start: \"Make auto mode your default permission mode?\"\n" + shown}
+	todo, _ := remedyingTask(t, s, f, failure)
+	waitFor(t, "the failure", func() bool { return todoNow(s, todo.ID).DoneAt != nil })
+	waitFor(t, "the supervision message", func() bool { return len(f.notices()) == 1 })
+	n := f.notices()[0]
+	for _, want := range []string{"启动标签最后几行", "   |  ❯ 1. Yes, make auto mode my default\n   |    2. Something new\n", "signal=failed"} {
+		if !strings.Contains(n, want) {
+			t.Errorf("message lacks %q:\n%s", want, n)
+		}
+	}
+	if strings.Contains(n, "还能重试") {
+		t.Errorf("retries offered for a start that failed for good:\n%s", n)
+	}
+}
+
+func sideRemedyService(t *testing.T) (*Service, *fakeHub) {
+	t.Helper()
+	store := restartHistoryStore{&profileTaskStore{memStore: &memStore{}, plans: map[string]db.TaskPlanRow{}}}
+	s, f := newQuietServiceOn(t, store)
+	f.mu.Lock()
+	f.known["side1"], f.known["side2"] = true, true
+	f.mu.Unlock()
+	f.setSessions("server",
+		proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle},
+		proto.Session{SessionID: "side1", MachineID: "server", Assistant: true, Status: proto.StatusIdle},
+		proto.Session{SessionID: "side2", MachineID: "server", Assistant: true, Status: proto.StatusIdle})
+	return s, f
+}
+
+// startSideTask dispatches through the same tool a side conversation uses.
+func startSideTask(t *testing.T, s *Service) Todo {
+	t.Helper()
+	ctx := t.Context()
+	result := s.Tool(ctx, ToolCall{MachineID: "server", SessionID: "side1", Name: "task_plan", Arguments: planArgs(true)})
+	if result.IsError {
+		t.Fatalf("side conversation could not dispatch: %s", toolText(result))
+	}
+	waitFor(t, "the side task and its supervisor", func() bool {
+		return onlyTodo(s).Supervision != nil
+	})
+	task := onlyTodo(s)
+	if task.Supervision.Supervisor != "side1" || task.Supervision.SupervisorSource != "plan" ||
+		s.isMain(ctx, "side1") || s.isLeader(ctx, "side1") {
+		t.Fatalf("expected a task owned by an ordinary conversation, got %+v", task.Supervision)
+	}
+	return task
+}
+
+func sideRemedyTool(t *testing.T, s *Service, self, name, id string) proto.ToolResult {
+	t.Helper()
+	args, err := json.Marshal(map[string]any{"todo_id": id, "keys": []string{"n"}, "reason": "Continue startup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Tool(t.Context(), ToolCall{MachineID: "server", SessionID: self, Name: name, Arguments: args})
+}
+
+func checkRemedyRefused(t *testing.T, s *Service, self, name, id, want string) {
+	t.Helper()
+	result := sideRemedyTool(t, s, self, name, id)
+	if !result.IsError || !strings.Contains(toolText(result), want) {
+		t.Fatalf("%s calling %s = %q, want refusal directing it to %s", self, name, toolText(result), want)
+	}
+}
+
+func checkTaskRetried(t *testing.T, s *Service, self, id, tab string) {
+	t.Helper()
+	result := sideRemedyTool(t, s, self, "task_retry", id)
+	if result.IsError || !strings.Contains(toolText(result), tab) {
+		t.Fatalf("%s retry = %q, want a retry in %s", self, toolText(result), tab)
+	}
+	waitFor(t, "the retried Agent on the same task", func() bool {
+		cur := todoNow(s, id)
+		return cur.DoneAt == nil && cur.StartError == "" && len(cur.Agents) == 1
+	})
+}
+
+func TestSideSupervisorRemediesItsOwnStart(t *testing.T) {
+	s, f := sideRemedyService(t)
+	f.mu.Lock()
+	f.failStart = keptRefusal(proto.CodeShellWaiting)
+	typed := 0
+	f.nodes = map[string]nodeAnswer{
+		"session.screen": func(_ string, _ json.RawMessage) (any, error) {
+			return map[string]any{"text": "Would you like to update? [Y/n]\n", "status": proto.StatusIdle}, nil
+		},
+		"start.keys": func(_ string, _ json.RawMessage) (any, error) {
+			typed++
+			return map[string]any{}, nil
+		},
+	}
+	f.mu.Unlock()
+
+	task := startSideTask(t, s)
+	waitFor(t, "the failed start told to its supervising conversation", func() bool {
+		return len(supervisionTo(f, "side1", sigFailed)) == 1
+	})
+	for _, name := range []string{"task_start_screen", "task_start_keys", "task_retry"} {
+		checkRemedyRefused(t, s, "side2", name, task.ID, "task's current supervising conversation")
+	}
+	if result := sideRemedyTool(t, s, "side1", "task_start_screen", task.ID); result.IsError || !strings.Contains(toolText(result), "Would you like to update?") {
+		t.Fatalf("supervisor's screen = %q", toolText(result))
+	}
+	if result := sideRemedyTool(t, s, "side1", "task_start_keys", task.ID); result.IsError || typed != 1 {
+		t.Fatalf("supervisor's keys = %q, sent %d times", toolText(result), typed)
+	}
+	f.mu.Lock()
+	f.failStart = nil
+	f.mu.Unlock()
+	checkTaskRetried(t, s, "side1", task.ID, "the same tab")
+}
+
+func TestSideSupervisorRetriesItsFailedStart(t *testing.T) {
+	s, f, d := supervisedQueueHub(t)
+	f.mu.Lock()
+	f.inbox = newFakeInbox()
+	f.known["side1"], f.known["side2"] = true, true
+	f.mu.Unlock()
+	conversations := []proto.Session{
+		{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle},
+		{SessionID: "side1", MachineID: "server", Assistant: true, Status: proto.StatusIdle},
+		{SessionID: "side2", MachineID: "server", Assistant: true, Status: proto.StatusIdle},
+	}
+	f.setSessions("server", conversations...)
+	d.setSessions("server", conversations)
+	busyOverloaded(d)
+	plan, task := queuedStartFor(t, s, "busy", "side1", "plan")
+	if plan.Tasks[0].Queue == nil || supervisorOf(task) != "side1" {
+		t.Fatalf("expected admission to queue a task supervised by side1")
+	}
+	timeOutQueue(t, s, plan.ID)
+	waitFor(t, "the timed-out start told to its supervising conversation", func() bool {
+		return len(supervisionTo(f, "side1", sigFailed)) == 1
+	})
+	if cur := todoNow(s, task.ID); !cur.failedStart() || len(cur.Agents) != 0 {
+		t.Fatalf("expected a failed start with no Agent, got %+v", cur)
+	}
+
+	checkRemedyRefused(t, s, "side2", "task_retry", task.ID, "task's current supervising conversation")
+	busyHealthy(d)
+	checkTaskRetried(t, s, "side1", task.ID, "a new tab")
+}
+
+func TestMainRetriesAnotherConversationsTask(t *testing.T) {
+	for _, archive := range []bool{false, true} {
+		name := "override"
+		if archive {
+			name = "after handover"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, f := sideRemedyService(t)
+			f.mu.Lock()
+			f.failStart = errors.New("the Agent could not start")
+			f.mu.Unlock()
+			task := startSideTask(t, s)
+			waitFor(t, "a failed start", func() bool { return todoNow(s, task.ID).failedStart() })
+			if archive {
+				if _, err := s.setArchived(t.Context(), "server", "side1", true, titleByUser); err != nil {
+					t.Fatal(err)
+				}
+				if got := supervisorOf(todoNow(s, task.ID)); got != "conv1" {
+					t.Fatalf("failed start handed to %q, want conv1", got)
+				}
+				checkRemedyRefused(t, s, "side1", "task_retry", task.ID, "Ask the main conversation")
+			}
+			f.mu.Lock()
+			f.failStart = nil
+			f.mu.Unlock()
+			checkTaskRetried(t, s, "conv1", task.ID, "a new tab")
+		})
+	}
+}
+
+func TestFormerSideSupervisorCannotRemedy(t *testing.T) {
+	s, f := sideRemedyService(t)
+	f.mu.Lock()
+	f.failStart = keptRefusal(proto.CodeShellWaiting)
+	f.mu.Unlock()
+	task := startSideTask(t, s)
+	waitFor(t, "the kept start told to its supervising conversation", func() bool {
+		return len(supervisionTo(f, "side1", sigFailed)) == 1
+	})
+	if _, err := s.setArchived(t.Context(), "server", "side1", true, titleByUser); err != nil {
+		t.Fatal(err)
+	}
+	if got := supervisorOf(todoNow(s, task.ID)); got != "conv1" {
+		t.Fatalf("kept start handed to %q, want conv1", got)
+	}
+	for _, name := range []string{"task_start_screen", "task_start_keys", "task_retry"} {
+		checkRemedyRefused(t, s, "side1", name, task.ID, "Ask the main conversation")
 	}
 }

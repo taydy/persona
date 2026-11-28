@@ -1,16 +1,22 @@
+import type { AgentPhase, AgentView } from "./agent-view-wire";
 import type { UsageCard } from "./tokens";
 import type { RuleSuggestion } from "./rule-suggestion";
 // The hub's wire types (docs/protocol/protocol.md). Only the fields the web client reads.
 
-export type AgentState = "needs_you" | "working" | "unread" | "idle" | "offline" | "unknown";
+/** Frozen Session.state and the host-state filters on older paging endpoints. */
+export type AgentState = NonNullable<Session["state"]>;
+export type StatusMarkState = AgentPhase | AgentState;
 
-/** An engine as the machine's node found it (docs/integrations/engines.md): `note` says why one that is there cannot be used. */
+/** An engine as the machine's node found it (docs/integrations/engines.md): `note` says why one that is there cannot be used.
+ *  `state` (Orca's row only, #17037; proto.EngineState) tells installed-and-stopped from not there; read it through
+ *  engines.ts `engineState`, which turns a state this client does not know into "unknown". */
 export interface DetectedEngine {
   id: string;
   name: string;
   available: boolean;
   version?: string;
   note?: string;
+  state?: string;
 }
 
 export interface Machine {
@@ -29,8 +35,10 @@ export interface Machine {
   deploying?: boolean;
   can_deploy?: boolean;
   deploy_reason?: string;
-  deploy_phase?: "waiting_idle" | "transferring" | "restarting" | "confirming";
+  deploy_phase?: "waiting_idle" | "transferring" | "draining" | "restarting" | "confirming";
   deploy_error?: string;
+  /** Where the owning assistant obtained the program for this deployment, when known. */
+  deploy_source?: "hub_package" | "local_build";
   system?: { name?: string; model?: string; cpu?: string; cores?: number; memory?: number };
   /** The terminal engine its sessions come from (herdr when absent); `engines`: what its node found, empty while offline. */
   engine?: string;
@@ -42,6 +50,10 @@ export interface Machine {
   engine_suggested?: { hosts: string[]; default: string };
   /** The node is too old for sets and runs `engine` alone until it is updated. */
   engine_sets_unsupported?: boolean;
+  /** "Start new Agents as Orca chats" (#17650): the switch, on or off, present only while Orca is in its engine set (where
+   *  it applies); absent elsewhere and from older hubs, which then offer no switch. A value this client does not know reads
+   *  as absent (lib/orca-chat.ts orcaChatSwitch). Changed with PUT …/orca-chat-starts {"on"}. */
+  orca_chat_starts?: OrcaChatStarts;
   kind?: string;
   arch?: string;
   home?: string;
@@ -68,6 +80,9 @@ export interface Machine {
    *  hour after a switch ended; absent from older hubs, which then offer nothing. */
   link_switch?: MachineLinkSwitch;
 }
+
+/** `Machine.orca_chat_starts` (#17650, `proto.OrcaChatStarts`): a closed set; a later value reads as absent. */
+export type OrcaChatStarts = "on" | "off";
 
 /** Where switching an ssh computer to Persona Link stands (`proto.MachineLinkSwitch`): `available`, a switch can start
  *  now, else `reason` says why not; `phase`, the current or last switch's ("" none), and a failed one's `error`, with
@@ -132,6 +147,9 @@ export interface ModelPick {
   launcher: string;
   model?: string;
   effort?: string;
+  /** The four dimensions' runtime and channel (lib/execution.ts); the hub projects them from the launcher, and back. */
+  runtime?: string;
+  channel?: string;
 }
 
 /** Session.pending_switch (#5035). `agent` is set on a switch to the other engine (feature `engine_switch`, #5054):
@@ -185,6 +203,8 @@ export interface SessionCapabilities {
 /** A session's work state (docs/assistant/agent-work.md): working, blocked on a named precondition, or done. */
 export interface WorkState {
   phase: "working" | "blocked" | "done" | "";
+  /** End of this turn, unlike state_since which changes when a reply is read or the hub restarts. */
+  turn_at?: string;
   /** What a blocked one waits on: user (a decision), agent, external (a deploy, CI, a time), transient (a model error). */
   on?: "user" | "agent" | "external" | "transient";
   /** One line for the lists: what it waits for, or what it concluded. */
@@ -283,7 +303,10 @@ export interface Session {
   /** The failed start's coded refusal (launcher_missing, claude_missing…) and its details; start_error is the hub's sentence for it. */
   start_error_code?: string;
   start_error_args?: Record<string, string>;
-  state?: AgentState;
+  state?: Extract<AgentPhase, "needs_you" | "working" | "idle"> | "unread" | "offline" | "unknown";
+  view?: AgentView;
+  /** Local seen-outbox overlay until the manager acknowledges the read. */
+  locallySeen?: boolean;
   state_since?: string;
   agent?: string;
   agent_name?: string;
@@ -319,6 +342,12 @@ export interface Session {
    *  once its turn is over, resuming the same conversation (#6476, node/mode_restart.go); `permission_mode` is the mode
    *  it still runs in until then. */
   bypass_pending?: boolean;
+  /** On a botmux session whose sends go through the untrusted external-event trigger (botmux does not advertise
+   *  ownerActor, or no BotMux Owner Union ID is set), the composer shows a one-line notice. */
+  botmux_external_trigger?: boolean;
+  /** Why, when `botmux_external_trigger` is set: `upgrade` (botmux before 3.59.23) or `owner_unset` (Settings › Agents
+   *  has no BotMux Owner Union ID). Absent from an older node: the upgrade notice. */
+  botmux_external_trigger_reason?: "upgrade" | "owner_unset";
   /** What the model saw in the latest reply and the model's window, in tokens (#2430); omitted while the node cannot tell. */
   context_tokens?: number;
   context_restart_recommended?: boolean;
@@ -420,12 +449,20 @@ export interface Session {
   /** Newest running workflow, compact metadata only (no agents, phases or tools). */
   workflow_progress?: Workflow;
   parent_session_id?: string;
+  /** Parent session's machine ID when a subagent runs on another computer (empty = same machine). */
+  parent_machine_id?: string;
   root_session_id?: string;
   is_subagent?: boolean;
   /** The listed session this child folds under (an Agent another Agent started: a Codex subagent, an Agent a Paseo Agent
-   *  created), set by the hub's manager (docs/protocol/protocol.md "Session hierarchy", #5120): the web never lists or
-   *  counts it on its own, and draws it as a card in that session's chat. */
+   *  created, or an A2A subagent), set by the hub's manager (docs/protocol/protocol.md "Session hierarchy", #5120): the
+   *  web never lists or counts it on its own, and draws it under that session. */
   folded_under?: string;
+  /** Machine ID of `folded_under` when folded across computers (empty = same machine). */
+  folded_under_machine_id?: string;
+  /** A2A task ID that launched this subagent, if any. */
+  a2a_task_id?: string;
+  /** How this subagent session was created (`"a2a" | "dispatch" | "spawned" | "runtime"`). */
+  subagent_origin?: string;
   /** The session on the same machine this one is drawn under while staying a session of its own (#5935): a Claude
    *  desktop app's side chat, /btw question or spawned session names the one it was started from. Unlike `folded_under`
    *  it folds nothing away: the row keeps its state and counts and only moves under its parent, a level in
@@ -456,6 +493,9 @@ export interface Session {
   /** Working only because of background commands that only wait (sleep, a check loop, gh … --watch; #6045): shown
    *  as "Waiting in the background", lighter, and not counted as Working. An older hub never sends it. */
   background_waiting?: boolean;
+  /** Working on background commands that have used no CPU and written no output since this time (#13744; a known
+   *  worker, set once that has lasted ten minutes, omitted otherwise). The state is still Working: a hint, not a state. */
+  background_stalled_since?: string;
   rev?: number;
   suggestion?: string;
   /** The suggestion names a command, a path, a link, a secret-looking string or a risky action (#4644): it is filled
@@ -484,7 +524,7 @@ export interface Session {
   channels?: string[];
   todo?: { id: string; title: string };
   /** Display-only completed association; never an active task or a reason to suppress notifications. */
-  completed_todo?: { id: string; title: string };
+  completed_todo?: { id: string; title: string; cancelled?: boolean };
   /** Works (or worked) for a quiet task (#1731): not in the global badge; the main conversation tells about it. */
   quiet?: boolean;
   /** Why it waits for the user, in its host's words (a botmux attention's reason); only while it needs you (docs/integrations/engines.md "botmux"). */
@@ -687,6 +727,14 @@ export interface FoldSource {
   title?: string;
 }
 
+/** An out-of-band declarative view attached by a tool call in a folded run (#14730); never sent to model runtimes. */
+export interface FoldToolView {
+  item_id?: string;
+  tool_use_id?: string;
+  tool?: string;
+  view: Record<string, unknown>;
+}
+
 /** What model requests used (proto.TokenUsage): tokens by kind, `in` without the cache; `cache_write_1h` is the part of
  *  `cache_write` written for an hour; `fast`: Claude Code's fast speed. Entries with the same `id` (and model) are one
  *  report, counted once. */
@@ -699,6 +747,24 @@ export interface TokenUsage {
   cache_write?: number;
   cache_write_1h?: number;
   fast?: boolean;
+}
+
+/** proto.Botmux: a BotMux-wrapped item's own words and the facts shown as tags. */
+export interface Botmux {
+  kind: "message" | "trigger" | "reply";
+  text: string;
+  sender?: string;
+  sender_type?: string;
+  quoted?: boolean;
+  topic_context?: boolean;
+  thread?: boolean;
+  attachments?: number;
+  attachment_meta?: { kind: string; name?: string; mime_type?: string }[];
+  mentions?: string[];
+  source?: string;
+  final?: boolean;
+  voice?: boolean;
+  truncated?: boolean;
 }
 
 export interface Item {
@@ -722,13 +788,18 @@ export interface Item {
   narration?: boolean;
   codex_heartbeat_quiet?: boolean;
   task?: TaskNote;
-  fold?: { items: number; tools: number; thoughts: number; until?: string; through_seq: number; through_id?: string; images?: FoldImage[]; tasks?: FoldTaskSnapshot[]; latest_thinking?: Item; supervision_user?: boolean; changes?: FoldChange[] | null; usage?: TokenUsage[]; sources?: FoldSource[] };
+  fold?: { items: number; tools: number; thoughts: number; until?: string; through_seq: number; through_id?: string; images?: FoldImage[]; tasks?: FoldTaskSnapshot[]; latest_thinking?: Item; supervision_user?: boolean; changes?: FoldChange[] | null; usage?: TokenUsage[]; sources?: FoldSource[]; botmux?: Botmux[]; tool_views?: FoldToolView[] };
+  /** Out-of-band declarative UI views returned by a tool call (#14730); never sent to model runtimes. */
+  tool_views?: unknown[];
   image?: { mime: string; data?: string; lazy?: boolean; size?: number; width?: number; height?: number };
   /** A Codex visualize marker (kind "visualization"): a self-contained HTML fragment on the node, fetched through the
    *  session visualization route. `mode` is "wide" or absent; the bytes are never carried here. */
   visualization?: { path: string; mode?: string; title?: string };
   /** Sent by another Claude session (cross-session messaging), not typed by you: its name. */
   from?: string;
+  /** What a BotMux-wrapped message or `botmux send` call says without BotMux's blocks (docs/protocol/protocol.md
+   *  "BotMux messages"); `text` stays the original. Absent from older nodes. */
+  botmux?: Botmux;
   /** The client_msg_id of the message this came from, as the hub tied it (every item of it: the text, its images, a
    *  queued copy, or the notice it became); older hubs never send it (lib/echo.ts). */
   client_msg_id?: string;
@@ -887,6 +958,9 @@ export interface SessionChildren {
 }
 
 export const SESSION_REVIEW_FEATURE = "session_review";
+/** The hub feature that says it has git/review (lib/session-review.ts). Here, not there, so the chat's check for it
+ *  keeps session-review.ts off the first screen. */
+export const REVIEW_FEATURE = "git_review";
 export const SESSION_REVIEW_TOOL = "persona_session_review";
 
 export function isSessionReview(ix: Pick<Interaction, "kind" | "tool_name">): boolean {
@@ -895,6 +969,8 @@ export function isSessionReview(ix: Pick<Interaction, "kind" | "tool_name">): bo
 
 export interface Interaction {
   id: string;
+  /** Authoritative interaction for a display-only copy; aggregates count only cards without this field. */
+  mirror_of?: string;
   /** The manager it belongs to (docs/protocol/protocol.md "Per-manager routing"); none: the default one. */
   manager?: string;
   machine_id: string;
@@ -903,8 +979,15 @@ export interface Interaction {
   cwd?: string;
   kind: "question" | "plan" | "permission" | "screen" | "elicitation";
   created_at?: string;
+  expires_at?: string;
+  seen_at?: string;
+  seen_ttl_seconds?: number;
   tool_name?: string;
+  /** The transcript call that raised this card, when its runtime supplies one. */
+  tool_use_id?: string;
   questions?: Question[];
+  /** The hub accepts a bare cancellation for this question. */
+  can_cancel?: boolean;
   plan?: string;
   /** The permission mode a plan-mode session goes on in once this plan is approved (#3784). */
   plan_then?: string;
@@ -954,6 +1037,8 @@ export interface Interaction {
   agent_type?: string;
   /** The session the card's session folds under (Session.folded_under, #5120): the card's home is that session's page. */
   folded_under?: string;
+  /** Machine ID of `folded_under` when the card's session folds under a parent on another computer (empty = same machine). */
+  folded_under_machine_id?: string;
   /** Session.folded_as of the card's session (#5180): `"worker"` when a lead's worker asks, `"side"` when a side
    *  session does (#7944). */
   folded_as?: "worker" | "side";
@@ -962,6 +1047,9 @@ export interface Interaction {
   elicitation?: Elicitation;
   /** Whether this assistant-owned operation can take a non-final owner question. */
   can_clarify?: boolean;
+  /** True when the card has no interactive computer terminal or UI to hand back to (headless assistant, command gates,
+   *  manager-owned cards, headless ACP companions like AGY, Grok, and builtin OpenCode); absent/false keeps "Leave to computer". */
+  no_hand_back?: boolean;
   /** What a permission card needs filled in before it is approved (a password): such a card is never approved in one tap. */
   fields?: { key: string; label: string; secret?: boolean }[];
   /** The assistant is deciding whether it may answer this question for the user (docs/assistant/assistant.md "Assistant
@@ -1033,6 +1121,21 @@ export interface LauncherHealth {
   checked_at?: string;
 }
 
+export type TodosV2AutoSeen = "off" | "subtasks" | "all_autonomous";
+export type TodosV2PendingReviewSLAHours = 0 | 12 | 24 | 48;
+export type TodosV2CanWaitSLAHours = 0 | 24 | 48 | 72;
+export type TodosV2DigestWindowMinutes = 0 | 30 | 60 | 120;
+
+/** Additive user-configurable attention preferences under todos_v2 (#16098, #16111, #16433). */
+export interface TodosV2AttentionPrefs {
+  todos_v2_auto_seen?: TodosV2AutoSeen;
+  todos_v2_pending_review_sla_hours?: TodosV2PendingReviewSLAHours;
+  todos_v2_can_wait_sla_hours?: TodosV2CanWaitSLAHours;
+  todos_v2_fold_children?: boolean;
+  todos_v2_quiet_hours?: string;
+  todos_v2_digest_window_minutes?: TodosV2DigestWindowMinutes;
+}
+
 export interface AssistantInfo {
   /** The manager that answered, including the default whose request carried no manager header. */
   manager?: string;
@@ -1044,11 +1147,13 @@ export interface AssistantInfo {
   timezone?: string;
   notes?: string;
   notes_effective?: string;
-  /** The side conversations the user made leaders (docs/assistant/unified-entry.md "Leader conversations"): absent
-   *  when there are none or from an older hub. The sidebar shows them first among the Persona chats, as pinned. */
+  /** The current directions' opaque ids, in hub order: a conversation-backed id indexes `conversations`; an external
+   *  one has no Persona conversation and gets its target from the direction tree or `/assistant/leaders` (#8236). */
   leaders?: string[];
   /** "Fold background rounds" in effect (#4314, docs/assistant/assistant.md "Background rounds"); absent from an older hub, which means on. */
   main_background_folded?: boolean;
+  /** Opt-in to fold routine relay replies and skip their finished notification in the main conversation. */
+  fold_routine_relay_replies?: boolean;
   /** "Show scheduled task chats" in the sidebar's Recent (#8324, lib/recent-task-chats.ts): one value on the hub for all
    *  of the user's devices, off by default; absent from an older hub (no switch, and Recent leaves them out). */
   recent_task_chats?: boolean;
@@ -1063,6 +1168,25 @@ export interface AssistantInfo {
   /** The background supervisor's conversation (#4927, lib/background-supervisor.ts): its session id once the hub made
    *  it; absent before that and from an older hub. Read-only. */
   background_supervisor?: string;
+  /** Unified experimental To-dos & Tasks Labs toggle (#14538, #14584); off by default and absent from older hubs. */
+  todos_v2?: boolean;
+  /** Auto-clear unseen badges for autonomously completed to-dos under todos_v2 (#16098, #16111); defaults to "all_autonomous". */
+  todos_v2_auto_seen?: TodosV2AutoSeen;
+  /** Quiet window in hours before pending_review escalates to needs_you under todos_v2 (#16098, #16111); defaults to 24. */
+  todos_v2_pending_review_sla_hours?: TodosV2PendingReviewSLAHours;
+  /** Deferral window in hours before non-urgent can_wait decisions escalate under todos_v2 (#16098, #16111); defaults to 48. */
+  todos_v2_can_wait_sla_hours?: TodosV2CanWaitSLAHours;
+  /** Fold non-urgent child tasks under top-level goals in board projection under todos_v2 (#16098, #16111); defaults to true. */
+  todos_v2_fold_children?: boolean;
+  /** Daily quiet-hours window ("HH:MM-HH:MM" 24h range with distinct start/end, or "" for off) under todos_v2 (#16433). */
+  todos_v2_quiet_hours?: string;
+  /** Digest batching window in minutes (0, 30, 60, or 120) for non-urgent notifications under todos_v2 (#16433). */
+  todos_v2_digest_window_minutes?: TodosV2DigestWindowMinutes;
+  /** Unified experimental Integrations & Extensions Labs toggle (#14802, #14805); off by default and absent from older hubs. */
+  integrations_v2?: boolean;
+  work_guide?: boolean;
+  /** Additive receipts for Labs experiments. Older managers omit the field. */
+  labs_seen?: string[];
   conversations: Session[];
 }
 
@@ -1136,4 +1260,20 @@ export interface UndeliveredMessage {
   /** Held for an Agent while its computer was away (#10661): that computer's name. `error` is then the whole line to
    *  show under the bubble, and Retry / Delete go to the session's held routes (lib/undelivered-actions.ts). */
   computer?: string;
+  /** Set on an input of a logical conversation's delivery queue (docs/operations/logical-input-reconciliation.md
+   *  "Delivery deadline"): why it has not gone in yet. `error` is still the server's line for it. */
+  reason?: UndeliveredReason;
+  /** When the current wait began (the dispatch, the queueing, or the expiry). */
+  since?: string;
+  /** awaiting_receipt: when it stops waiting for its receipt and expires. Nothing is sent twice. */
+  deadline?: string;
+  /** How many inputs wait before this one / after the one awaiting its receipt. */
+  ahead?: number;
+  behind?: number;
+  /** The client_msg_id of the input a queued one waits behind. */
+  blocked_by?: string;
 }
+
+/** Why a logical conversation's input has not gone in (proto.UndeliveredReason). receipt_expired is `failed`: it may
+ *  have gone in, so the owner looks and picks Retry (sent once more, last in the queue) or Ignore; the rest wait. */
+export type UndeliveredReason = "awaiting_receipt" | "behind_unconfirmed" | "switch_pending" | "queued" | "receipt_expired";

@@ -1,10 +1,28 @@
 import SwiftUI
-#if os(macOS)
-import AppKit
-#endif
 
 /// Every hit region of a worktree shares these commands and the exact host-owned creation target.
 struct WorktreeSidebarMenu: View, Equatable {
+    enum Command: CaseIterable {
+        case open, newSession, newChild, rename, copyPath, copyName, openParent
+
+        var title: LocalizedStringResource {
+            switch self {
+            case .open: "Open Tree [Agent Menu]"
+            case .newSession: "New Session [Agent Menu]"
+            case .newChild: "New Child Worktree"
+            case .rename: "Rename Worktree"
+            case .copyPath: "Copy Path"
+            case .copyName: "Copy Name [Agent Menu]"
+            case .openParent: "Open Parent [Agent Menu]"
+            }
+        }
+
+        func label(_ symbol: String) -> some View {
+            Label { Text(title) } icon: { Image(systemName: symbol) }
+                .lineLimit(1)
+        }
+    }
+
     nonisolated let workspace: HostWorkspace
     nonisolated let parent: HostWorkspace?
     nonisolated let sessions: [Session]
@@ -38,38 +56,38 @@ struct WorktreeSidebarMenu: View, Equatable {
     var body: some View {
         Section {
             Button { open(workspace) } label: {
-                Label(String(localized: "worktree.open", defaultValue: "Open Worktree"), systemImage: Theme.Icon.openSpace)
+                Command.open.label(Theme.Icon.openSpace)
             }
             .accessibilityIdentifier("worktree.open")
             Button { newSession(workspace) } label: {
-                Label("New Session [Chats View 58e21b]", systemImage: Theme.Icon.compose)
+                Command.newSession.label(Theme.Icon.compose)
             }
             .disabled(!workspace.online || !workspace.available || workspace.cwd.isEmpty)
             .accessibilityIdentifier("workspace.newSession")
             Button { newChild(workspace) } label: {
-                Label(String(localized: "workspace.newChild", defaultValue: "New Child Worktree…"), systemImage: Theme.Icon.newWorktree)
+                Command.newChild.label(Theme.Icon.newWorktree)
             }
             .disabled(!workspace.online || !workspace.available)
             .accessibilityIdentifier("workspace.newChild")
             Button { rename(workspace) } label: {
-                Label(String(localized: "worktree.rename", defaultValue: "Rename Worktree…"), systemImage: Theme.Icon.edit)
+                Command.rename.label(Theme.Icon.edit)
             }
             .disabled(!workspace.online || !workspace.available)
             .accessibilityIdentifier("worktree.rename")
         }
         Section {
             Button { UIPasteboard.general.string = workspace.cwd } label: {
-                Label("Copy Path", systemImage: Theme.Icon.copy)
+                Command.copyPath.label(Theme.Icon.copy)
             }
             .disabled(workspace.cwd.isEmpty)
             .accessibilityIdentifier("worktree.copyPath")
             Button { UIPasteboard.general.string = workspace.title } label: {
-                Label(String(localized: "worktree.copyName", defaultValue: "Copy Worktree Name"), systemImage: Theme.Icon.copy)
+                Command.copyName.label(Theme.Icon.copy)
             }
             .accessibilityIdentifier("worktree.copyName")
             if let parent {
                 Button { open(parent) } label: {
-                    Label(String(localized: "worktree.openParent", defaultValue: "Open Parent Worktree"), systemImage: Theme.Icon.parentFolder)
+                    Command.openParent.label(Theme.Icon.parentFolder)
                 }
                 .accessibilityIdentifier("worktree.openParent")
             }
@@ -81,11 +99,7 @@ struct WorktreeSidebarMenu: View, Equatable {
                 ForEach(sessions) { session in
                     Menu { agentMenu(session) } label: {
                         Label { Text(session.title).lineLimit(1) } icon: {
-                            #if os(macOS)
-                            menuIcon(session)
-                            #else
                             AgentMark(session)
-                            #endif
                         }
                     }
                 }
@@ -95,26 +109,10 @@ struct WorktreeSidebarMenu: View, Equatable {
 
     @ViewBuilder private func agentMenu(_ session: Session) -> some View {
         #if os(iOS)
-        AgentActionMenuReader(session: session, handlers: handlers)
+        AgentActionMenuReader(session: session, fromWorktreeSubmenu: agent == nil, handlers: handlers)
         #else
         if let menu = menus.first(where: { $0.key == session.key }) { menu.equatable() }
         #endif
     }
 
-    #if os(macOS)
-    /// NSHostingMenu extracts an Image's native size, ignoring AgentMark's SwiftUI frame.
-    private func menuIcon(_ session: Session) -> Image {
-        let kind = AgentKind(session)
-        guard let brand = kind.brand, let source = NSImage(named: brand) else {
-            return Theme.Icon.image(Theme.Icon.commandLine)
-        }
-        let size = NSSize(width: Theme.Size.markS, height: Theme.Size.markS)
-        let image = NSImage(size: size, flipped: false) { rect in
-            source.draw(in: rect)
-            return true
-        }
-        image.isTemplate = brand != Theme.Brand.claude
-        return Image(nsImage: image)
-    }
-    #endif
 }

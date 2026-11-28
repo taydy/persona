@@ -3,29 +3,32 @@ package assistant
 import (
 	"context"
 	"slices"
-	"strings"
 
 	"github.com/nwverse/persona/server/internal/channel"
 )
 
-type channelAdmissionKey struct {
-	channel, thread string
-	generation      uint64
-}
-
 type channelAdmission struct {
-	key        channelAdmissionKey
-	prev, done chan struct{}
+	binding     threadBindingRef
+	reservation threadBindingReservation
 }
 
 // admitChannelMessage claims the message, captures its binding generation and reserves its position atomically.
 // No node or channel RPC runs under the book lock. Reserve before persisting the claim so a later command cannot
 // overtake a durable receipt. A failed write rolls both changes back for redelivery.
-func (s *Service) admitChannelMessage(id string, m channel.Message) (*channelAdmission, error) {
+func (s *Service) admitChannelMessage(ctx context.Context, id string, m channel.Message) (*channelAdmission, error) {
+	v2 := s.integrationsV2On(ctx)
+	var v channel.View
+	if v2 {
+		var err error
+		v, _, err = s.pluginChannelNow(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+	}
 	c := &s.chans
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s.loadChannelStateLocked(context.Background())
+	s.loadChannelStateLocked(ctx)
 	if !c.stLoaded {
 		return nil, errChannelsUnread
 	}
@@ -33,15 +36,11 @@ func (s *Service) admitChannelMessage(id string, m channel.Message) (*channelAdm
 	if m.ID == "" || slices.Contains(seen, m.ID) {
 		return nil, nil
 	}
-	a := &channelAdmission{key: channelAdmissionKey{channel: id, thread: strings.TrimSpace(m.Thread), generation: c.generation[id]}}
-	if a.key.thread != "" {
-		if c.receiving == nil {
-			c.receiving = map[channelAdmissionKey]chan struct{}{}
-		}
-		a.prev = c.receiving[a.key]
-		a.done = make(chan struct{})
-		c.receiving[a.key] = a.done
+	binding, err := s.resolveThreadBindingLocked(ctx, id, m, v, v2)
+	if err != nil {
+		return nil, err
 	}
+	reservation := c.bindings.reserve(binding)
 	next := append(seen, m.ID)
 	if len(next) > channelSeenKeep {
 		next = next[len(next)-channelSeenKeep:]
@@ -53,44 +52,20 @@ func (s *Service) admitChannelMessage(id string, m channel.Message) (*channelAdm
 		} else {
 			delete(c.st.Seen, id)
 		}
-		if a.done != nil {
-			if a.prev == nil {
-				delete(c.receiving, a.key)
-			} else {
-				c.receiving[a.key] = a.prev
-			}
-		}
+		c.bindings.rollback(reservation)
 		return nil, err
 	}
-	return a, nil
+	return &channelAdmission{binding: binding, reservation: reservation}, nil
 }
 
-// run keeps one binding generation's thread ordered. A new binding never waits for an old generation's RPC.
-// The routing code still gates destinations on the channel's threads capability.
+// run keeps one binding generation's ordinary route or thread ordered. A new binding never waits for an old generation's RPC.
 func (a *channelAdmission) run(s *Service, m channel.Message, action string) {
-	if a.done != nil {
-		defer func() {
-			c := &s.chans
-			c.mu.Lock()
-			if c.receiving[a.key] == a.done {
-				delete(c.receiving, a.key)
-			}
-			close(a.done)
-			c.mu.Unlock()
-		}()
-	}
-	if a.prev != nil {
-		<-a.prev
-	}
-	s.channelReceiveInGeneration(a.key.channel, m, action, a.key.generation)
-}
-
-func (s *Service) channelGeneration(id string) uint64 {
-	s.chans.mu.Lock()
-	defer s.chans.mu.Unlock()
-	return s.chans.generation[id]
-}
-
-func (s *Service) channelGenerationCurrent(id string, generation uint64) bool {
-	return s.channelGeneration(id) == generation
+	defer func() {
+		c := &s.chans
+		c.mu.Lock()
+		c.bindings.release(a.reservation)
+		c.mu.Unlock()
+	}()
+	a.reservation.wait()
+	s.receiveChannelMessage(a.binding, m, action)
 }

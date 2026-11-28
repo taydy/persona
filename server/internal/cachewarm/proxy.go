@@ -80,6 +80,12 @@ func New(session, upstream string, logf func(string, ...any)) (*Proxy, error) {
 			r.Out.URL.RawPath = strings.TrimPrefix(r.Out.URL.RawPath, p.prefix)
 			r.SetURL(u)
 			r.Out.Host = u.Host
+			// The response tap reads message_start from the stream. Claude Code asks for gzip, br and zstd, which
+			// the transport would hand back undecoded; a compressed stream never armed a refresh. Loopback to the
+			// CLI needs no compression, so ask the provider for identity (the transport adds no encoding of its own).
+			if r.Out.Method == http.MethodPost && strings.HasSuffix(r.Out.URL.Path, "/messages") {
+				r.Out.Header.Del("Accept-Encoding")
+			}
 		},
 		Transport: roundTripper{p, transport},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
@@ -202,13 +208,17 @@ func (p *Proxy) Tick(ctx context.Context, now time.Time, policy *assistantwire.C
 		p.mu.Unlock()
 		return
 	}
+	if p.checking {
+		p.mu.Unlock()
+		return
+	}
 	c := p.last
 	if p.attempts >= policy.MaxRequests {
 		p.forgetLocked()
 		p.mu.Unlock()
 		return
 	}
-	if !idle || p.blocked || p.checking || p.active != 0 || c == nil || now.Before(p.next.Add(time.Duration(policy.IntervalMinutes)*time.Minute)) {
+	if !idle || p.blocked || p.active != 0 || c == nil || now.Before(p.next.Add(time.Duration(policy.IntervalMinutes)*time.Minute)) {
 		p.mu.Unlock()
 		return
 	}
@@ -312,7 +322,23 @@ func (rt roundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	tap := &responseTap{p: p, c: c, valid: valid, stream: strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")}
 	originalBody := resp.Body
-	resp.Body = &teeBody{Reader: io.TeeReader(originalBody, tap), Closer: closeFunc(func() error { p.mu.Lock(); p.active--; p.mu.Unlock(); return originalBody.Close() })}
+	if originalBody == nil {
+		originalBody = http.NoBody
+	}
+	var closeOnce sync.Once
+	var closeErr error
+	resp.Body = &teeBody{
+		Reader: io.TeeReader(originalBody, tap),
+		Closer: closeFunc(func() error {
+			closeOnce.Do(func() {
+				p.mu.Lock()
+				p.active--
+				p.mu.Unlock()
+				closeErr = originalBody.Close()
+			})
+			return closeErr
+		}),
+	}
 	return resp, nil
 }
 

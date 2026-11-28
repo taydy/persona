@@ -18,9 +18,9 @@ data class NeedsYouRow(val key: SessionKey, val cards: List<Interaction>, val si
         get() = cards.singleOrNull()?.takeIf { it.sessionId.isEmpty() }?.let { "card:${it.id}" } ?: "agent:${key.path}"
 }
 
-/** The cards the Agents tab lists: none of the Persona tab's own conversations. */
+/** The Agents tab lists one authoritative card per request, none of the Persona tab's own conversations. */
 fun needsYouCards(cards: List<Interaction>, sessions: Map<SessionKey, Session>): List<Interaction> =
-    cards.filter { (sessions[it.homeKey] ?: sessions[it.sessionKey])?.assistant != true }
+    cards.filter { !it.isDisplayMirror && (sessions[it.homeKey] ?: sessions[it.sessionKey])?.assistant != true }
 
 /** The sessions that wait for the user whether or not a card was read; never the Persona tab's own conversations. */
 fun needsYouWaiting(sessions: List<Session>): List<Session> =
@@ -47,7 +47,7 @@ fun needsYouRows(cards: List<Interaction>, waiting: List<Session>): List<NeedsYo
         }
     }
     waiting.forEach { session ->
-        val home = session.foldedUnder?.takeIf(String::isNotBlank)?.let { SessionKey(session.machineId, it) } ?: session.key
+        val home = session.foldedUnderKey ?: session.key
         if (home !in at) {
             at[home] = rows.size
             rows += NeedsYouRow(home, emptyList(), parseTime(session.stateSince ?: session.updatedAt))

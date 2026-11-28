@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nwverse/persona/server/internal/assistant/repositorystore"
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
@@ -27,8 +28,10 @@ func waitReportQueue(t *testing.T, s *Service) {
 // By default a task's turns are not pushed: a finished turn (whatever the agent said, a merged PR, "收工"), an
 // interruption and a closing by the judge are execution steps.
 func TestGoalReportsSkipExecutionSteps(t *testing.T) {
-	s, f, posts := reportServiceWith(t, goalFeatures)
+	s, f, posts := reportServiceWith(t, goalFeatures, repositorystore.New(todoTestDB(t)))
 	todo := startedTask(t, s, f)
+	artifactNodeProof(f, "https://github.com/o/r/pull/901", "contributor", "contributor",
+		"fix/login", "fix/login", "abc", "abc")
 	agentTurn(s, f, proto.StatusWorking, "", 0)
 	agentTurn(s, f, proto.StatusDone, "好的，收工。https://github.com/o/r/pull/901 已合并，临时 worktree 清掉了", 0)
 	waitReportQueue(t, s)
@@ -46,6 +49,7 @@ func TestGoalReportsSkipExecutionSteps(t *testing.T) {
 
 // A decision is pushed as its own answerable card, with no task report line around it.
 func TestGoalReportsDecisionIsItsOwnCard(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, posts := reportServiceWith(t, goalFeatures)
 	todo := startedTask(t, s, f)
 	agentTurn(s, f, proto.StatusBlocked, "", 1)
@@ -65,6 +69,7 @@ func TestGoalReportsDecisionIsItsOwnCard(t *testing.T) {
 // goal, where it is and the evidence with a link — no stage bar, no agent's words. It is told once; a finished turn
 // starts the count again.
 func TestGoalReportsStuckSaysGoalNowEvidence(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, posts := reportServiceWith(t, goalFeatures)
 	todo := startedTask(t, s, f)
 	s.taskReport(todo, reportFailed, "box", [2]string{}, "那台电脑离线", nil)
@@ -111,6 +116,7 @@ func TestGoalReportsStuckSaysGoalNowEvidence(t *testing.T) {
 
 // report_steps brings the card back as it was: a finished turn with the stage bar and what the agent said.
 func TestReportStepsSwitchBringsBackTheOldCard(t *testing.T) {
+	needsLarkLayer(t)
 	feats := goalFeatures
 	feats.ReportSteps = true
 	s, f, posts := reportServiceWith(t, feats)
@@ -125,6 +131,7 @@ func TestReportStepsSwitchBringsBackTheOldCard(t *testing.T) {
 
 // The conclusion card says the goal, where it is now — with how far the work went out — and the evidence's link.
 func TestConclusionCardSaysGoalNowEvidence(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, todo, posts, _ := conclusionService(t, true)
 	waitsForReview(t, s, f, todo.ID, "查完了，见 https://docs.example.com/plan")
 	s.setTaskStage(context.Background(), todo.ID, "verify", "")
@@ -141,6 +148,7 @@ func TestConclusionCardSaysGoalNowEvidence(t *testing.T) {
 
 // Cuts that come quickly — the one making the task stuck replaced by a later one before the card went out — still tell it.
 func TestGoalReportsStuckSurvivesQuickCuts(t *testing.T) {
+	needsLarkLayer(t)
 	s, f, posts := reportServiceWith(t, goalFeatures)
 	todo := startedTask(t, s, f)
 	for i := 0; i < reportStuckAfter+2; i++ {

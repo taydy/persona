@@ -142,10 +142,6 @@ struct ExtensionRemoteImage: View {
         .task(id: Request(url: url, pixels: Int(ceil(points * displayScale * Theme.sizeScale(typeSize))))) {
             image = nil
             failed = false
-            #if DEBUG && os(macOS)
-            let captureLoad = MacExtensionSnapshotBatch.beginImageLoad(url)
-            defer { MacExtensionSnapshotBatch.finishImageLoad(captureLoad, loaded: image != nil) }
-            #endif
             let pixels = Int(ceil(points * displayScale * Theme.sizeScale(typeSize)))
             guard let cg = await ExtensionImageCache.shared.image(url, maxPixel: pixels) else {
                 if !Task.isCancelled { failed = true }
@@ -196,6 +192,8 @@ struct ExtensionMarkdown: View {
                 return .handled
             })
             .accessibilityIdentifier("plugin-ui-markdown")
+            // An extension card's words look up on a tap (#10977); never in a picture of it.
+            .textLookupSurface(picture ? "" : "card")
     }
 
     /// The subset has no pictures: whatever an image points at is not loaded.
@@ -729,11 +727,7 @@ struct ExtensionFieldItem: View {
     private func labeled(@ViewBuilder _ content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.xs) {
             Text(label).font(Theme.Font.labelStrong).foregroundStyle(.secondary).lineLimit(2)
-            #if os(macOS)
-            content().labelsHidden() // a Mac form would put the label beside an empty box (#1221)
-            #else
             content()
-            #endif
         }
         .padding(.vertical, Theme.Space.xxs)
     }

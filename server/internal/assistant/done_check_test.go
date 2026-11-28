@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/assistant/repositorystore"
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
@@ -39,14 +40,16 @@ func doneCheck(t *testing.T, s *Service, id, body string) doneCheckAnswer {
 // (a turn end the hub missed) and writes the verdict. Even a legacy unsupervised task becomes delivered and supervised by
 // the main conversation: a judge never closes it (#5732).
 func TestDoneCheckApplyMarksAFinishedTaskDelivered(t *testing.T) {
-	s, f := newTaskService(t)
+	s, f := newTaskServiceOn(t, repositorystore.New(todoTestDB(t)))
 	f.judge = `{"verdict":"done","reason":"修好了"}`
 	todo := startedTask(t, s, f)
 	if todo.Supervision != nil {
 		t.Fatalf("supervised: %+v", todo.Supervision)
 	}
 	setSettings(t, s, func(v *Settings) { v.Main = "conv1" })
-	agentStopped(f, "修好了，PR https://github.com/o/r/pull/9 已合并")
+	reply := "修好了，PR https://github.com/o/r/pull/9 已合并"
+	artifactReportProof(f, todo, reply, "https://github.com/o/r/pull/9")
+	agentStopped(f, reply)
 
 	got := doneCheck(t, s, todo.ID, "")
 	if got.Verdict != verdictDone || got.WouldClose || got.Applied != nil {
@@ -109,15 +112,12 @@ func TestDoneCheckApplyKeepsOwnerActionWhenJudgeFails(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || out.Verdict != verdictNeedsUser || out.Applied == nil || !*out.Applied {
 			t.Fatalf("applied owner action = %+v, %v", out, err)
 		}
-		waitFor(t, "the owner-action push after a judge failure", func() bool { return len(f.pushed()) == 1 })
-		if cur := todoNow(s, todo.ID); cur.Supervision.State != reviewNeedsUser || cur.Supervision.Waits == nil {
+		if cur := todoNow(s, todo.ID); cur.Supervision.Waits == nil {
 			t.Fatalf("the judge failure discarded the owner wait: %+v", cur.Supervision)
 		}
-		waitFor(t, "the owner-action receipt", func() bool { return todoNow(s, todo.ID).Supervision.Waits.NotifiedAt != nil })
+		ownerWaitHeldBySupervisor(t, s, f, todo.ID)
 		doneCheck(t, s, todo.ID, `{"apply":true}`)
-		if got := len(f.pushed()); got != 1 {
-			t.Fatalf("the same deterministic owner action pushed %d times", got)
-		}
+		ownerWaitHeldBySupervisor(t, s, f, todo.ID)
 	})
 
 	t.Run("model not configured", func(t *testing.T) {
@@ -139,17 +139,12 @@ func TestDoneCheckApplyKeepsOwnerActionWhenJudgeFails(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("an unconfigured judge discarded the deterministic owner action: %d %s", w.Code, w.Body.String())
 		}
-		waitFor(t, "the owner-action push without a configured judge", func() bool { return len(f.pushed()) == 1 })
-		if cur := todoNow(s, todo.ID); cur.Supervision.State != reviewNeedsUser || cur.Supervision.Waits == nil {
+		if cur := todoNow(s, todo.ID); cur.Supervision.Waits == nil {
 			t.Fatalf("an unconfigured judge discarded the owner wait: %+v", cur.Supervision)
 		}
-		waitFor(t, "the owner-action receipt without a configured judge", func() bool {
-			return todoNow(s, todo.ID).Supervision.Waits.NotifiedAt != nil
-		})
+		ownerWaitHeldBySupervisor(t, s, f, todo.ID)
 		doneCheck(t, s, todo.ID, `{"apply":true}`)
-		if got := len(f.pushed()); got != 1 {
-			t.Fatalf("the same owner action without a configured judge pushed %d times", got)
-		}
+		ownerWaitHeldBySupervisor(t, s, f, todo.ID)
 	})
 }
 

@@ -30,7 +30,7 @@ import persona.feature.agents.AgentsPreferencesSnapshot
 import persona.feature.agents.listSession
 import persona.feature.chat.ChatWiringSource
 import persona.feature.chat.ChatAppBindings
-import persona.feature.inbox.InboxSnapshot
+import persona.core.inbox.InboxSnapshot
 import persona.platform.capsule.*
 import java.util.UUID
 
@@ -176,7 +176,8 @@ internal class CapsuleSessions(
     private val acknowledged = MutableStateFlow<Set<String>>(emptySet())
     private val agents = combine(session.sessions.sessions, session.assistant.assistant, session.interactions.pending,
         session.preferences.snapshots) { list, assistant, pending, preferences ->
-        CapsuleAgents((list + assistant.conversations).distinctBy { it.key }, assistant.mainSession, pending, preferences)
+        CapsuleAgents((list + assistant.conversations).distinctBy { it.key }, assistant.mainSession,
+            pending.filterNot { it.isDisplayMirror }, preferences)
     }
     // Session lists change several times a second while agents run; the capsule's catalog (every session's dates
     // parsed, sorted and grouped) is built from the latest of them only, never once per queued change.

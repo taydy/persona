@@ -79,6 +79,7 @@ type pageSession struct {
 	manifest                           *extension.Manifest
 	item                               extension.UIItem
 	components                         map[string]bool
+	unsupported                        []string
 	slot                               extension.UISlot
 	tree                               *uistream.Tree
 	fit                                pageFitMemo // FitNative's last answer for this session's renders
@@ -386,9 +387,10 @@ func (h *Manager) uiStream(ctx context.Context, call extwire.UIStreamCall) (json
 		s.recovering = false
 		s.suspended = true
 		s.expires = time.Now().Add(5 * time.Minute)
-		s.pauseDone = make(chan struct{})
+		done := make(chan struct{})
+		s.pauseDone = done
 		ps.mu.Unlock()
-		if err := h.pagePause(s); err != nil {
+		if err := h.pagePause(s, done); err != nil {
 			return nil, err
 		}
 		return streamFrame("suspended", req.RequestID, s.id), nil
@@ -404,6 +406,7 @@ func (h *Manager) uiStream(ctx context.Context, call extwire.UIStreamCall) (json
 	s.busy = true
 	s.recovering = true
 	visibility := s.visibility
+	prevWho := s.who
 	if req.Request == "resume" {
 		s.who = call.Who
 	}
@@ -423,6 +426,9 @@ func (h *Manager) uiStream(ctx context.Context, call extwire.UIStreamCall) (json
 			ps.mu.Lock()
 			s.busy = false
 			s.recovering = false
+			if !s.closed && req.Request == "resume" && s.visibility == visibility {
+				s.who = prevWho
+			}
 			ps.mu.Unlock()
 			return nil, err
 		}
@@ -489,7 +495,7 @@ func streamEventKey(native json.RawMessage, event wire.UIStreamEvent) string {
 	for i := range view.Sections {
 		for j := range view.Sections[i].Items {
 			e := &view.Sections[i].Items[j]
-			if e.Type != wire.ComponentGraph && e.Type != wire.ComponentScene {
+			if e.Type != wire.ComponentGraph && e.Type != wire.ComponentScene && e.Type != wire.ComponentMap {
 				continue
 			}
 			for k := range e.Nodes {
@@ -499,6 +505,11 @@ func streamEventKey(native json.RawMessage, event wire.UIStreamEvent) string {
 			}
 			for k := range e.Pins {
 				if a := e.Pins[k].Action; a != nil && a.ID == event.Action {
+					return e.Key
+				}
+			}
+			for k := range e.Markers {
+				if a := e.Markers[k].Action; a != nil && a.ID == event.Action {
 					return e.Key
 				}
 			}

@@ -1,11 +1,9 @@
 import MarkdownUI
 import PersonaKit
 import SwiftUI
-#if os(iOS) || os(visionOS)
 import CoreText
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
-#endif
 
 // MARK: - A lifted message's words, selected where they are (#603)
 
@@ -105,7 +103,6 @@ private struct SelectableInLift: ViewModifier {
     @State private var place = LiftPlace()
 
     func body(content: Content) -> some View {
-        #if os(iOS) || os(visionOS)
         if lifted {
             offered(content.accessibilityHidden(select != nil)) // the text view's words, while it is over them
             // The text view over them, its lines on theirs (`LiftLayout.snap`), a folded quote's hidden ones aside.
@@ -125,9 +122,6 @@ private struct SelectableInLift: ViewModifier {
         } else {
             content
         }
-        #else
-        content
-        #endif
     }
 
     /// What the words are offered (`place`). Parts in a lazy stack, as wide as the copy: nothing between the stack and
@@ -151,7 +145,6 @@ private struct SelectableInLift: ViewModifier {
     }
 }
 
-#if os(iOS) || os(visionOS)
 #if os(iOS)
 /// A long press on the lifted message: where it landed, in the window, for its words to be selected there.
 /// iOS only: `UIGestureRecognizerRepresentable` is not available on visionOS.
@@ -902,11 +895,19 @@ final class LiftUITextView: UITextView, UITextViewDelegate, UIEditMenuInteractio
 
     func textView(_ textView: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
         let picked = ReplyText.copyText(attributedText.attributedSubstring(from: range)).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !picked.isEmpty, let quote else { return UIMenu(children: suggestedActions) }
-        let ours = UIMenu(options: .displayInline, children: [
-            UIAction(title: String(localized: "Quote"), image: UIImage(systemName: Theme.Icon.quote)) { _ in quote(picked) },
-        ])
-        return UIMenu(children: [ours] + suggestedActions)
+        var items: [UIMenuElement] = []
+        if !picked.isEmpty, let quote {
+            items.append(UIAction(title: String(localized: "Quote"), image: UIImage(systemName: Theme.Icon.quote)) { _ in quote(picked) })
+        }
+        // One word picked, while a text_lookup extension answers: Look Up in <provider> (#10977), the way to it that
+        // needs no tap on the word (VoiceOver, a selection).
+        #if os(iOS)
+        if let lookup = TextLookupMenu.action(for: picked, in: self, range: range, source: "chat") {
+            items.append(lookup)
+        }
+        #endif
+        guard !items.isEmpty else { return UIMenu(children: suggestedActions) }
+        return UIMenu(children: [UIMenu(options: .displayInline, children: items)] + suggestedActions)
     }
 
     /// The words as the chat shows them; a table in it as its Markdown.
@@ -1745,4 +1746,3 @@ enum ReplyText {
         return r.uiImage
     }
 }
-#endif

@@ -2,9 +2,12 @@ package hub
 
 import (
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/nwverse/persona/server/internal/apierr"
+	"github.com/nwverse/persona/server/internal/assistantwire"
+	"github.com/nwverse/persona/server/internal/extwire"
 	"github.com/nwverse/persona/server/internal/i18n"
 	"github.com/nwverse/persona/server/internal/identity"
 	"github.com/nwverse/persona/server/internal/nodeproto"
@@ -28,13 +31,47 @@ func extensionToken(r *http.Request) bool { return principalOf(r.Context()).Role
 
 func restrictedAgentData(r *http.Request) bool {
 	role := principalOf(r.Context()).Role
-	return role == roleExtension || role == roleScoped
+	return role == roleExtension || role == roleScoped || role == roleReadOnly
+}
+
+// ownerExtension checks the owner's trust verdict from the connection that authenticated the extension and its route.
+// A legacy Assistant can confirm owner trust through a snapshot it sent on that same connection.
+func (h *Hub) ownerExtension(r *http.Request) bool {
+	p := principalOf(r.Context())
+	c := p.extAuthConn
+	if p.Role != roleExtension || c == nil {
+		return false
+	}
+	h.bus.mu.Lock()
+	defer h.bus.mu.Unlock()
+	if h.bus.current[p.Manager] != c {
+		return false
+	}
+	select {
+	case <-c.peer.Done():
+		return false
+	default:
+	}
+	if p.extOwner != extwire.OwnerUnreported {
+		return p.extOwner == extwire.OwnerConfirmed
+	}
+	if slices.Contains(c.presence.Capabilities, assistantwire.CapabilityExtensionInfoAccessScoped) {
+		return false
+	}
+	profile := c.extensionOwnerProfile.Load()
+	return profile != nil && slices.Contains(profile.ExtensionOwners, p.Extension)
+}
+
+// spacesHidden: r's token is shown none of the tracks' conversations on the read routes: an extension's other than
+// the user's own (ownerExtension), or a scoped device's. Controls stay closed to every extension (extensionControllable).
+func (h *Hub) spacesHidden(r *http.Request) bool {
+	return restrictedAgentData(r) && !h.ownerExtension(r)
 }
 
 // withoutSpaceSessions drops the spaces' conversations from list for an extension's token (list itself
 // otherwise, and when none is dropped). list is never changed.
-func withoutSpaceSessions(r *http.Request, list []proto.Session) []proto.Session {
-	if !restrictedAgentData(r) {
+func (h *Hub) withoutSpaceSessions(r *http.Request, list []proto.Session) []proto.Session {
+	if !h.spacesHidden(r) {
 		return list
 	}
 	for i := range list {
@@ -161,7 +198,7 @@ const codeSessionsNotListed = "sessions_not_listed"
 // unknown machine (the route's own 404), go on to next.
 func (h *Hub) extensionReadable(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if restrictedAgentData(r) {
+		if h.spacesHidden(r) {
 			if m := h.localMachine(r.PathValue("mid")); m != nil {
 				s, ok := m.session(r.PathValue("sid"))
 				if !ok && h.historyReads.readable(m.cfg.ID, r.PathValue("sid"), time.Now()) {

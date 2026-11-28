@@ -23,6 +23,8 @@ const (
 	// featureTodoView: every row of GET /api/v1/todos carries `view`, the list `counts`, and GET /api/v1/todos/{id}
 	// answers one row so (docs/protocol/protocol.md, the to-dos rows).
 	featureTodoView = assistantwire.CapabilityTodoView
+	// featureTodoRevision: GET /api/v1/todos/revision answers the pushed read's cheap merged validator.
+	featureTodoRevision = assistantwire.CapabilityTodoRevision
 	// featureTodoPlaces: GET /api/v1/todos/places answers the To-dos sidebar's places with the counts.
 	featureTodoPlaces = assistantwire.CapabilityTodoPlaces
 	// featureTodoAsks: POST /api/v1/todos/{id}/asks/{ask}/answer answers a to-do's own asks by their view's ids
@@ -34,6 +36,8 @@ const (
 	// featureTodoImages: POST /api/v1/todos persists images and serves their private bytes (#11084). A hub-wide flag
 	// cannot promise image creation for only some managers, so an older or offline one hides the picker.
 	featureTodoImages = assistantwire.CapabilityTodoImages
+	// todoRevisionRoute is the pushed read's cheap validator, answered by every manager and merged (mergeTodoRevision).
+	todoRevisionRoute = "GET /api/v1/todos/revision"
 	// todoPlacesRoute is answered by every manager the to-dos list merges, joined (mergeTodoPlaces).
 	todoPlacesRoute = "GET /api/v1/todos/places"
 )
@@ -58,6 +62,19 @@ func (h *Hub) todoViewFeatures() []string {
 		return []string{featureTodoPlaces}
 	}
 	return nil
+}
+
+// todoRevisionFeatures promises the cheap merged read only when every manager has it. Otherwise the web sends no extra
+// probe at all and keeps the original full-list refresh throughout a rolling upgrade.
+func (h *Hub) todoRevisionFeatures() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, id := range h.listManagers(ctx) {
+		if h.archiveManagerHas(id, assistantwire.CapabilityTodoRevision) != http.StatusOK {
+			return nil
+		}
+	}
+	return []string{featureTodoRevision}
 }
 
 // todoAsksFeatures is todo_asks while every manager whose to-dos the list merges is connected and names it, as
@@ -103,20 +120,257 @@ func (h *Hub) todoImageFeatures() []string {
 }
 
 // todoListSums are the members of a merged to-dos list the hub adds up over its answers (mergeList, before the list's
-// validator is taken): counts, those of every answer the merge takes that has them (sumTodoCounts). None when no such
-// answer has them (every manager is older): the merged list then has none either.
+// validator is taken): counts, closed cursors and the optional todos_v2 board and shared blockers.
 func todoListSums(answers []listAnswer) map[string]json.RawMessage {
 	var all []json.RawMessage
+	var blockers []json.RawMessage
+	var boards []json.RawMessage
 	for i := range answers {
 		if raw, ok := mergedMember(&answers[i], "todos", "counts"); ok {
 			all = append(all, raw)
 		}
+		if raw, ok := mergedMember(&answers[i], "todos", "shared_blockers"); ok {
+			blockers = append(blockers, raw)
+		}
+		if raw, ok := mergedMember(&answers[i], "todos", "board"); ok && bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+			boards = append(boards, raw)
+		}
 	}
-	sum, ok := sumTodoCounts(all)
-	if !ok {
-		return nil
+	var out map[string]json.RawMessage
+	if sum, ok := sumTodoCounts(all); ok {
+		out = map[string]json.RawMessage{"counts": sum}
 	}
-	return map[string]json.RawMessage{"counts": sum}
+	if merged, ok := mergeSharedBlockers(blockers); ok {
+		if out == nil {
+			out = map[string]json.RawMessage{}
+		}
+		out["shared_blockers"] = merged
+	}
+	if merged, ok := mergeTodoBoards(boards); ok {
+		if out == nil {
+			out = map[string]json.RawMessage{}
+		}
+		out["board"] = merged
+	}
+	if cursors := todoClosedCursors(answers); len(cursors) > 0 {
+		if out == nil {
+			out = map[string]json.RawMessage{}
+		}
+		raw, _ := json.Marshal(cursors)
+		out["closed_cursors"] = raw
+	}
+	return out
+}
+
+// mergeTodoBoards joins board objects in the list's manager order (default first, then by manager ID).
+// The managers supply the membership, counts and order within their own boards.
+func mergeTodoBoards(all []json.RawMessage) (json.RawMessage, bool) {
+	switch len(all) {
+	case 0:
+		return nil, false
+	case 1:
+		return all[0], true
+	}
+	boards := make([]map[string]json.RawMessage, 0, len(all))
+	out := map[string]json.RawMessage{}
+	var counts []json.RawMessage
+	sidebar := []json.RawMessage{}
+	for _, raw := range all {
+		var board map[string]json.RawMessage
+		if json.Unmarshal(raw, &board) != nil {
+			continue
+		}
+		boards = append(boards, board)
+		for key, value := range board {
+			if _, has := out[key]; !has {
+				out[key] = value
+			}
+		}
+		counts = append(counts, board["counts"])
+		var nodes []json.RawMessage
+		if json.Unmarshal(board["sidebar_tree"], &nodes) == nil {
+			sidebar = append(sidebar, nodes...)
+		}
+	}
+	out["sidebar_tree"], _ = json.Marshal(sidebar)
+	out["status_groups"] = mergeTodoBoardGroups(boards, "status_groups", "key", "entries", "total_count", "visible_count")
+	out["direction_groups"] = mergeTodoBoardGroups(boards, "direction_groups", "direction_id", "todo_ids", "counts")
+	if sum, ok := sumTodoCounts(counts); ok {
+		out["counts"] = sum
+	}
+	raw, err := json.Marshal(out)
+	return raw, err == nil
+}
+
+// mergeTodoBoardGroups joins records with the same group key. Their first appearance sets the order, with the
+// ungrouped direction last. Members stay in manager order and counts are added as sent.
+func mergeTodoBoardGroups(boards []map[string]json.RawMessage, boardKey, groupKey, listKey string, countKeys ...string) json.RawMessage {
+	type group struct {
+		fields map[string]json.RawMessage
+		items  []json.RawMessage
+		counts []map[string]json.RawMessage
+	}
+	groups := map[string]*group{}
+	var order []string
+	for _, board := range boards {
+		var rows []map[string]json.RawMessage
+		if json.Unmarshal(board[boardKey], &rows) != nil {
+			continue
+		}
+		for _, row := range rows {
+			var key *string
+			if json.Unmarshal(row[groupKey], &key) != nil || key == nil {
+				continue
+			}
+			g := groups[*key]
+			if g == nil {
+				g = &group{fields: map[string]json.RawMessage{}, items: []json.RawMessage{}}
+				groups[*key] = g
+				order = append(order, *key)
+			}
+			for field, value := range row {
+				if _, has := g.fields[field]; !has {
+					g.fields[field] = value
+				}
+			}
+			var items []json.RawMessage
+			if json.Unmarshal(row[listKey], &items) == nil {
+				g.items = append(g.items, items...)
+			}
+			counts := make(map[string]json.RawMessage, len(countKeys))
+			for _, field := range countKeys {
+				if value, has := row[field]; has {
+					counts[field] = value
+				}
+			}
+			g.counts = append(g.counts, counts)
+		}
+	}
+	if i := slices.Index(order, ""); i >= 0 {
+		copy(order[i:], order[i+1:])
+		order[len(order)-1] = ""
+	}
+	out := make([]map[string]json.RawMessage, 0, len(order))
+	for _, key := range order {
+		g := groups[key]
+		g.fields[listKey], _ = json.Marshal(g.items)
+		for field, sum := range sumMembers(g.counts) {
+			g.fields[field] = sum
+		}
+		out = append(out, g.fields)
+	}
+	raw, _ := json.Marshal(out)
+	return raw
+}
+
+type todoClosedCursor struct {
+	NextCursor string `json:"next_cursor"`
+	HasMore    bool   `json:"has_more"`
+}
+
+// todoClosedCursors are the older-closed cursors each manager's default answer carries, keyed by the manager a
+// paginated read must name. A manager from before #15683 has none.
+func todoClosedCursors(answers []listAnswer) map[string]todoClosedCursor {
+	out := map[string]todoClosedCursor{}
+	for i := range answers {
+		rawHasMore, ok := mergedMember(&answers[i], "todos", "closed_has_more")
+		if !ok {
+			continue
+		}
+		var hasMore bool
+		if json.Unmarshal(rawHasMore, &hasMore) != nil || !hasMore {
+			continue
+		}
+		rawCursor, ok := mergedMember(&answers[i], "todos", "closed_next_cursor")
+		if !ok {
+			continue
+		}
+		var cursor string
+		if json.Unmarshal(rawCursor, &cursor) != nil || cursor == "" {
+			continue
+		}
+		out[answers[i].id] = todoClosedCursor{NextCursor: cursor, HasMore: true}
+	}
+	return out
+}
+
+type mergedSharedBlocker struct {
+	Key     string   `json:"key"`
+	Kind    string   `json:"kind"`
+	Label   string   `json:"label"`
+	URL     string   `json:"url,omitempty"`
+	TodoIDs []string `json:"todo_ids"`
+	Count   int      `json:"count"`
+}
+
+func mergeSharedBlockers(all []json.RawMessage) (json.RawMessage, bool) {
+	if len(all) == 0 {
+		return nil, false
+	}
+	var valid [][]mergedSharedBlocker
+	var first json.RawMessage
+	for _, raw := range all {
+		var list []mergedSharedBlocker
+		if json.Unmarshal(raw, &list) != nil || len(list) == 0 {
+			continue
+		}
+		if first == nil {
+			first = raw
+		}
+		valid = append(valid, list)
+	}
+	switch len(valid) {
+	case 0:
+		return nil, false
+	case 1:
+		return first, true
+	}
+	type group struct {
+		entry mergedSharedBlocker
+		todos map[string]bool
+	}
+	groups := map[string]*group{}
+	for _, list := range valid {
+		for _, item := range list {
+			if item.Key == "" {
+				continue
+			}
+			g := groups[item.Key]
+			if g == nil {
+				g = &group{entry: item, todos: map[string]bool{}}
+				groups[item.Key] = g
+			} else if item.Label != "" && (g.entry.Label == "" || item.Label < g.entry.Label) {
+				g.entry.Label = item.Label
+			}
+			for _, id := range item.TodoIDs {
+				if id != "" {
+					g.todos[id] = true
+				}
+			}
+		}
+	}
+	var merged []mergedSharedBlocker
+	for _, g := range groups {
+		if len(g.todos) < 2 {
+			continue
+		}
+		ids := make([]string, 0, len(g.todos))
+		for id := range g.todos {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		g.entry.TodoIDs = ids
+		g.entry.Count = len(ids)
+		merged = append(merged, g.entry)
+	}
+	if len(merged) == 0 {
+		return nil, false
+	}
+	slices.SortFunc(merged, func(a, b mergedSharedBlocker) int {
+		return cmp.Or(cmp.Compare(b.Count, a.Count), cmp.Compare(a.Key, b.Key))
+	})
+	b, err := json.Marshal(merged)
+	return b, err == nil
 }
 
 // sumTodoCounts adds up the counts objects of all (each answer's; anything not an object, null included, is none):

@@ -70,8 +70,9 @@ type Client struct {
 	// context (about 0.85 MB) and its largest compressed message. A hub only compresses when it is offered.
 	Uncompressed bool
 
-	// probeOver, probeEvery replace the constants of the same names (tests).
+	// probeOver, probeEvery, maxMessage replace the constants of the same names (tests).
 	probeOver, probeEvery time.Duration
+	maxMessage            int
 
 	mu   sync.Mutex
 	peer *rpc.Peer     // the connection that said its handshake; nil between connections
@@ -83,6 +84,13 @@ func orDefault(d, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+func (c *Client) maxMessageBytes() int {
+	if c.maxMessage > 0 {
+		return c.maxMessage
+	}
+	return MaxMessage
 }
 
 func (c *Client) logf(format string, args ...any) {
@@ -204,6 +212,11 @@ func healthy(ctx context.Context, hc *http.Client, u string) bool {
 
 // healthURL is healthPath under the hub's base URL (a reverse proxy's path kept), over http(s) for ws(s).
 func healthURL(hub string) (string, error) {
+	return HTTPURL(hub, healthPath)
+}
+
+// HTTPURL resolves a Hub path through the same reverse proxy as the bus.
+func HTTPURL(hub, path string) (string, error) {
 	if _, err := Endpoint(hub); err != nil {
 		return "", err
 	}
@@ -217,7 +230,7 @@ func healthURL(hub string) (string, error) {
 	case "wss":
 		base.Scheme = "https"
 	}
-	return base.JoinPath(strings.TrimPrefix(healthPath, "/")).String(), nil
+	return base.JoinPath(strings.TrimPrefix(path, "/")).String(), nil
 }
 
 // session is one connection: dial, handshake, serve until it drops. helloed: the handshake went through.
@@ -233,7 +246,8 @@ func (c *Client) session(ctx context.Context) (helloed bool, err error) {
 		return false, err
 	}
 	defer ws.CloseNow()
-	conn := NewConn(sctx, ws)
+	limit := c.maxMessageBytes()
+	conn := newConn(sctx, ws, int64(limit))
 	go func() {
 		err := Keepalive(sctx, ws, orDefault(c.PingEvery, PingEvery), orDefault(c.PingTimeout, PingTimeout))
 		if sctx.Err() == nil {
@@ -242,6 +256,11 @@ func (c *Client) session(ctx context.Context) (helloed bool, err error) {
 		}
 	}()
 	p := rpc.New("s", conn)
+	p.ReadLimit = limit
+	p.WriteLimit = limit
+	p.OnWriteRejected = func(kind, op string, size, max int) {
+		c.logf("bus: rejected outgoing %s %s: %d bytes (limit %d)", kind, op, size, max)
+	}
 	p.OnRequest, p.OnEvent, p.Cancels = c.OnRequest, c.OnEvent, c.Cancels
 	served := make(chan error, 1)
 	go func() { served <- p.Serve(sctx, conn) }()
@@ -253,14 +272,12 @@ func (c *Client) session(ctx context.Context) (helloed bool, err error) {
 	var res json.RawMessage
 	hctx, hcancel := context.WithTimeout(sctx, HelloTimeout)
 	err = p.Call(hctx, c.HelloMethod, params, &res)
-	hcancel()
 	if err != nil {
-		var coded *rpc.Error
-		if errors.As(err, &coded) && coded.Code == CodeWrongIdentity {
-			err = fmt.Errorf("%w: %s", ErrRejected, coded.Message)
-		}
+		err = helloError(err, p, served, sctx, hctx)
+		hcancel()
 		return false, fmt.Errorf("%s: %w", c.HelloMethod, err)
 	}
+	hcancel()
 	if c.OnHello != nil {
 		if err := c.OnHello(res); err != nil {
 			return false, err
@@ -268,7 +285,56 @@ func (c *Client) session(ctx context.Context) (helloed bool, err error) {
 	}
 	c.setPeer(p)
 	defer c.setPeer(nil)
-	return true, closeReason(<-served)
+	select {
+	case err := <-served:
+		return true, closeReason(err)
+	case <-p.Done():
+		// Closed (rpc.Peer.Close): by its own read loop as it ended, or by the service to have everything read
+		// again on a new connection. The socket goes with it (ws.CloseNow above): a closed peer left on an open
+		// socket answers nothing, and nothing would dial again until the hub hung up. Close takes a nil error too
+		// (an orderly close): it still ends the connection, and Run hears why rather than nil.
+		err := p.Err()
+		if err == nil {
+			err = rpc.ErrClosed
+		}
+		return true, closeReason(err)
+	}
+}
+
+// helloError translates a handshake failure into ErrRejected / ErrRevoked when the hub refused the
+// identity or closed the WebSocket with CloseRevoked / CloseRefused during HelloMethod.
+func helloError(err error, p *rpc.Peer, served <-chan error, sctx, hctx context.Context) error {
+	var coded *rpc.Error
+	if errors.As(err, &coded) {
+		if coded.Code == CodeWrongIdentity {
+			return fmt.Errorf("%w: %s", ErrRejected, coded.Message)
+		}
+		return err
+	}
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		return closeReason(err)
+	}
+	if perr := p.Err(); perr != nil {
+		return closeReason(perr)
+	}
+	if sctx.Err() != nil || hctx.Err() != nil {
+		return err
+	}
+	// If ws.Write failed with a raw transport error right as the hub sent a Close frame, give Serve
+	// a brief window to surface the peer's CloseError before falling back to the write error.
+	t := time.NewTimer(50 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case serr := <-served:
+		if serr != nil {
+			return closeReason(serr)
+		}
+	case <-t.C:
+	case <-hctx.Done():
+	case <-sctx.Done():
+	}
+	return err
 }
 
 // closeReason says why the hub closed the connection: a revoked token or a refused handshake is ErrRejected.

@@ -38,18 +38,22 @@ describe("a supervised task", () => {
     expect(html).toContain("1/2");
     expect(html).toContain("pull/7 merged");
     expect(html).toContain('dateTime="2026-11-10T09:00:00Z"');
-    expect(html).toContain("agent:box/s1");
-    expect(html).toContain('aria-label="还没验收"');
+    expect(html).toContain('data-testid="review-evidence-author">Agent<');
+    expect(html).not.toContain("agent:box/s1");
+    expect(html).toContain('aria-label="尚未验收"');
   });
   it.each([
-    "agent:box/s1", "supervisor:main", "judge",
-  ])("keeps the %s evidence attribution in the existing task detail without new labels", (by) => {
+    ["agent:box/s1", "Agent"],
+    ["supervisor:main", "督办"],
+    ["judge", "评审"],
+  ])("maps %s evidence attribution to readable label %s in the task detail", (by, expected) => {
     const detail: Todo = { ...todo, supervision: {
       supervisor: "main", done_when: ["Tests pass"],
       criteria: [{ criterion: "Tests pass", state: "met", evidence: "go test: PASS", at: "2026-11-11T01:00:00Z", by }],
     } };
     const html = renderToStaticMarkup(<ReviewChecklist todo={detail} />);
-    expect(html).toContain(by);
+    expect(html).toContain(`data-testid="review-evidence-author">${expected}<`);
+    expect(html).not.toContain(by);
     expect(html).toContain("go test: PASS");
     expect(html).toContain('dateTime="2026-11-11T01:00:00Z"');
   });
@@ -62,7 +66,8 @@ describe("a supervised task", () => {
     expect(html).toContain('data-testid="review-parked"');
     expect(html).toContain("Waiting for the external release");
     expect(html).toContain("go test: PASS");
-    expect(html).toContain("agent:box/s1");
+    expect(html).toContain('data-testid="review-evidence-author">Agent<');
+    expect(html).not.toContain("agent:box/s1");
     expect(html).toContain('dateTime="2026-11-11T01:00:00Z"');
   });
   it("does not display stale parked metadata while the task's Agent is working", () => {
@@ -85,7 +90,7 @@ describe("a supervised task", () => {
 
   it("shows its review state and the criteria met on its card", () => {
     const html = renderToStaticMarkup(<ReviewBadge todo={todo} />);
-    expect(html).toContain("返工第 1 轮");
+    expect(html).toContain("第 1 轮返工");
     expect(html).toContain("1/2");
     expect(renderToStaticMarkup(<ReviewBadge todo={{ ...todo, supervision: undefined }} />)).toBe("");
   });
@@ -94,8 +99,8 @@ describe("a supervised task", () => {
     const html = renderToStaticMarkup(<ReviewChecklist todo={todo} />);
     expect(html).toContain("验收标准");
     expect(html).toContain("预计 30 分钟");
-    expect(html).toContain('aria-label="达成"');
-    expect(html).toContain('aria-label="缺口"');
+    expect(html).toContain('aria-label="已达成"');
+    expect(html).toContain('aria-label="未达成"');
     expect(html).toContain("只有浅色");
     expect(html).toContain("督办说明：补深色截图");
   });
@@ -105,7 +110,7 @@ describe("a supervised task", () => {
       ...todo.supervision!, state: "accepted",
       reviews: [{ at: "2026-11-05T09:00:00Z", verdict: "accepted", checks: [{ criterion: todo.supervision!.done_when![0], met: true }] }],
     } }} />);
-    expect(html).toContain('aria-label="验收后追加，未单独核对"');
+    expect(html).toContain('aria-label="验收后新增，未单独核对"');
     expect(html).toContain(renderToStaticMarkup(<Icon name="minus" size={13} stroke={2.4} />));
     expect(html).toContain("1/1");
   });
@@ -132,14 +137,14 @@ describe("a supervised task", () => {
 
   it("says when no criteria were given", () => {
     const html = renderToStaticMarkup(<ReviewChecklist todo={{ ...todo, supervision: { supervisor: "main", done_when: [] } }} />);
-    expect(html).toContain("派活时没写验收标准");
+    expect(html).toContain("未设置验收标准");
   });
 
   it("marks a line to a task that cut its turn short", () => {
     const say = (body: Record<string, unknown>): string =>
       renderToStaticMarkup(<FeedLineView item={{ id: "f3", conversation: "main", at: "2026-11-05T09:00:00Z", kind: "routed", ref: "todo_1", body }} />);
-    expect(say({ text: "先修测试", interrupted: true })).toContain("打断「");
-    expect(say({ text: "先修测试" })).not.toContain("打断「");
+    expect(say({ text: "先修测试", interrupted: true })).toContain("已中断「");
+    expect(say({ text: "先修测试" })).not.toContain("已中断「");
     expect(say({ text: "先修测试" })).toContain("对「");
   });
 
@@ -149,12 +154,12 @@ describe("a supervised task", () => {
       renderToStaticMarkup(<ReviewChecklist todo={{ ...todo, supervision: { ...todo.supervision!, state: "pending_review", auto_review } }} />);
     const clean = reviewed({ id: "rv_1", state: "clean", count: 2, blocking: 0, findings: "P2 app.ts:3 命名" });
     expect(clean).toContain("独立评审");
-    expect(clean).toContain("没有阻断问题 · 2 条发现");
+    expect(clean).toContain("无阻断问题 · 2 条发现");
     expect(clean).toContain("展开报告");
     expect(clean).not.toContain("P2 app.ts:3"); // the report opens on a click
-    expect(reviewed({ id: "rv_1", state: "blocking", count: 3, blocking: 1, findings: "P0 x" })).toContain("还剩 1 条阻断问题 · 3 条发现");
+    expect(reviewed({ id: "rv_1", state: "blocking", count: 3, blocking: 1, findings: "P0 x" })).toContain("仍有 1 条阻断问题 · 3 条发现");
     expect(reviewed({ id: "rv_1", state: "running" })).toContain("进行中");
-    expect(reviewed({ id: "rv_1", state: "failed" })).toContain("没评审完");
+    expect(reviewed({ id: "rv_1", state: "failed" })).toContain("未完成评审");
     expect(reviewed({ id: "rv_1", state: "cancelled" })).not.toContain("auto-review");
   });
 

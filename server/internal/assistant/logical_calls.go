@@ -15,6 +15,7 @@ import (
 	"github.com/nwverse/persona/server/internal/i18n"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/rpc"
+	"github.com/nwverse/persona/server/internal/wireids"
 )
 
 func logicalRefusal(ctx context.Context, code string) error {
@@ -111,12 +112,16 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 		}
 		return nil, true, logicalRefusal(ctx, "message_id_required")
 	}
-	if method == DeviceSessionItems || method == "session.item" || method == "session.image" || method == DeviceAssistantHandoff {
+	navigation := method == proto.MethodSessionInputPreviews || method == proto.MethodSessionItemsWindow
+	if method == DeviceSessionItems || method == "session.item" || method == "session.image" || method == DeviceAssistantHandoff || navigation {
 		var out json.RawMessage
 		for attempt := 0; attempt < 3; attempt++ {
 			out, err = s.logicalHistoryCall(ctx, st, c, method, raw)
 			if !errors.Is(err, db.ErrConversationHistoryChanged) {
 				break
+			}
+			if navigation {
+				return nil, true, &rpc.Error{Code: proto.CodeNavigationChanged, Message: i18n.T(i18n.From(ctx), "chat-navigation.history_changed")}
 			}
 			if attempt == 2 {
 				break
@@ -134,6 +139,23 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 	active, ok := c.Active()
 	if !ok {
 		return nil, true, logicalRefusal(ctx, "unavailable")
+	}
+	if logicalSendMethod(method) && c.Switch == nil && s.isVanishedZeroTurnSegment(ctx, c, active) {
+		client, _ := p["client_msg_id"].(string)
+		if client == "" {
+			client, _ = p["once_id"].(string)
+		}
+		if _, external := ctx.Value(logicalTransportKey{}).(devicewire.NodeCall); !external || client != "" {
+			recovered, err := s.beginZeroTurnRecoverySwitch(ctx, st, c, active)
+			if err != nil {
+				return nil, true, err
+			}
+			c = recovered
+			active, ok = c.Active()
+			if !ok {
+				return nil, true, logicalRefusal(ctx, "unavailable")
+			}
+		}
 	}
 	if method == "session.watch" || method == "session.unwatch" {
 		s.logical.mu.Lock()
@@ -165,6 +187,13 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 		}
 		withEpoch = st.WithDrainedConversationEpoch
 	}
+	// The queue may outlive these permissions and dispatch to another physical segment. Its
+	// durable payload and receipt always use the ordinary text prepared by the manager.
+	diagnostic, _ := ctx.Value(agyRelayContextKey{}).(agyRelayContext)
+	withDiagnostic := diagnostic.matches(machine, method, p)
+	if withDiagnostic {
+		p["text"] = diagnostic.plain
+	}
 	dispatched := false
 	err = withEpoch(ctx, machine, id, c.Epoch, func(current *db.LogicalConversation) error {
 		active, ok = current.Active()
@@ -191,7 +220,8 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 			}
 			// Queues are used throughout a switch, including its first target turn.
 			pending := false
-			if queue, ok := s.store().(logicalSwitchStore); ok {
+			queue, queued := s.store().(logicalSwitchStore)
+			if queued {
 				var err error
 				pending, err = queue.ConversationInputPending(ctx, machine, id)
 				if err != nil {
@@ -207,6 +237,15 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 				}
 			}
 			needsQueue := current.Switch != nil || pending
+			if _, external := ctx.Value(logicalTransportKey{}).(devicewire.NodeCall); !needsQueue && queued && current.Epoch > 1 && (client != "" || !external) {
+				// The handoff an idle acceptance kept goes with this input (#14488): the queue attaches it once. A node's
+				// own send without a message id cannot be queued, and goes on without it as before.
+				handoff, err := queue.ConversationPendingHandoff(ctx, machine, id, active.ID)
+				if err != nil {
+					return err
+				}
+				needsQueue = len(handoff) > 0
+			}
 			if client == "" && needsQueue {
 				if _, external := ctx.Value(logicalTransportKey{}).(devicewire.NodeCall); external {
 					return logicalRefusal(ctx, "message_id_required")
@@ -229,13 +268,21 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 							return e
 						}
 					}
-					out, e = json.Marshal(map[string]any{"ok": true, "queued": seen != "accepted" && seen != "rejected", "duplicate": seen != "", "session_id": id, "client_msg_id": client})
+					reply := logicalQueuedReply{OK: true, Queued: seen != "accepted" && seen != "rejected" && seen != db.ConversationInputDismissed, Duplicate: seen != "", SessionID: wireids.SessionID(id), ClientMsgID: wireids.ClientMsgID(client)}
+					if reply.Queued {
+						// Not gone in yet: the sender sees its bubble with why at once (logical_undelivered.go), and so does
+						// every other device from the next snapshot. Never a bare success that then vanishes.
+						kept := s.logicalQueuedMessage(ctx, machine, id, client)
+						reply.Delivered, reply.Undelivered = logicalDeliveredLater, &kept
+						s.publishSoon()
+					}
+					out, e = json.Marshal(reply)
 					s.historyWake()
 					return e
 				}
 			}
 		}
-		if logicalSendMethod(method) && current.Epoch > 1 {
+		if logicalSendMethod(method) && logicalSourceMayBeRetired(current) {
 			if _, err := s.logicalPhysical(ctx, active.MachineID, "assistant.segment.restore", map[string]any{"session_id": active.SessionID}); err != nil {
 				return err
 			}
@@ -250,6 +297,10 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 			}
 		}
 		physical := cloneLogicalParams(p, active)
+		if withDiagnostic && active.MachineID == machine && active.SessionID == id {
+			// This delivery neither queues nor changes the verified recipient, under the same epoch lock.
+			physical["text"] = diagnostic.block + diagnostic.plain
+		}
 		for _, key := range []string{"at_item_id", "answer_again_after"} {
 			if ref, _ := physical[key].(string); ref != "" {
 				source, err := activeLogicalItemID(active, ref)
@@ -266,6 +317,15 @@ func (s *Service) logicalCall(ctx context.Context, machine, method string, raw j
 				}
 			}
 			physical["history"] = active.SourceHistory
+		}
+		if active.Ordinal > 1 && (logicalSendMethod(method) || method == assistantwire.DeviceAssistantAnswerAgain) {
+			marker, ok := s.store().(logicalSegmentInputStore)
+			if !ok {
+				return logicalRefusal(ctx, "unavailable")
+			}
+			if err := marker.MarkConversationSegmentDispatched(ctx, machine, id, active.ID); err != nil {
+				return err
+			}
 		}
 		var e error
 		dispatched = true
@@ -391,7 +451,8 @@ func (s *Service) logicalSendModel(ctx context.Context, machine, session string,
 	}
 	c, err := st.LogicalConversation(ctx, machine, session)
 	if err != nil {
-		return true, err
+		s.logf("load logical conversation model (%s/%s): %v", machine, short(session), err)
+		return true, i18n.Err("assistant-model_pick.err_unreadable")
 	}
 	if c == nil || c.Epoch == 1 {
 		return false, nil
@@ -420,8 +481,25 @@ func (s *Service) logicalSendModel(ctx context.Context, machine, session string,
 	if launcher == "" {
 		return true, logicalRefusal(ctx, "unknown_engine")
 	}
-	if model, _ := p["model"].(string); model == "" {
-		p["model"] = a.Model
+	if model, _ := p["model"].(string); strings.TrimSpace(model) == "" {
+		if a.Model != "" {
+			p["model"] = a.Model
+		} else if inherited, _ := p[larkAgentInheritedModelKey].(bool); !inherited && !proto.IsExternalLauncher(launcher) {
+			if effort, _ := p["effort"].(string); effort == "" && a.Effort != "" {
+				p["effort"] = a.Effort
+			}
+			if mode, _ := p["permission_mode"].(string); mode == "" && a.PermissionMode != "" {
+				p["permission_mode"] = a.PermissionMode
+			}
+			delete(p, "model")
+			purpose := s.conversationModelPurpose(ctx, machine, session)
+			if err := preservePermissionMode(p, func() error { return s.applyModel(ctx, purpose, p) }); err != nil {
+				return true, err
+			}
+			return true, nil
+		} else {
+			p["model"] = a.Model
+		}
 	} else if err := checkModelID(model); err != nil {
 		return true, err
 	}

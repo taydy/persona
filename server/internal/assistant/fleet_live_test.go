@@ -37,7 +37,8 @@ func TestBuildFleet(t *testing.T) {
 	muted := agent("muted", proto.StateWorking, nil)
 	muted.Muted = true
 	agents = append(agents, muted)
-	ixs := []proto.Interaction{{ID: "ix1", MachineID: "m", SessionID: "p", Kind: proto.IxPermission, Summary: "Bash: go test ./...", CreatedAt: t0}}
+	occurrence := t0.Add(123456789 * time.Nanosecond)
+	ixs := []proto.Interaction{{ID: "ix1", MachineID: "m", SessionID: "p", Kind: proto.IxPermission, Summary: "Bash: go test ./...", CreatedAt: occurrence}}
 
 	st := buildFleet(agents, ixs)
 	if st.Phase != "needsYou" || st.NeedsYou != 1 || st.Working != 2 || st.Unread != 1 {
@@ -52,6 +53,14 @@ func TestBuildFleet(t *testing.T) {
 	}
 	if first.Place != "box · web" { // slot "2" is just the index: not repeated
 		t.Fatalf("place %q", first.Place)
+	}
+	raw, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if json.Unmarshal(raw, &wire) != nil || wire["interactionCreatedAt"] != occurrence.Format(time.RFC3339Nano) {
+		t.Fatalf("Live Activity occurrence = %v, want %s (item %s)", wire["interactionCreatedAt"], occurrence.Format(time.RFC3339Nano), raw)
 	}
 	if st.Items[1].ID != "m/w1" || st.Items[2].ID != "m/w2" {
 		t.Fatalf("working order %+v", st.Items)
@@ -83,6 +92,16 @@ func TestRound2(t *testing.T) {
 	for in, want := range map[int64]int64{7: 7, 99: 99, 987: 990, 12345: 12000, 41614712: 42000000} {
 		if got := round2(in); got != want {
 			t.Errorf("round2(%d) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// The island's load is rounded to the tenth of a core the apps print (#12519): 1.46 per core is 150 ("1.5", as the
+// card shows it), not 145.
+func TestLoadPercent(t *testing.T) {
+	for in, want := range map[float64]int{0: 0, 0.04: 0, 0.06: 10, 1.44: 140, 1.46: 150, 2.01: 200, 6.53: 650} {
+		if got := loadPercent(in); got != want {
+			t.Errorf("loadPercent(%v) = %d, want %d", in, got, want)
 		}
 	}
 }

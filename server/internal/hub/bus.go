@@ -17,6 +17,7 @@ import (
 
 	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/bus"
+	"github.com/nwverse/persona/server/internal/buswire"
 	"github.com/nwverse/persona/server/internal/db"
 	"github.com/nwverse/persona/server/internal/devicewire"
 	"github.com/nwverse/persona/server/internal/extwire"
@@ -56,6 +57,32 @@ func handleBus(method string, fn busCall) {
 	busMethods[method] = fn
 }
 
+// handleTypedBus binds a handler to the method's request and result types. The
+// decoder accepts unknown fields, and invalidPrefix keeps the method's error text.
+func handleTypedBus[P, R any](method buswire.Method[P, R], invalidPrefix string, fn func(*Hub, context.Context, *busConn, P) (R, error)) {
+	handleTypedBusWithDecoder(method, func(_ *busConn, params json.RawMessage) (P, error) {
+		var p P
+		if err := json.Unmarshal(params, &p); err != nil {
+			return p, &rpc.Error{Code: bus.CodeInvalidParams, Message: invalidPrefix + err.Error()}
+		}
+		return p, nil
+	}, fn)
+}
+
+func handleTypedBusWithDecoder[P, R any](method buswire.Method[P, R], decode func(*busConn, json.RawMessage) (P, error), fn func(*Hub, context.Context, *busConn, P) (R, error)) {
+	handleBus(method.Name, func(h *Hub, ctx context.Context, c *busConn, params json.RawMessage) (any, error) {
+		p, err := decode(c, params)
+		if err != nil {
+			return nil, err
+		}
+		out, err := fn(h, ctx, c, p)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	})
+}
+
 // handleBusEvent registers what takes event (a one-way message) once a connection said its handshake; unregistered
 // events are dropped.
 func handleBusEvent(event string, fn busEvent) {
@@ -90,6 +117,7 @@ type busState struct {
 	stopping bool
 	// Tests shorten these; zero is the protocol's (internal/bus).
 	pingEvery, pingTimeout, helloTimeout time.Duration
+	maxMessage                           int
 	// idents keeps the identities instead of h.store (tests without Postgres).
 	idents busStore
 	// storeErrLog throttles the line for a token lookup the store did not answer; storeDown is until when (UnixNano)
@@ -138,6 +166,9 @@ type busConn struct {
 	// here only, never stored.
 	proofKey string
 
+	// extensionOwnerProfile is the latest accepted profile on this connection for legacy extension authorization.
+	extensionOwnerProfile atomic.Pointer[assistantwire.Profile]
+
 	// guarded by busState.mu
 	presence busPresence
 	replaced bool // a newer connection of the identity took over
@@ -145,6 +176,9 @@ type busConn struct {
 	// inboxNeedsYou is the inbox's "Needs you" count it reported on this connection (inbox.needs_you, managers.go);
 	// nil: none yet. It goes with the connection, so the roster never shows the count of a manager that is away.
 	inboxNeedsYou *int
+	// countsView is the counts view it told on this connection (counts.view, counts_view.go), compacted and never
+	// decoded; nil: none yet. It goes with the connection, as inboxNeedsYou does.
+	countsView json.RawMessage
 
 	// roster is the managers event on its way to it (sendRoster): the newest list, its number and the one sent last.
 	roster struct {
@@ -157,17 +191,21 @@ type busConn struct {
 
 // busPresence is a connected identity as the roster has it: who, and where its handshake says it runs.
 type busPresence struct {
-	ID      string `json:"id"`
-	Role    string `json:"role"`
-	Name    string `json:"name"`
-	Host    string `json:"host,omitempty"`
-	OS      string `json:"os,omitempty"`
-	Arch    string `json:"arch,omitempty"`
-	Deploy  string `json:"deploy,omitempty"`
-	Version string `json:"version,omitempty"`
+	ID             string `json:"id"`
+	Role           string `json:"role"`
+	Name           string `json:"name"`
+	Host           string `json:"host,omitempty"`
+	MachineUID     string `json:"machine_uid,omitempty"`
+	OS             string `json:"os,omitempty"`
+	Arch           string `json:"arch,omitempty"`
+	Deploy         string `json:"deploy,omitempty"`
+	Version        string `json:"version,omitempty"`
+	PendingRestart bool   `json:"pending_restart,omitempty"`
 	// Capabilities are what its manager.hello names (assistantwire.Capability*).
-	Capabilities []string  `json:"capabilities,omitempty"`
-	Since        time.Time `json:"since"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	// Features are the loaded built-in modules' flags to expose through the hub hello.
+	Features []string  `json:"features,omitempty"`
+	Since    time.Time `json:"since"`
 }
 
 // close sends the close frame saying why; the read loop then ends the connection.
@@ -202,6 +240,7 @@ func (e *everyMinute) Allow(now time.Time) bool {
 // it on to its center (memberForward).
 func (h *Hub) busRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+bus.Path, h.serveBus)
+	mux.HandleFunc("GET "+devicewire.DevelopmentPackagesPath+"/{commit}/{version}/{file}", h.serveDevelopmentPackage)
 	h.relayRoutes(mux) // the manager's second channel: the connections relayed to it (devices_relay.go)
 }
 
@@ -285,16 +324,22 @@ func (h *Hub) serveBus(w http.ResponseWriter, r *http.Request) {
 	// close frame.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	limit := h.busMaxMessage()
 	conn := bus.NewConn(ctx, ws)
 	tok, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ") // the one busCaller took
 	c := &busConn{ident: ident, proofKey: extwire.ProofKey(tok), ws: ws, peer: rpc.New("h", conn), helloed: make(chan struct{})}
+	c.peer.ReadLimit = limit
+	c.peer.WriteLimit = limit
+	c.peer.OnWriteRejected = func(kind, op string, size, max int) {
+		h.logf("bus: [%s] rejected outgoing %s %s: %d bytes (limit %d)", ident.ID, kind, op, size, max)
+	}
 	// A card the hub's own feature asks (fleet.ask) is withdrawn when that feature stops waiting (a tool call whose
 	// caller went away, #2597). So is what the manager does for one of the hub's features (extensions.hub_call): a
 	// persona_settings change of one of its own settings is a card it holds and a change it makes, and untold it kept
 	// the card up and made the change on a later approval, after the assistant had heard the call failed (#5907). A
 	// devices.file_call's long file copy / zip likewise stops when the hub's caller goes away (#6113). Ordinary
 	// devices.call methods run on: their node may not support cancellation, so stopping the manager would be ambiguous.
-	c.peer.Cancels = map[string]bool{assistantwire.MethodFleetAsk: true, assistantwire.MethodFleetAskPrepared: true, extwire.MethodHubCall: true, devicewire.MethodFileCall: true}
+	c.peer.Cancels = map[string]bool{assistantwire.MethodFleetAsk: true, assistantwire.MethodFleetAskPrepared: true, extwire.MethodHubCall: true, devicewire.MethodFileCall: true, devicewire.MethodRetireCall: true}
 	c.peer.OnRequest = func(ctx context.Context, method string, params json.RawMessage) (any, error) {
 		return h.busRequest(ctx, c, method, params)
 	}
@@ -331,6 +376,13 @@ func durationOr(d, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+func (h *Hub) busMaxMessage() int {
+	if h.bus.maxMessage > 0 {
+		return h.bus.maxMessage
+	}
+	return bus.MaxMessage
 }
 
 // busRequest is the connection's dispatcher: its handshake, then busMethods on the current connection only.
@@ -374,13 +426,17 @@ func (c *busConn) refuse(h *Hub, err error) (any, error) {
 // busManagerHello is what manager.hello says that the hub keeps for now; the rest (apps, the machine's summary) is
 // the follow-up's.
 type busManagerHello struct {
-	ID           string   `json:"id"`
-	Host         string   `json:"host"`
-	OS           string   `json:"os"`
-	Arch         string   `json:"arch"`
-	Deploy       string   `json:"deploy"`
-	Version      string   `json:"version"`
-	Capabilities []string `json:"capabilities"`
+	ID                     string   `json:"id"`
+	Host                   string   `json:"host"`
+	MachineUID             string   `json:"machine_uid,omitempty"`
+	OS                     string   `json:"os"`
+	Arch                   string   `json:"arch"`
+	Deploy                 string   `json:"deploy"`
+	Version                string   `json:"version"`
+	PendingRestart         bool     `json:"pending_restart,omitempty"`
+	Capabilities           []string `json:"capabilities"`
+	Features               []string `json:"features"`
+	ProjectReviewAppInputs *bool    `json:"project_review_app_inputs,omitempty"`
 }
 
 // busHelloReply is manager.hello's answer: who the hub knows the service as, the managers, and the assistant's hello
@@ -409,9 +465,33 @@ func (h *Hub) managerHello(ctx context.Context, c *busConn, params json.RawMessa
 	if p.ID != c.ident.ID {
 		return c.refuse(h, fmt.Errorf("manager.hello says %q but the token is %q's", clip(p.ID, 64), c.ident.ID))
 	}
-	if err := h.busAccept(ctx, c, busPresence{Host: clip(p.Host, 200), OS: clip(p.OS, 40), Arch: clip(p.Arch, 40),
-		Deploy: clip(p.Deploy, 40), Version: clip(p.Version, 80), Capabilities: capabilityList(p.Capabilities)}); err != nil {
+	capabilities, cut := capabilityList(p.Capabilities)
+	features, featuresCut := capabilityList(p.Features)
+	if err := h.busAccept(ctx, c, busPresence{Host: clip(p.Host, 200), MachineUID: clip(strings.TrimSpace(p.MachineUID), 80),
+		OS: clip(p.OS, 40), Arch: clip(p.Arch, 40), Deploy: clip(p.Deploy, 40), Version: clip(p.Version, 80),
+		PendingRestart: p.PendingRestart, Capabilities: capabilities, Features: features}); err != nil {
 		return nil, err
+	}
+	// A hello without the switch or the capability (a manager from before project review, or one rolled back to such a
+	// version) turns App inputs off: what was queued for it is dropped, and nothing more is queued that it could never
+	// take. An optional feature: its write failing must not hang up the manager (refuse says "wrong identity", which a
+	// client may take as final). The switch saved by an earlier hello stays in place, and the next hello writes again.
+	appInputs := p.ProjectReviewAppInputs != nil && *p.ProjectReviewAppInputs &&
+		slices.Contains(p.Capabilities, assistantwire.CapabilityProjectReview)
+	if err := h.setProjectReviewAppInputs(ctx, c.ident.ID, appInputs); err != nil {
+		h.logf("bus: [%s] project review App inputs not saved: %v", c.ident.ID, err)
+	}
+	if slices.Contains(p.Capabilities, assistantwire.CapabilityProjectReview) {
+		h.pokeProjectReviewOwners() // its rows, kept while it was away
+	}
+	for _, l := range []struct {
+		what      string
+		kept, cut []string
+	}{{"capabilities", capabilities, cut}, {"features", features, featuresCut}} {
+		if len(l.cut) > 0 {
+			h.logf("bus: [%s] hello names %d %s and the hub keeps %d: dropped %s (raise maxManagerCapabilities)",
+				c.ident.ID, len(l.kept)+len(l.cut), l.what, maxManagerCapabilities, strings.Join(l.cut[:min(len(l.cut), 8)], ", "))
+		}
 	}
 	if c.ident.Role == bus.RoleManager && !slices.Contains(p.Capabilities, assistantwire.CapabilityConfigOwn) {
 		h.bus.mu.Lock()
@@ -435,15 +515,25 @@ func (h *Hub) managerHello(ctx context.Context, c *busConn, params json.RawMessa
 	return reply, nil
 }
 
-// capabilityList is a hello's capabilities, bounded: at most 32 names of at most 64 bytes.
-func capabilityList(in []string) []string {
-	var out []string
+// maxManagerCapabilities bounds how many capabilities the hub keeps from a manager's hello. A capability past it is
+// dropped, so the feature it gates never starts (managerHello logs which); the built-in manager alone says 33
+// (2026-11-24), and TestManagerHelloCapabilitiesFit keeps room above that.
+const maxManagerCapabilities = 64
+
+// capabilityList is a hello's capabilities, bounded: at most maxManagerCapabilities names of at most 64 bytes. cut is
+// the well-formed names past the limit, in the hello's order: what the hub drops that the manager means.
+func capabilityList(in []string) (out, cut []string) {
 	for _, c := range in {
-		if c = strings.TrimSpace(c); c != "" && len(c) <= 64 && len(out) < 32 && !slices.Contains(out, c) {
+		if c = strings.TrimSpace(c); c == "" || len(c) > 64 || slices.Contains(out, c) || slices.Contains(cut, c) {
+			continue
+		}
+		if len(out) < maxManagerCapabilities {
 			out = append(out, c)
+		} else {
+			cut = append(cut, c)
 		}
 	}
-	return out
+	return out, cut
 }
 
 // busAccept makes c its identity's current connection, and hangs up the one it replaces.
@@ -458,6 +548,11 @@ func (h *Hub) busAccept(ctx context.Context, c *busConn, p busPresence) error {
 		h.bus.current = map[string]*busConn{}
 	}
 	old := h.bus.current[c.ident.ID]
+	var prevPresence busPresence
+	if old == c {
+		prevPresence = c.presence
+		p.Since = prevPresence.Since
+	}
 	h.bus.current[c.ident.ID] = c
 	c.presence = p
 	if old != nil && old != c {
@@ -466,13 +561,19 @@ func (h *Hub) busAccept(ctx context.Context, c *busConn, p busPresence) error {
 	h.bus.mu.Unlock()
 	c.once.Do(func() { close(c.helloed) })
 	if old == c {
+		if prevPresence.Host != p.Host || prevPresence.MachineUID != p.MachineUID || prevPresence.OS != p.OS ||
+			prevPresence.Arch != p.Arch || prevPresence.Deploy != p.Deploy || prevPresence.Version != p.Version {
+			h.busSeen(ctx, c.ident.ID, &db.BusIdentity{Host: p.Host, MachineUID: p.MachineUID, OS: p.OS, Arch: p.Arch, Deploy: p.Deploy, Version: p.Version})
+		} else if prevPresence.PendingRestart != p.PendingRestart || !slices.Equal(prevPresence.Capabilities, p.Capabilities) {
+			h.tellManagers()
+		}
 		return nil // a second handshake on the same connection
 	}
 	if old != nil {
 		old.close(bus.CloseReplaced, "replaced by a newer connection")
 	}
 	h.logf("bus: [%s] connected: host %q %s/%s, version %q", p.ID, p.Host, p.OS, p.Arch, p.Version)
-	h.busSeen(ctx, c.ident.ID, &db.BusIdentity{Host: p.Host, OS: p.OS, Arch: p.Arch, Deploy: p.Deploy, Version: p.Version})
+	h.busSeen(ctx, c.ident.ID, &db.BusIdentity{Host: p.Host, MachineUID: p.MachineUID, OS: p.OS, Arch: p.Arch, Deploy: p.Deploy, Version: p.Version})
 	h.busRosterChanged(ctx, c)
 	if c.ident.ID == assistantwire.AssistantID {
 		go h.assistantConnected()
@@ -516,6 +617,7 @@ func (h *Hub) busEnded(c *busConn) {
 	if current {
 		h.extLost.lost(c.ident.ID, time.Now()) // its extensions may still call for a while (extensions_proof.go)
 		h.logf("bus: [%s] disconnected", c.ident.ID)
+		h.countsViewEnded(c) // the apps hear that its view stopped (counts_view.go); they keep the one they have
 		if c.ident.Role == bus.RoleManager {
 			go h.devicesGone(c.ident.ID) // its machines (devices_reports.go)
 		}
@@ -639,15 +741,20 @@ func (h *Hub) callBusAsIs(ctx context.Context, id, method string, params, out an
 	if c == nil {
 		return fmt.Errorf("%s: %w", id, errBusOffline)
 	}
+	return c.Call(ctx, method, params, out)
+}
+
+// Call uses this exact connection and the caller's deadline.
+func (c *busConn) Call(ctx context.Context, method string, params, out any) error {
 	if params == nil {
 		params = map[string]any{}
 	}
 	err := c.peer.Call(ctx, method, params, out)
 	switch {
 	case errors.Is(err, rpc.ErrDropped):
-		return fmt.Errorf("%s: %w", id, errBusDropped)
+		return fmt.Errorf("%s: %w", c.ident.ID, errBusDropped)
 	case errors.Is(err, rpc.ErrClosed):
-		return fmt.Errorf("%s: %w", id, errBusOffline)
+		return fmt.Errorf("%s: %w", c.ident.ID, errBusOffline)
 	}
 	return err
 }

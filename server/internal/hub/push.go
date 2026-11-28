@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +19,10 @@ import (
 	"github.com/nwverse/persona/server/internal/db"
 	"github.com/nwverse/persona/server/internal/i18n"
 )
+
+// errCredentialRevoked is returned when a push registration, prefs update, or web push subscription
+// races with or follows revocation of its authenticating credential.
+var errCredentialRevoked = errors.New("credential revoked")
 
 // Device is an iPhone, a Mac or a Watch that wants push notifications.
 type Device = db.Device
@@ -39,6 +44,10 @@ type Pusher struct {
 	direct *apns.Client
 	// relay posts to the devices' relays over connections kept between pushes (apns.NewTransport, #4800).
 	relay *http.Client
+	// privateOnly is office network mode (private_network.go): no relay is ever posted to, the hub's own key pushes only
+	// sealed payloads with the relay's content-free envelope (sealedDirect), and Live Activities, which iOS reads in the
+	// clear, are not pushed.
+	privateOnly bool
 	// retryWaits: how long a push the relay did not take for a reason that may pass waits before each further try
 	// (postRelayRetrying); tests shorten them.
 	retryWaits []time.Duration
@@ -51,6 +60,8 @@ type Pusher struct {
 	userLang func() i18n.Lang
 	// userLoc is the user's time zone (Hub.userLocation): quiet hours without a zone of their own read in it (quiethours.go).
 	userLoc func() *time.Location
+	// attention is the attention mode the assistant last reported (Hub.attentionMode, push_attention.go); nil: normal.
+	attention func() *assistantwire.Attention
 	// desktopOpen: the desktop app with this push device id is connected (Hub.desktopOpen); it posts its own
 	// notifications for agents then (the Mac's MacAttentionWatcher).
 	desktopOpen func(device string) bool
@@ -59,6 +70,9 @@ type Pusher struct {
 	// devicesChanged runs after a device was registered, forgotten or reloaded, or its settings changed (Hub:
 	// fleet.clients, whether a phone would be pushed an MCP form). It may run under the Pusher's locks: it must not block.
 	devicesChanged func()
+	// revoked reports whether a device credential has been revoked (Hub.isDeviceRevoked).
+	// Must acquire only leaf locks (h.devtok.mu) because callers may hold saveMu or mu.
+	revoked func(credential string) bool
 
 	// sends counts the APNs and relay posts still on their way (sendBuiltWith, sendLiveActivity): each runs in its own
 	// goroutine and logs when it ends, so whoever closes what they post to (a test's fake APNs) waits for them first.
@@ -79,21 +93,25 @@ type Pusher struct {
 	acceptedDirty map[string]bool
 	// withdrawals: where each card's push went, to take it back when the card is over (push_withdraw.go).
 	withdrawals withdrawals
-	saveMu      sync.Mutex // one device row write at a time, always the latest state (register, setPrefsBy, renewal, forget, maintenance)
+	// todoPushes: when each to-do's push to the owner about one reason last rang (push_todo_dedup.go).
+	todoPushes todoPushBook
+	saveMu     sync.Mutex // one device row write at a time, always the latest state (register, setPrefsBy, renewal, forget, maintenance)
 	// storeTimeout bounds each device row write, which never runs under mu; tests shorten it.
 	storeTimeout time.Duration
 	// prefsEdit holds one change of a device's settings from its read to its write (editPrefs); taken before saveMu
 	// and mu, never by a push.
 	prefsEdit sync.Mutex
 
-	// gradingMu guards the low-distraction mode state (push_grading.go): the cached switch, the per-key push times for the
-	// 12-hour rule, the held-push list and the delivered-push counts.
+	// gradingMu guards the low-distraction mode state (push_grading.go): the cached switch, per-manager push times for
+	// repeat suppression, the held-push list and the delivered-push counts. gradingSwitchMu serializes owner switch
+	// writes across the database and in-memory cache so concurrent toggles never invert cached state.
+	gradingSwitchMu   sync.Mutex
 	gradingMu         sync.Mutex
 	gradingCached     *bool
 	gradingCachedAt   time.Time
 	gradingRefreshing bool
 	gradingVersion    uint64 // bumped by setPushGrading, so a refresh that read before it does not undo it
-	gradingLastAlert  map[string]time.Time
+	gradingLastAlert  map[string]map[string]time.Time
 	intercepts        []heldPushRecord
 	sent              []pushSent
 	heldDirty         bool // the held-push list changed since the last save
@@ -109,6 +127,10 @@ type Pusher struct {
 	sentMirrorMu   sync.Mutex
 	gradingWriting bool // the one saver goroutine is running
 
+	// Cached versioned push grading configuration snapshot (hub.push_grading and
+	// hub.push_grading_layer), resolved independently per manager.
+	gradingEffective *pushGradingEffectiveCache
+
 	maintenanceWake     chan struct{}
 	maintenanceDeferred bool
 	pendingForgets      []Device
@@ -122,6 +144,8 @@ func newPusher(dir string, store Store, logf func(string, ...any)) *Pusher {
 		retryWaits: []time.Duration{time.Second, 4 * time.Second}, now: time.Now, storeTimeout: deviceStoreTimeout,
 		// Web Push in memory here; the hub gives it the store when it starts (hub.go): a test's store may have no settings.
 		web: newWebPusher(nil, logf)}
+	p.gradingEffective = newPushGradingEffectiveCache(gradingConfigTTL)
+	p.gradingEffective.now = func() time.Time { return p.now() }
 	if store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), deviceStoreTimeout)
 		if _, err := store.ReconcilePushDevices(ctx, p.now().UTC(), pushDeviceMaxIdle); err != nil {
@@ -174,6 +198,10 @@ func validRelayURL(s string) bool {
 	return false
 }
 
+func (p *Pusher) isRevoked(credential string) bool {
+	return p != nil && credential != "" && p.revoked != nil && p.revoked(credential)
+}
+
 func (p *Pusher) register(d Device) error {
 	return p.registerContext(context.Background(), d)
 }
@@ -184,6 +212,9 @@ func (p *Pusher) registerContext(ctx context.Context, d Device) error {
 	d.Registering = true
 	p.saveMu.Lock()
 	defer p.saveMu.Unlock()
+	if p.isRevoked(d.Credential) || p.isRevoked(d.CredentialID) {
+		return errCredentialRevoked
+	}
 	d.RelayURL = strings.TrimRight(d.RelayURL, "/")
 	if d.RelayURL != "" && !validRelayURL(d.RelayURL) {
 		p.logf("device %s: ignoring relay url %q", d.Name, d.RelayURL)
@@ -214,7 +245,34 @@ func (p *Pusher) registerContext(ctx context.Context, d Device) error {
 	// Publish only after the ownership check and duplicate retirement commit.
 	// A failed enrollment must not expose an unpersisted APNs target to sends.
 	if err := p.writeDeviceIn(ctx, d); err != nil {
+		if p.isRevoked(d.Credential) || p.isRevoked(d.CredentialID) {
+			return errCredentialRevoked
+		}
 		return err
+	}
+	if p.isRevoked(d.Credential) || p.isRevoked(d.CredentialID) {
+		removed := false
+		p.mu.Lock()
+		if existing, ok := p.devices[d.DeviceID]; ok {
+			// When p.store != nil, writeDeviceIn already committed d.DeviceID under d's credential,
+			// so stay consistent with p.deleteRow(d); without a store, remove only if owned by d's credential.
+			owned := p.store != nil ||
+				(d.Credential != "" && (existing.Credential == d.Credential || existing.CredentialID == d.Credential)) ||
+				(d.CredentialID != "" && (existing.Credential == d.CredentialID || existing.CredentialID == d.CredentialID))
+			if owned {
+				delete(p.devices, d.DeviceID)
+				delete(p.failed, d.DeviceID)
+				delete(p.replaced, d.DeviceID)
+				delete(p.acceptedDirty, d.DeviceID)
+				removed = true
+			}
+		}
+		p.mu.Unlock()
+		if removed {
+			p.changed()
+		}
+		p.deleteRow(d)
+		return errCredentialRevoked
 	}
 	d.Registering = false
 	defer p.changed() // after mu is let go
@@ -264,7 +322,7 @@ func (p *Pusher) writeDeviceIn(parent context.Context, d Device) error {
 
 // relayed: this device can be pushed through its relay (the hub has no key of its own).
 func (p *Pusher) relayed(d Device) bool {
-	return p.direct == nil && d.RelayURL != "" && d.RelayGrant != "" && d.PushKey != ""
+	return !p.privateOnly && p.direct == nil && d.RelayURL != "" && d.RelayGrant != "" && d.PushKey != ""
 }
 
 // reachable: a push to this device can go anywhere.
@@ -305,23 +363,33 @@ func (p *Pusher) device(id string) (Device, bool) {
 
 // signedOut forgets the devices a revoked credential registered (signing out that Mac, Settings › Devices): an app signed out gets
 // no more pushes, its Live Activity included. Its notification settings go with it; pairing again starts from the
-// defaults.
+// defaults. Serialized under saveMu with registerContext and setPrefsBy so an in-flight write cannot resurrect a
+// revoked credential and signedOut never deletes a newer credential's registration for the same device_id.
 func (p *Pusher) signedOut(credential string) {
 	if p == nil || credential == "" {
 		return
 	}
+	p.saveMu.Lock()
 	p.mu.Lock()
 	var gone []Device
-	for _, d := range p.devices {
-		if d.Credential == credential {
+	for id, d := range p.devices {
+		if d.Credential == credential || d.CredentialID == credential {
 			gone = append(gone, d)
+			delete(p.devices, id)
+			delete(p.failed, id)
+			delete(p.replaced, id)
+			delete(p.acceptedDirty, id)
 		}
 	}
 	p.mu.Unlock()
-	for _, d := range gone {
-		p.forget(d)
-		p.logf("device %s signed out: no more pushes", d.Name)
+	if len(gone) > 0 {
+		p.changed()
+		for _, d := range gone {
+			p.deleteRow(d)
+			p.logf("device %s signed out: no more pushes", d.Name)
+		}
 	}
+	p.saveMu.Unlock()
 	p.web.signedOut(credential)
 }
 
@@ -443,13 +511,52 @@ func (p *Pusher) setPrefsBy(id, credential string, prefs NotifyPrefs) error {
 	raw, _ := json.Marshal(prefs)
 	p.saveMu.Lock()
 	defer p.saveMu.Unlock()
+	if p.isRevoked(credential) {
+		return errCredentialRevoked
+	}
 	if p.store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), p.storeTimeout)
 		err := p.store.SetDevicePrefs(ctx, id, credential, raw)
 		cancel()
 		if err != nil {
+			if p.isRevoked(credential) {
+				return errCredentialRevoked
+			}
 			return err
 		}
+	}
+	if p.isRevoked(credential) {
+		p.mu.Lock()
+		cur, ok := p.devices[id]
+		owned := ok && (cur.Credential == credential || cur.CredentialID == credential)
+		if owned {
+			delete(p.devices, id)
+			delete(p.failed, id)
+			delete(p.replaced, id)
+			delete(p.acceptedDirty, id)
+		}
+		p.mu.Unlock()
+		if owned {
+			p.changed()
+		}
+		deleteDB := owned
+		if !ok && p.store != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), p.storeTimeout)
+			rows, err := p.store.Devices(ctx)
+			cancel()
+			if err == nil {
+				for _, row := range rows {
+					if row.DeviceID == id && (row.Credential == credential || row.CredentialID == credential) {
+						deleteDB = true
+						break
+					}
+				}
+			}
+		}
+		if deleteDB {
+			p.deleteRow(Device{DeviceID: id, Name: id})
+		}
+		return errCredentialRevoked
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()

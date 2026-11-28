@@ -33,7 +33,7 @@ Domains are examples; replace with your configuration. HTTP addresses should be 
 | --- | --- |
 | `listen` | HTTP default `:18660`, retained for LAN / VPN. The hub's own commands on its machine (`hub pair`, `hub admin`, `hub peer`, `hub setup`, `hub doctor`, `personad extension`) call it from loopback, where it takes their master token: on `127.0.0.1` when it listens on every address or `listen` names a host, at the address `listen` names when that is loopback or one of this machine's. An address the machine doesn't have (a DHCP lease that moved on) is never called, so the token stays on the machine |
 | `public_url` | Primary pairing URL (see the [local app QR exception](../protocol/protocol.md#temporary-pairing)), also added to candidates; keep an address old clients can reach |
-| `public.tls_listen` | Empty string disables TLS; setting it adds separate HTTPS / WSS listening |
+| `public.tls_listen` | Empty string disables TLS; setting it adds separate HTTPS / WSS listening. An IPv4 host, `0.0.0.0` included, binds IPv4 only; use an empty host (`:18662`) to listen on every address |
 | `public.cert_file` / `public.key_file` | Both empty means managed self-signed certificates; custom certificates require both file paths, preferably absolute |
 | `public.advertise` | Additional candidates; full HTTPS URLs recommended, also accepts domains, IPs, or hosts with ports. Missing scheme / port is filled from current listener. Advertising does not start listeners, open firewalls, or update DNS |
 | `public.advertise_ipv6` | Unset or `true` automatically advertises local global IPv6 candidates |
@@ -114,6 +114,30 @@ openssl x509 -req -in hub.csr -CA <ca>.crt -CAkey <ca>.key -CAcreateserial -days
 ```
 
 On iOS, install the CA as a profile, then turn it on under Settings › General › About › Certificate Trust Settings. Then set `public_url` to the `https://` address so that new pairings and links use it. Pair each Apple device again, and remove its old device so that its old token stops working. The hub does not renew a custom certificate, so reissue it before it expires. Persona Link pins the key, which does not change.
+
+## Office network mode
+
+Use this when an organization runs the hub for its own people: the hub, its computers and the phones work only inside the organization's network, and phones join it through the organization's VPN. Set `security.private_network_only: true` in hub.json and restart the hub (`server/internal/hub/private_network.go`):
+
+```json
+{
+  "public_url": "https://<internal hub name>:18662",
+  "public": { "tls_listen": ":18662", "advertise": ["https://<internal hub name>:18662"] },
+  "security": { "private_network_only": true, "plaintext_loopback_only": true },
+  "update": { "url": "file:///<internal release mirror>" }
+}
+```
+
+What the switch does:
+
+- **No answer to the internet.** Every request from a public source gets `403 private_network_only` on both listeners, health and pairing included, whatever the firewall lets through. Loopback, private and on-link addresses and `security.trusted_cidrs` (the VPN's range) reach the routes as before; see [source classification](#source-classification-and-reverse-proxies).
+- **Refused settings.** The hub does not start, and `personad hub doctor` names each one, while hub.json has `public.ddns`, `public.advertise_ipv6: true`, a public IP literal in `public_url` or `public.advertise`, `security.allow_public_plaintext`, `sharing.public_origin`, `update.development`, or a machine of kind `tailcat` or with `tailcat_addr`. Names are not resolved: the organization's DNS answers for them.
+- **No global IPv6 candidates.** Without `public.advertise_ipv6`, the hub hands out no global IPv6 address it finds on its interfaces.
+- **Updates only from the organization.** The build's own update source is not used: the hub checks for releases, and offers the Android app, only from `update.url`; without it there are no update checks. Node builds follow the same source unless `node_packages.url` names one.
+- **Pushes with the hub's own key, content-free.** The publisher's [push relay](push-relay.md) is never used, so a hub without `~/.persona/apns.json` sends no Apple pushes. With the key, every alert to Apple is content-free: title "Persona" and a localized "New message"; the phone shows the details once the app opens over the organization's network. When the phone has registered a push key with the hub (the app sends it with a relay grant), the payload also travels sealed to that key in `e`, and the notification service extension shows the full notification; background pushes and urgent calls need that key and are not sent without it. Apple sees which device is pushed and when, never the content. Live Activities are not pushed, because iOS reads their content in the clear.
+- **No tailcat.** The manager never dials tailcat, and every node it connects stops its tailcat endpoint (`node.configure private_network`). Delete `~/.persona/tailcat.json` on those computers so the endpoint does not start again before the hub connects. Connect computers with Persona Link instead ([link.md](link.md)).
+
+Not covered: what the manager reaches because the administrator turned it on (model providers, mail, Lark, GitHub and other connectors, extension markets, Web Push to browsers). Allow those destinations in the firewall's outbound rules; allow `api.push.apple.com:443` for pushes.
 
 ## Candidate addresses and DDNS
 
@@ -200,6 +224,15 @@ Hub trusts only connection source and local receiving addresses, **not `X-Forwar
 **Docker Desktop / OrbStack forwarded sources** are not guaranteed gateways: Docker Desktop gvisor networking may make local and LAN clients share one public-looking address. Hub uses the actual peer, so plaintext APIs return `403 tls_required`; whitelisting only `docker network inspect`'s gateway may not help. While connecting, inspect the remote address for container port 18660 with `docker compose exec hub netstat -tn`, then follow [Docker troubleshooting](docker.md#docker-desktop--orbstack-的明文连接). Prefer hub TLS. For local-only trials, bind host ports to `127.0.0.1`, then whitelist the observed forwarded source as a single-address CIDR in `security.trusted_cidrs`. That source may represent all forwarded clients; a whitelist does not restore original identity.
 
 Local TLS-terminating reverse proxies make source loopback; remote ones make it the proxy address. This affects public plaintext / main-token restrictions, health redaction, and rate limits. Forwarded headers cannot restore these checks. A reverse proxy must handle public TLS, access control, rate limiting, and prevent public access through it to local-only pairing-code endpoints. Prefer hub's own TLS listener. TCP-only forwarding without TLS termination (port forwarding, tunneling, nginx `stream` SNI passthrough to TLS port) can use PROXY protocol to convey real sources.
+
+### Wildcard preview origins
+
+To let the web app render dev servers inside an isolated-origin `<iframe>` instead of streaming headless-browser frames ([preview.md](../web/preview.md) "Isolated preview origin"), point wildcard DNS `*.<preview.domain>` at your hub (for example `*.preview.example.com`) and set `preview.domain` in `hub.json` ([config.md](config.md)). Using a domain separate from the hub's registrable domain (or at least a dedicated subdomain with `preview.domain` distinct from `public_url`) strengthens site isolation; `preview.domain` must never overlap `public_url`, `public.advertise`, or `sharing.public_origin`. Two TLS deployments are supported:
+
+1. **Hub's own TLS listener (`public.tls_listen`) with SNI selection**: configure `preview.cert_file` and `preview.key_file` with a wildcard certificate covering `*.<preview.domain>`. On TLS handshakes whose SNI is a single-level `<label>.<preview.domain>`, the hub serves the preview certificate; all other handshakes (empty SNI, the hub hostname, Persona Link, phones, bare `<preview.domain>`, nested subdomains) keep serving the hub's identity certificate unchanged, so Persona Link and app SPKI pinning (`fp`) are completely unaffected. The preview certificate is checked and reloaded on the hub's 2-minute TLS refresh timer and, unlike the hub's pinned identity key, may rotate its private key on renewal. When `preview.port` is omitted, preview URLs use `public.tls_listen`'s port.
+2. **TLS-terminating reverse proxy in front of the hub**: omit `preview.cert_file` and `preview.key_file`, terminate TLS for `*.<preview.domain>` at the reverse proxy (Caddy, nginx, Cloudflare, etc.), and forward HTTP and WebSocket upgrades (`Upgrade` / `Connection`) to the hub's `listen` port with the original `Host` header preserved. Set `preview.port` only if the proxy serves HTTPS on a port other than `443`. As described above, the hub still classifies sources strictly by socket peer address and never trusts `X-Forwarded-For` or `X-Forwarded-Proto`; plaintext preview requests arriving directly from a public peer are rejected with `403 tls_required` (and `security.private_network_only` / `security.plaintext_loopback_only` apply identically). The preview session cookie is always emitted with `Secure`.
+
+Requests matching `<preview.domain>` or `*.<preview.domain>` are intercepted before hub routes and never reach `/api/v1/*`, `/admin`, `/s/*`, or the web app (`/api` and `/api/*` on preview hosts always return `404`). Hub APIs remain Bearer-only with no CORS headers allowing preview origins.
 
 ### PROXY protocol
 

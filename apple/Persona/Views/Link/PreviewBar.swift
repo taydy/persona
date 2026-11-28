@@ -1,14 +1,11 @@
 import SwiftUI
-#if canImport(UIKit)
 import UIKit
-#endif
 import WebKit
 
 // The link card's tools for a machine's dev server (#150, docs/web/preview.md "iPhone"): under a forwarded page, back /
 // forward, where the page is on that computer, a screenshot for the message and picking an element to comment on. The
 // page itself is the pool's web view, as for any link (LinkSheet.swift).
 
-#if os(iOS) || os(visionOS)
 /// What the page's web view says about where it is (KVO), for the bar.
 @MainActor @Observable
 final class WebNav {
@@ -46,7 +43,6 @@ final class WebNav {
         Task { @MainActor [weak self] in self?.attached = true }
     }
 }
-#endif
 
 #if os(iOS)
 /// Picking an element in the page: the node's own `preview_pick.js` (the app bundles a copy, kept equal by
@@ -246,6 +242,10 @@ struct PreviewPage: View {
     var url: URL
     var key: SessionKey
     @Binding var title: String
+    var forwardedLabel: String? = nil
+    var onRetry: (() -> Void)? = nil
+    var onOpenExternal: ((URL) -> Void)? = nil
+    var onReprobePort: ((PortForwarder.Key) async -> PortPresence.ReprobeOutcome)? = nil
     var onSelect: (String, String) -> Void
     @State private var nav = WebNav()
     @State private var picker = ElementPicker()
@@ -272,7 +272,16 @@ struct PreviewPage: View {
 
     var body: some View {
         VStack(spacing: Theme.Space.flush) {
-            PooledWebView(url: url, title: $title, nav: nav, onPick: onSelect)
+            WebPageView(
+                url: url,
+                forwardedLabel: forwardedLabel,
+                title: $title,
+                nav: nav,
+                onRetry: onRetry ?? { WebViewPool.shared.reload(url) },
+                onOpenExternal: onOpenExternal ?? { _ in },
+                onReprobePort: onReprobePort,
+                onPick: onSelect
+            )
                 .overlay(alignment: .top) {
                     if picking && picked == nil { banner.transition(reduceMotion ? AnyTransition.opacity : AnyTransition.move(edge: .top).combined(with: .opacity)) }
                 }

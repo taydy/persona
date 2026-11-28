@@ -22,6 +22,12 @@ const recordFile = process.argv[process.argv.indexOf('--record') + 1]
 const noAdditionalDirs = process.argv.includes('--no-additional-dirs')
 const failResume = process.argv.includes('--fail-resume')
 const ignoreTerm = process.argv.includes('--ignore-term')
+const flagValue = (name) => {
+  const index = process.argv.indexOf(name)
+  return index >= 0 ? process.argv[index + 1] : undefined
+}
+const resumeDefaultModel = flagValue('--resume-default-model')
+const rejectModel = flagValue('--reject-model')
 const record = (o) => appendFileSync(recordFile, `${JSON.stringify({ worker: process.pid, ...o })}\n`)
 const send = (o) => process.stdout.write(`${JSON.stringify(o)}\n`)
 
@@ -59,13 +65,35 @@ function onRequest(msg) {
       if (failResume) {
         return send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'session/resume refused additionalDirectories' } })
       }
+      if (resumeDefaultModel) {
+        return answer({
+          models: {
+            currentModelId: resumeDefaultModel,
+            availableModels: [{ modelId: resumeDefaultModel, name: resumeDefaultModel }],
+          },
+        })
+      }
       return answer({})
     case 'session/set_model':
+      if (rejectModel && params?.modelId === rejectModel) {
+        return send({ jsonrpc: '2.0', id, error: { code: -32602, message: `Unknown model ${params.modelId}` } })
+      }
+      return answer({})
     case 'session/set_mode':
     case 'session/close':
       return answer({})
     case 'session/set_config_option':
       answer({})
+      if (params.value === 'wake-idle') {
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: params.sessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'autonomous step' } },
+          },
+        })
+      }
       if (params.value === 'ask-idle') askPermission(params.sessionId)
       return
     case 'session/prompt': {
@@ -103,10 +131,15 @@ function onNotification(msg) {
 }
 
 if (ignoreTerm) {
-  process.on('SIGTERM', () => {})
+  process.on('SIGTERM', () => record({ term: process.pid }))
   setInterval(() => {}, 60_000)
 }
-record({ started: process.pid })
+record({
+  started: process.pid,
+  fakeExtensionCredential: process.env.EXAMPLE_EXTENSION_CREDENTIAL ?? null,
+  fakeExtensionAccount: process.env.EXAMPLE_EXTENSION_ACCOUNT ?? null,
+  path: process.env.PATH ?? '',
+})
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
 rl.on('line', (line) => {
   if (!line.trim()) return

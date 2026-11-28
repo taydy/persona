@@ -9,6 +9,7 @@ vi.hoisted(() => {
   globalThis.ResizeObserver ??= class { observe() {} unobserve() {} disconnect() {} } as unknown as typeof ResizeObserver;
 });
 import { emptyTaskIndex } from "../../lib/tasks";
+import { closePanel, getPanel } from "../../lib/panel";
 import type { Item, Subagent, TaskNote } from "../../lib/types";
 import type { AgentStatus, ToolStep } from "../../lib/work-groups";
 import { ChatContext, type ChatContextValue } from "./chat-context";
@@ -147,5 +148,16 @@ describe("SubagentCard: opened in place", () => {
     draw(call(input, { text: "Done." }), "completed");
     expect(head().getAttribute("aria-expanded")).toBe("true");
     expect(subagentCardKey("t:", "c-a1")).toBe("t:task:c-a1");
+  });
+
+  it("shows View full when expanded and opens the subagent detail panel", () => {
+    draw(call(input), "running");
+    expect(host.querySelector("[data-subagent-view-full]")).toBeNull();
+    act(() => head().click());
+    const btn = host.querySelector<HTMLButtonElement>("[data-subagent-view-full]");
+    expect(btn?.textContent).toBe("查看完整内容");
+    act(() => btn!.click());
+    expect(getPanel()).toEqual({ kind: "subagent", mid: "m", sid: "s@sa1", parentMid: "m", parentSid: "s", call: "c-a1", from: "card" });
+    closePanel();
   });
 });

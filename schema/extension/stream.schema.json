@@ -235,7 +235,8 @@
             "highlight": {},
             "truncated": {},
             "load": {},
-            "line_url": {}
+            "line_url": {},
+            "navigate": {}
           },
           "additionalProperties": false
         },
@@ -353,6 +354,24 @@
             "shapes": {},
             "labels": {},
             "pins": {}
+          },
+          "additionalProperties": false
+        },
+        {
+          "$ref": "view.schema.json#/$defs/MapComponent",
+          "properties": {
+            "type": {},
+            "key": {},
+            "title": {},
+            "alt": {},
+            "caption": {},
+            "aspect": {},
+            "viewport": {},
+            "markers": {},
+            "routes": {},
+            "links": {},
+            "static": {},
+            "show_list": {}
           },
           "additionalProperties": false
         }

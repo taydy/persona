@@ -10,9 +10,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nwverse/persona/server/internal/acceptloop"
@@ -38,9 +40,18 @@ type RuntimeHost struct {
 	path    string
 	version string
 	logger  *log.Logger
+	// pipe is the named pipe runtimes the node starts dial on Windows (runtimepipe_windows.go); "" elsewhere, or
+	// when it could not be made. Set by Listen before any runtime starts, then fixed.
+	pipe string
 
-	mu   sync.Mutex
-	node *Node // the Node serving a hub connection now; nil between connections
+	mu                   sync.Mutex
+	node                 *Node                           // the Node serving a hub connection now; nil between connections
+	hubSeq               uint64                          // monotonic attach/detach transition counter
+	hubEpoch             uint64                          // monotonic hub-connection epoch incremented on every attach
+	gp                   *gateProxy                      // last attached Node's gate proxy (resident keeper's) so disconnects between hub links release leases
+	leaseDisconnectGrace time.Duration                   // zero: runtimeLeaseDisconnectGrace (tests shorten it)
+	pendingReleases      map[string]*pendingLeaseRelease // runtime id -> deferred disconnect release while same instance may reconnect
+	closed               bool                            // Listen context ended; no new deferred timers are armed
 
 	// The daemons it dials (daemons.go), by id: their ids are reserved against runtimes on the socket.
 	dmu        sync.Mutex
@@ -54,6 +65,9 @@ type RuntimeHost struct {
 	paseo paseoBridge
 	// orca runs the bridge to Orca's structured sessions while the machine's engine is Orca (orcabridge.go).
 	orca orcaBridgeState
+	// orcaBots is what the Orca bridge last learned of the computer's bots for the session list (orcabots.go); nil
+	// while it runs no bridge or knows of no bot with a listed Home Chat.
+	orcaBots atomic.Pointer[orcaBotHomes]
 	// cindy runs the Cindy bridge while the machine's engine is Cindy (cindybridge.go).
 	cindy cindyBridgeState
 	// t3code runs the T3 Code bridge while the machine's engine is T3 Code (t3codebridge.go).
@@ -86,17 +100,27 @@ func (rh *RuntimeHost) current() *Node {
 // attach makes n the Node serving the hub: it lists and drives the runtimes' sessions from now on. What the last hub
 // connection watched is forgotten (the new one watches afresh); runtimes hear that a hub is there.
 func (rh *RuntimeHost) attach(n *Node) {
-	n.runtimes = rh.reg
-	rh.reg.setHostOff(n.engineHostOff)
-	n.runtimeHost = rh
 	rh.mu.Lock()
+	if n.runtimes != rh.reg {
+		n.runtimes = rh.reg
+	}
+	if n.runtimeHost != rh {
+		n.runtimeHost = rh
+	}
 	if rh.node != n {
 		rh.reg.clearAssistantPIDs()
 	}
 	rh.node = n
-	rh.mu.Unlock()
+	rh.hubSeq++
+	rh.hubEpoch++
+	seq, epoch := rh.hubSeq, rh.hubEpoch
+	rh.reg.setHostOff(n.engineHostOff)
 	rh.reg.resetWatches()
-	rh.notifyHub(true)
+	if gp := n.existingGates(); gp != nil {
+		rh.gp = gp
+	}
+	rh.mu.Unlock()
+	rh.notifyHub(seq, epoch, true)
 }
 
 // detach: n no longer serves the hub (its connection ended). A newer Node may have attached already: then nothing.
@@ -106,27 +130,289 @@ func (rh *RuntimeHost) detach(n *Node) {
 		rh.mu.Unlock()
 		return
 	}
+	if gp := n.existingGates(); gp != nil {
+		rh.gp = gp
+	}
 	rh.node = nil
+	rh.hubSeq++
+	seq, epoch := rh.hubSeq, rh.hubEpoch
 	rh.reg.clearAssistantPIDs()
-	rh.mu.Unlock()
 	rh.reg.resetWatches()
-	rh.notifyHub(false)
+	rh.mu.Unlock()
+	rh.notifyHub(seq, epoch, false)
 }
 
-// notifyHub tells every connected runtime whether a hub is connected.
-func (rh *RuntimeHost) notifyHub(connected bool) {
+// runtimeLeaseDisconnectGrace keeps session-scoped gate proxy leases alive across a brief non-overlapping socket
+// disconnect so a surviving companion process (runtime-sdk RETRY_PRESENT = 1s) reconnecting with the same instance
+// keeps its live Assistant workers' proxy URLs working, while still reclaiming leases if it never returns.
+const runtimeLeaseDisconnectGrace = 15 * time.Second
+
+type pendingLeaseRelease struct {
+	instance string
+	sessions []string
+	timer    *time.Timer
+}
+
+func (rh *RuntimeHost) leaseGrace() time.Duration {
+	if rh.leaseDisconnectGrace > 0 {
+		return rh.leaseDisconnectGrace
+	}
+	return runtimeLeaseDisconnectGrace
+}
+
+func (rh *RuntimeHost) releaseSessionGates(sessions []string) {
+	if len(sessions) == 0 {
+		return
+	}
+	rh.mu.Lock()
+	n, gp := rh.node, rh.gp
+	rh.mu.Unlock()
+	if cur := n.existingGates(); cur != nil {
+		cur.releaseSessions(sessions)
+	} else if gp != nil {
+		gp.releaseSessions(sessions)
+	}
+}
+
+func mergeUniqueStrings(a, b []string) []string {
+	out := make([]string, 0, len(a)+len(b))
+	seen := make(map[string]struct{}, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, s := range list {
+			if s == "" {
+				continue
+			}
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (rh *RuntimeHost) scheduleSessionGateRelease(h *runtimeConn, procID osproc.ProcIdentity, released []string) {
+	if len(released) == 0 {
+		return
+	}
+	h.mu.Lock()
+	id, instance, pid := h.hello.Runtime, h.hello.Instance, h.pid
+	h.mu.Unlock()
+	dead := pid > 0 && procID.Start != "" && !procID.StillIs(pid)
+
+	var immediate []string
+	rh.mu.Lock()
+	if id == "" || rh.closed {
+		immediate = released
+	} else if activeInst, connected := rh.reg.activeInstance(id); connected {
+		// Another connection for id is already active: same-instance reconnect preserves leases, and
+		// different-instance takeover already handled replacement in onRuntimeHello.
+		_ = activeInst
+	} else if dead {
+		immediate = released
+		if prev := rh.pendingReleases[id]; prev != nil {
+			prev.timer.Stop()
+			delete(rh.pendingReleases, id)
+			immediate = mergeUniqueStrings(prev.sessions, immediate)
+		}
+	} else {
+		if rh.pendingReleases == nil {
+			rh.pendingReleases = map[string]*pendingLeaseRelease{}
+		}
+		sessions := released
+		if prev := rh.pendingReleases[id]; prev != nil {
+			prev.timer.Stop()
+			if prev.instance != "" && instance != "" && prev.instance != instance {
+				immediate = prev.sessions
+			} else {
+				sessions = mergeUniqueStrings(prev.sessions, sessions)
+			}
+		}
+		entry := &pendingLeaseRelease{instance: instance, sessions: sessions}
+		grace := rh.leaseGrace()
+		entry.timer = time.AfterFunc(grace, func() { rh.expirePendingLeaseRelease(id, entry) })
+		rh.pendingReleases[id] = entry
+	}
+	rh.mu.Unlock()
+	rh.releaseSessionGates(immediate)
+}
+
+func (rh *RuntimeHost) expirePendingLeaseRelease(id string, entry *pendingLeaseRelease) {
+	rh.mu.Lock()
+	if rh.pendingReleases[id] != entry {
+		rh.mu.Unlock()
+		return
+	}
+	if activeInst, connected := rh.reg.activeInstance(id); connected && (activeInst == "" || entry.instance == "" || activeInst == entry.instance) {
+		delete(rh.pendingReleases, id)
+		rh.mu.Unlock()
+		return
+	}
+	delete(rh.pendingReleases, id)
+	sessions := rh.reg.unownedSessions(entry.sessions)
+	rh.mu.Unlock()
+	rh.releaseSessionGates(sessions)
+}
+
+func (rh *RuntimeHost) onRuntimeHello(id, instance string, replacedSessions []string) {
+	var toRelease []string
+	rh.mu.Lock()
+	if prev := rh.pendingReleases[id]; prev != nil {
+		prev.timer.Stop()
+		delete(rh.pendingReleases, id)
+		if prev.instance != "" && instance != "" && prev.instance != instance {
+			toRelease = append(toRelease, prev.sessions...)
+		}
+	}
+	rh.mu.Unlock()
+	toRelease = mergeUniqueStrings(toRelease, replacedSessions)
+	rh.releaseSessionGates(toRelease)
+}
+
+func (rh *RuntimeHost) cancelPendingLeaseReleases() {
+	rh.mu.Lock()
+	rh.closed = true
+	for id, entry := range rh.pendingReleases {
+		entry.timer.Stop()
+		delete(rh.pendingReleases, id)
+	}
+	rh.mu.Unlock()
+}
+
+// notifyHub schedules per-connection ordered runtime.hub notifications without blocking
+// healthy runtimes behind a slow/wedged peer and without holding rh.mu across writes.
+func (rh *RuntimeHost) notifyHub(seq, epoch uint64, connected bool) {
 	for _, h := range rh.reg.ready() {
-		_ = h.peer.Notify("runtime.hub", map[string]any{"connected": connected})
+		h.enqueueHub(seq, epoch, connected)
+	}
+}
+
+// releaseHubAfterHello unblocks per-connection runtime.hub delivery once the runtime.hello
+// reply has been written to the wire, reconciling any attach/detach that raced with hello.
+func (rh *RuntimeHost) releaseHubAfterHello(h *runtimeConn) {
+	rh.mu.Lock()
+	seq, epoch, connected := rh.hubSeq, rh.hubEpoch, rh.node != nil
+	rh.mu.Unlock()
+	h.mu.Lock()
+	if h.hubHolders > 0 {
+		h.hubHolders--
+	}
+	var start bool
+	if h.ready && h.hubHolders == 0 {
+		if seq > h.hubTargetSeq {
+			h.hubTargetSeq = seq
+			h.hubTargetEpoch = epoch
+			h.hubTargetConn = connected
+		}
+		start = h.tryStartHubDrainLocked()
+	}
+	h.mu.Unlock()
+	if start {
+		go h.drainHubNotifications()
+	}
+}
+
+func (h *runtimeConn) enqueueHub(seq, epoch uint64, connected bool) {
+	if h == nil || h.peer == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.hubClosed || seq <= h.hubTargetSeq {
+		h.mu.Unlock()
+		return
+	}
+	h.hubTargetSeq = seq
+	h.hubTargetEpoch = epoch
+	h.hubTargetConn = connected
+	start := h.tryStartHubDrainLocked()
+	h.mu.Unlock()
+	if start {
+		go h.drainHubNotifications()
+	}
+}
+
+// nextHubNotificationLocked returns the next runtime.hub boolean to write on h.
+// If h was last told connected=true for an earlier hub epoch and the latest target is
+// connected=true for a newer hub epoch, it emits connected=false first so edge-triggered
+// runtime SDKs observe the disconnect edge and re-report assistant PIDs. Caller holds h.mu.
+func (h *runtimeConn) nextHubNotificationLocked() (connected bool, send bool) {
+	if !h.ready || h.hubHolders > 0 || h.hubClosed || h.peer == nil {
+		return false, false
+	}
+	if !h.hubStateInit {
+		return h.hubTargetConn, true
+	}
+	if h.hubLastConnected == h.hubTargetConn && (!h.hubLastConnected || h.hubLastEpoch == h.hubTargetEpoch) {
+		return false, false
+	}
+	if h.hubLastConnected && h.hubTargetConn && h.hubLastEpoch != h.hubTargetEpoch {
+		return false, true
+	}
+	return h.hubTargetConn, true
+}
+
+func (h *runtimeConn) tryStartHubDrainLocked() bool {
+	if h.hubNotifying || !h.ready || h.hubHolders > 0 || h.hubClosed || h.peer == nil {
+		return false
+	}
+	if _, send := h.nextHubNotificationLocked(); !send {
+		return false
+	}
+	h.hubNotifying = true
+	return true
+}
+
+func (h *runtimeConn) drainHubNotifications() {
+	done := false
+	defer func() {
+		if !done {
+			h.mu.Lock()
+			h.hubNotifying = false
+			h.mu.Unlock()
+		}
+	}()
+	for {
+		h.mu.Lock()
+		connected, send := h.nextHubNotificationLocked()
+		if !send {
+			h.hubNotifying = false
+			done = true
+			h.mu.Unlock()
+			return
+		}
+		sentEpoch := h.hubTargetEpoch
+		if !connected && h.hubStateInit && h.hubLastConnected && h.hubTargetConn && h.hubLastEpoch != h.hubTargetEpoch {
+			sentEpoch = h.hubLastEpoch
+		}
+		peer := h.peer
+		h.mu.Unlock()
+
+		if err := peer.Notify("runtime.hub", map[string]any{"connected": connected}); err != nil {
+			h.mu.Lock()
+			h.hubNotifying = false
+			done = true
+			h.mu.Unlock()
+			return
+		}
+
+		h.mu.Lock()
+		h.hubStateInit = true
+		h.hubLastConnected = connected
+		h.hubLastEpoch = sentEpoch
+		h.mu.Unlock()
 	}
 }
 
 // Listen serves runtimes on the socket until ctx ends, re-creating the socket file if something removes it (an older
 // node shutting down), as the hook socket does. It dials the daemons in daemons.json beside the socket too.
 func (rh *RuntimeHost) Listen(ctx context.Context) error {
+	rh.ctx = ctx
 	if _, err := rh.listenOnce(ctx); err != nil {
+		rh.ctx = nil
 		return err
 	}
-	rh.ctx = ctx
+	rh.listenPipe(ctx)
 	rh.startDaemons(ctx)
 	if rh.autoCompanions {
 		rh.setAgyBridge(true)
@@ -138,6 +424,7 @@ func (rh *RuntimeHost) Listen(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
+				rh.cancelPendingLeaseReleases()
 				return
 			case <-t.C:
 			}
@@ -150,6 +437,21 @@ func (rh *RuntimeHost) Listen(ctx context.Context) error {
 		}
 	}()
 	return nil
+}
+
+// dialPath is where a runtime the node starts connects: the named pipe on Windows, whose Node.js cannot reach a Unix
+// socket (runtimepipe_windows.go), else the socket.
+func (rh *RuntimeHost) dialPath() string {
+	if rh.pipe != "" {
+		return rh.pipe
+	}
+	return rh.path
+}
+
+// mcpConfig is the node's mcp.json, beside the runtime socket. It follows rh.path, never dialPath: on Windows that is
+// a pipe name, whose directory is \\.\pipe.
+func (rh *RuntimeHost) mcpConfig() string {
+	return filepath.Join(filepath.Dir(rh.path), "mcp.json")
 }
 
 func (rh *RuntimeHost) listenOnce(ctx context.Context) (net.Listener, error) {
@@ -181,7 +483,9 @@ func (rh *RuntimeHost) serveConn(ctx context.Context, c io.ReadWriteCloser, daem
 	defer stop()
 	defer c.Close()
 	peer := rpc.New("r", c)
+	peer.TrackReplies = true
 	pid := 0
+	var procID osproc.ProcIdentity
 	if nc, ok := c.(net.Conn); ok {
 		pid, _ = peerPID(nc) // 0 for a pipe, or where the system does not tell
 	}
@@ -190,6 +494,9 @@ func (rh *RuntimeHost) serveConn(ctx context.Context, c io.ReadWriteCloser, daem
 	// runs would descend from it.
 	if pid > 0 && slices.Contains(nodeLineage(), pid) {
 		pid = 0
+	}
+	if pid > 0 {
+		procID = osproc.Identify(pid)
 	}
 	h := rh.reg.add(peer)
 	h.mu.Lock()
@@ -204,7 +511,11 @@ func (rh *RuntimeHost) serveConn(ctx context.Context, c io.ReadWriteCloser, daem
 	err := peer.Serve(ctx, c)
 	peer.Close(err)
 	cancel()
-	rh.reg.remove(h)
+	released := rh.reg.remove(h)
+	h.mu.Lock()
+	h.hubClosed = true
+	h.mu.Unlock()
+	rh.scheduleSessionGateRelease(h, procID, released)
 	if id := h.id(); id != "" {
 		if id == agyRuntimeID {
 			rh.wakeAgyBridge()
@@ -287,10 +598,11 @@ func (rh *RuntimeHost) registerRuntime(ctx context.Context, h *runtimeConn, hell
 			}
 		}
 	}
-	stale, err := rh.reg.hello(h, hello, rh.reservedID, preempt)
+	stale, replacedSessions, err := rh.reg.registerHello(h, hello, rh.reservedID, preempt)
 	if err != nil {
 		return err
 	}
+	rh.onRuntimeHello(hello.Runtime, hello.Instance, replacedSessions)
 	if yieldedOpencode != nil && !slices.Contains(stale, yieldedOpencode) {
 		stale = append(stale, yieldedOpencode)
 	}
@@ -334,11 +646,16 @@ func (rh *RuntimeHost) request(ctx context.Context, h *runtimeConn, method strin
 		}
 		hello.Instance = strings.TrimSpace(hello.Instance)
 		hello.Launchers = cleanLaunchers(hello.Launchers)
+		h.mu.Lock()
+		h.hubHolders++
+		h.mu.Unlock()
 		if err := rh.registerRuntime(ctx, h, hello); err != nil {
+			rh.releaseHubAfterHello(h)
 			rh.logger.Printf("runtime %s #%d refused: %v", hello.Runtime, h.serial, err)
 			return nil, err
 		}
 		rh.logger.Printf("runtime %s %s #%d connected", hello.Runtime, hello.Version, h.serial)
+		rh.claimCodex(h, hello.CodexClaims)
 		if rh.autoCompanions && (hello.Launcher != "" || len(hello.Launchers) > 0) {
 			if n := rh.current(); n != nil && n.peer != nil {
 				_ = n.peer.Notify("launchers.changed", map[string]any{})
@@ -358,17 +675,38 @@ func (rh *RuntimeHost) request(ctx context.Context, h *runtimeConn, method strin
 		// runtime with caps.modes; resume: a runtime with caps.resume that is the machine's engine is asked to take
 		// sessions over (runtimecontrol.go). workspaces: runtime.workspaces is kept and, for a runtime with
 		// caps.workspaces that is the machine's engine, listed as its catalog and asked to make worktrees
-		// (runtimeworkspaces.go).
+		// (runtimeworkspaces.go). codex_claims: hello's codex_claims name Codex app-server instances the node leaves
+		// to the runtime (codex_instance_claims.go), a runtime on the socket's only.
 		features := []string{"prefer_running", "resume_argv", "handover", "transcript", "launchers", "start_params", "modes", "resume", "codex_thread", "unlisted_transcripts", "workspaces", "usage"}
 		if !h.isDaemon() {
-			features = append(features, "usage_windows", "leader_tools", "supervision_policy", "a2a_mcp")
+			features = append(features, "usage_windows", "leader_tools", "supervision_policy", "a2a_mcp", "remote_agent", "memory_tools", "codex_claims", "input")
 			if hello.Caps.Assistant {
 				features = append(features, "assistant_pids")
+				if hello.Caps.AssistantEnvironment && !hello.Caps.RemoteAgent {
+					features = append(features, "assistant_command_gate")
+				}
 			}
 		}
-		res := map[string]any{"protocol": RuntimeProtocol, "node_version": rh.version, "hub": rh.current() != nil,
+		offer := rh.packageOffer(h, hello)
+		rh.mu.Lock()
+		helloSeq, helloEpoch, helloHub := rh.hubSeq, rh.hubEpoch, rh.node != nil
+		rh.mu.Unlock()
+		h.mu.Lock()
+		h.hubStateInit = true
+		h.hubLastConnected = helloHub
+		h.hubLastEpoch = helloEpoch
+		if helloSeq > h.hubTargetSeq {
+			h.hubTargetSeq = helloSeq
+			h.hubTargetEpoch = helloEpoch
+			h.hubTargetConn = helloHub
+		}
+		h.mu.Unlock()
+		if !rpc.AfterReply(ctx, func() { rh.releaseHubAfterHello(h) }) {
+			rh.releaseHubAfterHello(h)
+		}
+		res := map[string]any{"protocol": RuntimeProtocol, "node_version": rh.version, "hub": helloHub,
 			"features": features}
-		if offer := rh.packageOffer(h, hello); offer != nil {
+		if offer != nil {
 			res["update"] = offer
 		}
 		return res, nil
@@ -415,6 +753,13 @@ func (rh *RuntimeHost) request(ctx context.Context, h *runtimeConn, method strin
 		}
 		if assistant && !p.LeaderOnly {
 			res.Tools = append(res.Tools, n.gateTools()...)
+			if h.remoteAgent() {
+				if p.SessionID == "" {
+					res.Tools = append(res.Tools, n.memoryTools()...)
+				} else if _, ok := n.sessionAllowsMemoryTools(p.SessionID); ok {
+					res.Tools = append(res.Tools, n.memoryTools()...)
+				}
+			}
 		}
 		if h.isDaemon() {
 			res.Tools = slices.DeleteFunc(res.Tools, func(tool proto.Tool) bool { return !assistantwire.IsA2ATool(tool.Name) })
@@ -449,7 +794,17 @@ func (rh *RuntimeHost) request(ctx context.Context, h *runtimeConn, method strin
 			return n.saveMailAttachment(ctx, p.Args, p.SessionID, assistant, n.guestOf(p.SessionID) != nil), nil
 		}
 		if g := n.gateTool(p.Name); assistant && g != nil {
+			if h.remoteAgent() {
+				rh.reg.markRemote(p.SessionID)
+				n.gates().markRemote(p.SessionID)
+			}
 			return n.assistantGateTool(ctx, g, p.SessionID, p.Args), nil
+		}
+		if isMemoryTool(p.Name) {
+			if !h.remoteAgent() || !assistant {
+				return proto.TextResult("Memory tools require a remote assistant session", true), nil
+			}
+			return n.assistantMemoryTool(ctx, p.Name, p.SessionID, p.Args), nil
 		}
 		var res json.RawMessage
 		params := map[string]any{"name": p.Name, "args": p.Args, "session_id": p.SessionID, "assistant": assistant, "guest": n.guestOf(p.SessionID) != nil}
@@ -457,6 +812,9 @@ func (rh *RuntimeHost) request(ctx context.Context, h *runtimeConn, method strin
 			params["origin"] = origin
 		}
 		err := n.peer.Call(ctx, "mcp.call", params, &res)
+		if err == nil {
+			res = n.toolViews.stripRaw(p.SessionID, p.Name, res)
+		}
 		return res, err
 	}
 	return nil, fmt.Errorf("unknown method %s", method)
@@ -499,6 +857,16 @@ func (rh *RuntimeHost) event(h *runtimeConn, event string, params json.RawMessag
 		}
 		return
 	}
+	if event == "session.compaction.settled" {
+		var p struct {
+			SessionID string `json:"session_id"`
+			Error     string `json:"error"`
+		}
+		if json.Unmarshal(params, &p) == nil && p.SessionID != "" {
+			rh.reg.settleCompaction(h, p.SessionID, p.Error)
+		}
+		return
+	}
 	if event == "runtime.workspaces" { // its own workspaces (runtimeworkspaces.go): only from one that keeps them
 		var p struct {
 			Workspaces []runtimeWorkspace `json:"workspaces"`
@@ -519,8 +887,16 @@ func (rh *RuntimeHost) event(h *runtimeConn, event string, params json.RawMessag
 			return
 		}
 		var moved []string
+		var agyPaneBackground map[string][]proto.BackgroundTask
+		var waits map[runtimeInputKey]runtimeInputReport
 		if !h.isDaemon() { // a daemon's offline sessions are not resumed in this machine's terminal engine
+			if h.reportsInput() {
+				waits = runtimeInputReports(params)
+			}
 			x := runtimeRowExtras(params, len(p.Sessions))
+			if h.id() == agyRuntimeID {
+				agyPaneBackground = agyPaneBackgroundFromRows(params)
+			}
 			h.setResume(x.resume)
 			// …nor read from this machine's transcripts: a daemon names none (runtimetranscript.go).
 			ts := x.transcripts
@@ -537,7 +913,7 @@ func (rh *RuntimeHost) event(h *runtimeConn, event string, params json.RawMessag
 		if cap(list) > 2*len(list)+8 { // the list shrank: keep no array of the old size
 			list = append(make([]proto.Session, 0, len(list)), list...)
 		}
-		rewatch, driven := rh.reg.setSessions(h, list)
+		rewatch, driven := rh.reg.setSessionList(h, list, agyPaneBackground, waits)
 		for _, id := range driven { // started for the hub by another runtime: its cards go to the phone first here too
 			if h.peer != nil {
 				_ = h.peer.Notify("runtime.driven", map[string]any{"session_id": id})
@@ -546,6 +922,7 @@ func (rh *RuntimeHost) event(h *runtimeConn, event string, params json.RawMessag
 		if n == nil {
 			return
 		}
+		n.observeAgySessions(h, list)
 		for _, id := range moved {
 			n.transcriptMoved(h, id)
 		}
