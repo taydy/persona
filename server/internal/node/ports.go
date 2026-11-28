@@ -321,6 +321,11 @@ func (n *Node) httpPorts(ctx context.Context, ls []listener, live map[string]boo
 // dialTargets are the addresses to reach a listener bound to addr, from this machine.
 func dialTargets(port int, addr string) []string {
 	p := strconv.Itoa(port)
+	// Screen Sharing can greet on both families but accept the RFB handshake only on IPv6.
+	// Prefer the IPv6 loopback for an unspecified Mac screen listener. Keep explicit bindings and TCP fallback.
+	if runtime.GOOS == "darwin" && port == screenPort && (addr == "" || addr == "*" || addr == "0.0.0.0") {
+		return []string{"[::1]:" + p, "127.0.0.1:" + p}
+	}
 	switch addr {
 	case "", "0.0.0.0", "*":
 		return []string{"127.0.0.1:" + p, "[::1]:" + p}

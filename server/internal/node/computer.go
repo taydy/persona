@@ -99,9 +99,14 @@ func computerStatus(ctx context.Context) proto.Computer {
 // screenPort is where macOS's Screen Sharing (VNC) listens; the live screen reaches it through the hub's port relay.
 const screenPort = 5900
 
-// screenSharing: macOS's Screen Sharing answers on 127.0.0.1:5900.
+// Probe the same loopback candidates used by the screen relay.
 func screenSharing(ctx context.Context) bool {
-	return answersRFB(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(screenPort)))
+	for _, addr := range dialTargets(screenPort, "") {
+		if answersRFB(ctx, addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // answersRFB: what listens at addr greets with RFB's version ("RFB 003.889" from macOS).

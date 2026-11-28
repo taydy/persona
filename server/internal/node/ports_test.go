@@ -627,3 +627,21 @@ func TestScanPortsDropsAChangedCachedProcess(t *testing.T) {
 		t.Fatalf("the host was asked %d times, want 1 (the first process never changed)", got)
 	}
 }
+
+func TestMacScreenLoopbackOrder(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Mac Screen Sharing")
+	}
+	for _, addr := range []string{"", "*", "0.0.0.0"} {
+		targets := dialTargets(screenPort, addr)
+		if len(targets) != 2 || targets[0] != "[::1]:5900" || targets[1] != "127.0.0.1:5900" {
+			t.Fatalf("screen loopback order for %q: %v", addr, targets)
+		}
+	}
+	if got := dialTargets(screenPort, "127.0.0.1"); len(got) != 1 || got[0] != "127.0.0.1:5900" {
+		t.Fatalf("explicit binding: %v", got)
+	}
+	if got := dialTargets(8080, ""); got[0] != "127.0.0.1:8080" {
+		t.Fatalf("unrelated port: %v", got)
+	}
+}
