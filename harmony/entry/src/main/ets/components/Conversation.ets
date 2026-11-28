@@ -51,6 +51,7 @@ import { conversationImageEntries, conversationImageKey, attachmentFileName, mes
 import type { MessageImageGalleryEntry, LoadedMessageImage, ConversationPhotoRequest } from '../core/MessageImageGallery';
 import { MarkdownText } from './MarkdownText';
 import { AssistantCards } from './AssistantCards';
+import { canDirectSendSuggestion, ComposerSuggestionChip, extractSessionSuggestions } from '../core/NextSuggestions';
 import { DecisionPager } from '../models/DecisionPager';
 import { QuestionWorkspace, QuestionSheet, questionPrompt } from '../models/QuestionWorkspace';
 import { InteractionDecisionForm } from './InteractionDecisionForm';
@@ -122,6 +123,7 @@ struct MessageSurface {
   @Param own: boolean = false;
   @Param agentPrompt: boolean = false;
   @Param personaReply: boolean = false;
+  @Param agentTranscript: boolean = false;
   @Param structured: boolean = false;
   @Param text: string = '';
   @Param maximum: number = Tokens.readingMax;
@@ -163,7 +165,7 @@ struct MessageSurface {
           this.own ? { left: Tokens.inset, right: Tokens.inset, top: 10, bottom: 10 } : 0)
       .backgroundColor(this.surfaceFill())
       .borderRadius(this.own || this.personaReply ? Tokens.bubble : 0)
-      .border(this.own || this.personaReply ? { width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.cardBorder(this.env.dark), radius: Tokens.bubble } : { width: 0 })
+      .border(!this.agentTranscript && (this.own || this.personaReply) ? { width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.cardBorder(this.env.dark), radius: Tokens.bubble } : { width: 0 })
       .shadow(this.personaReply ? PhoneStyle.cardElevation(this.env.dark) : { radius: 0, color: Color.Transparent })
       .clip(this.own).id(this.sourceId)
   }
@@ -356,6 +358,7 @@ export struct Conversation {
   private lastReadingFrame: ReadingFrameOrigin | undefined;
   private priorReadingFrame: ReadingFrameOrigin | undefined;
   private scrollingByHand: boolean = false;
+  private lastDragSample: number = 0;
   private lastManualAnchor: ReadingAnchor | undefined = undefined;
   private manuallyReading: boolean = false;
   private selectedReadingLine: string = '';
@@ -734,6 +737,14 @@ export struct Conversation {
     this.readingMotion++; this.scrollingByHand = true;
     if (this.searchHitId && this.seekingHit) this.readingRestoring = false;
   }
+  private sampleDragAnchor(): void {
+    if (!this.scrollingByHand) return;
+    const now = Date.now();
+    if (now - this.lastDragSample < 100) return;
+    this.lastDragSample = now;
+    this.recordReading(this.firstVisibleIndex);
+  }
+
   private finishReadingMotion(): void {
     if (!this.scrollingByHand) return;
     this.scrollingByHand = false;
@@ -1073,6 +1084,7 @@ export struct Conversation {
     this.userScrolling = true;
     this.relationAnchor = undefined;
     if (offset < 0) this.atEnd = false;
+    if (!this.atEnd && !this.resumeHistory) this.trackHistoryRendering(this.lastVisibleIndex);
   }
   private reachedLatest(): void {
     if (!this.active || this.relationAnchor || this.photoOpen || !this.scroller.isAtEnd()) return;
@@ -1121,12 +1133,17 @@ export struct Conversation {
   }
   private trackHistoryRendering(last: number): void {
     const hold = this.active && this.userScrolling && !this.atEnd &&
-      this.model.selected.kind === 'session' && last < this.readingPrefix() + this.lines.length - 1;
+      this.model.selected.kind === 'session' && (this.scrollingByHand || last < this.readingPrefix() + this.lines.length - 1);
     if (hold && !this.resumeHistory) this.resumeHistory = this.model.holdHistoryRendering();
     else if (!hold && this.resumeHistory) this.releaseHistoryRendering();
   }
   private finishScroll(): void {
     if (this.userScrolling) this.reachedLatest();
+    if (this.scrollingByHand) {
+      this.recordReading(this.firstVisibleIndex);
+      this.rememberTailPosition();
+    }
+    this.lastDragSample = 0;
     this.finishReadingMotion();
     this.userScrolling = false;
     if (this.resumeHistory) this.releaseHistoryRendering();
@@ -2364,8 +2381,7 @@ export struct Conversation {
     return undefined;
   }
   @Computed get handoffComputer(): ResourceRow | undefined {
-    return this.model.machines.find(row => row.id === this.model.selected.machine && row.supportsScreen() &&
-      (!row.group || row.group === this.model.profile.id) && (!row.manager || row.manager === this.model.profile.manager));
+    return this.model.selectedScreenMachine();
   }
   @Builder desktopWaitContent() {
     Column({space:3}) {
@@ -2637,9 +2653,10 @@ export struct Conversation {
             this.trackHistoryRendering(end);
             this.approachHistory(start);
             this.lastVisibleIndex = end;
-            this.firstVisibleIndex = start; this.recordReading(start); this.rememberTailPosition();
+            this.firstVisibleIndex = start;
+            if (!this.scrollingByHand) { this.recordReading(start); this.rememberTailPosition(); }
           })
-          .onDidScroll(() => { if (this.scrollingByHand) this.recordReading(this.firstVisibleIndex); })
+          .onDidScroll(() => this.sampleDragAnchor())
           .onReachEnd(() => this.reachedLatest())
           .onScrollStop(() => this.finishScroll())
   }
@@ -2675,7 +2692,8 @@ export struct Conversation {
         }.id('chat.work.' + entry.item.message!.id)
       } else if (entry.item.message!.work) {
         this.workBody(entry)
-        if (entry.item.message!.turnChanges) {
+        if (entry.item.message!.turnChanges && (entry.item.soleProcessGroup ?
+          !this.closedSoloGroups.includes(entry.item.message!.id) : this.expanded.includes(entry.item.message!.id))) {
           TurnChangesCard({ changes: entry.item.message!.turnChanges!, onOpenFile: (path: string) => this.onOpenFile(path) })
         }
       }
@@ -2724,10 +2742,10 @@ export struct Conversation {
         }.width('100%').alignItems(VerticalAlign.Center).padding({top:4,bottom:4}).id('chat.live.activity')
       } else if (entry.item.message!.text && entry.item.message!.id !== this.issueEchoId) {
         WithTheme({ colorMode: this.environment.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT, theme: nativeMessageTheme(this.look, this.model.style, entry.item.message!.role === 'user', this.environment.dark) }) {
-        MessageSurface({ sourceId:'chat.lift.source.'+entry.item.id, personaReply:entry.item.message!.role === 'assistant' && this.model.selected.kind === 'conversation', own: entry.item.message!.role === 'user', structured: entry.item.message!.role === 'user' && structuredBubble(entry.item.message!.text), text:entry.item.message!.text, maximum: entry.item.message!.role === 'user' ? this.messageMaximum(entry.item.message!) : Tokens.readingMax,
+        MessageSurface({ sourceId:'chat.lift.source.'+entry.item.id, agentTranscript:this.model.selected.kind === 'session', personaReply:entry.item.message!.role === 'assistant' && this.model.selected.kind === 'conversation', own: entry.item.message!.role === 'user', structured: entry.item.message!.role === 'user' && structuredBubble(entry.item.message!.text), text:entry.item.message!.text, maximum: entry.item.message!.role === 'user' ? this.messageMaximum(entry.item.message!) : Tokens.readingMax,
           timeHint:this.timeHint(entry.item.message!), onTime:() => this.toggleMessageTime(entry.item.message!) }) {
           if (entry.item.message!.role === 'assistant' && this.model.selected.kind === 'conversation') AssistantMessage({ streaming:this.isStreamingMessage(entry.item.message!), model: this.model, documents:this.documents, feed: this.feed, message: entry.item.message!, active: this.active, workspaceRoot:this.markdownWorkspace, mediaWidth:Math.min(Tokens.readingMax,this.availableWidth - 2 * Tokens.page), onPreview:(request: ConversationPhotoRequest) => this.showPhoto(request), onEditImage:(image: LoadedMessageImage) => this.editReceivedImage(image), onOpenFile:(path: string) => this.onOpenFile(path), onLink: (address: string) => this.onLink(address), onOpenResource: (row: ResourceRow) => this.onOpenResource(row) })
-          else MarkdownText({ streaming:this.isStreamingMessage(entry.item.message!), transcript: true, documents:this.documents, text: entry.item.message!.text, narration:entry.item.message!.narration, ownMessage:entry.item.message!.role === 'user',
+          else MarkdownText({ streaming:this.isStreamingMessage(entry.item.message!), transcript: true, agentTranscript:this.model.selected.kind === 'session', documents:this.documents, text: entry.item.message!.text, narration:entry.item.message!.narration, ownMessage:entry.item.message!.role === 'user',
             onBodyTap:entry.item.message!.role === 'user' && entry.item.message!.at > 0 ? () => this.toggleMessageTime(entry.item.message!) : undefined,
             messageId:entry.item.message!.id, clipped:entry.item.message!.userTextClipped,
             readOriginal:() => this.model.readFullUserText(entry.item.message!),
@@ -2862,8 +2880,8 @@ export struct Conversation {
             .linearGradient({
               direction: GradientDirection.Bottom,
               colors: [
-                [this.environment.dark ? '#00000000' : '#00FFFFFF', 0],
-                [this.environment.dark ? '#E6000000' : '#E6FFFFFF', 1]
+                [Colors.canvasFogStart, 0],
+                [Colors.canvasFogEnd, 1]
               ]
             })
             .hitTestBehavior(HitTestMode.None)
@@ -2877,7 +2895,7 @@ export struct Conversation {
                 .fontWeight(FontWeight.Medium).fontColor([Colors.link])
                 .width(this.latestArrowSize).height(this.latestArrowSize)
             }.width(this.latestDiameter).height(this.latestDiameter).borderRadius(this.latestDiameter/2).clip(true)
-              .backgroundColor(Colors.styleID==='glass' ? (this.environment.dark ? '#CC1C1C1E' : '#E6FFFFFF') : Colors.surface)
+              .backgroundColor(Colors.styleID==='glass' ? Colors.elevatedGlass : Colors.surface)
               .backgroundBlurStyle(Colors.styleID==='glass' ? BlurStyle.COMPONENT_THICK : BlurStyle.NONE)
               .border({ width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.floatingBorder(this.environment.dark), radius: this.latestDiameter / 2 })
               .shadow(PhoneStyle.floatingElevation(this.environment.dark))
@@ -2947,7 +2965,7 @@ export struct Conversation {
   private composerSurface(): ResourceColor {
     if(this.model.style==='beautiful') return this.environment.dark ? '#232427' : '#FFFFFF';
     if(this.legacyInterface) return Colors.surface;
-    if(Colors.styleID==='glass') return this.environment.dark ? '#CC1C1C1E' : '#E6FFFFFF';
+    if(Colors.styleID==='glass') return Colors.elevatedGlass;
     return Colors.surface;
   }
   private composerRim(): ResourceColor {
@@ -3146,6 +3164,97 @@ export struct Conversation {
     const source = matched || selected;
     return extractComposerQueue(source.data());
   }
+  @Computed get composerSuggestions(): ComposerSuggestionChip[] {
+    if (!this.active || !this.composerAvailable() || this.model.draftLoading || !!this.model.draft.trim() ||
+      this.sending || !!this.model.decision || this.model.canStop() || this.model.assistantReplyWorking()) {
+      return [];
+    }
+    if (this.model.demo && this.model.nextSuggestionsValue === false) return [];
+    const selected = this.model.selected;
+    if (!selected || !selected.id) return [];
+    const targetSession = selected.session || selected.id;
+    const pool = selected.kind === 'conversation' ? this.model.conversations : this.model.sessions;
+    const matched = pool.find((row: ResourceRow) =>
+      (row.session || row.id) === targetSession &&
+      (!selected.machine || row.machine === selected.machine) &&
+      (!selected.manager || row.manager === selected.manager)
+    );
+    const source = matched || selected;
+    return extractSessionSuggestions(source.data());
+  }
+  private fillSuggestion(chip: ComposerSuggestionChip): void {
+    if (!this.sendCurrent() || !this.composerAvailable() || this.sending) return;
+    Haptics.tap();
+    this.model.updateDraft(chip.text);
+    this.getUIContext().getFocusController().requestFocus('chat.input');
+  }
+  private sendSuggestionNow(chip: ComposerSuggestionChip): void {
+    if (!canDirectSendSuggestion(chip) || !this.sendCurrent() || !this.composerAvailable() || this.sending) return;
+    Haptics.success();
+    this.model.updateDraft(chip.text);
+    this.sendDraft().catch(() => undefined);
+  }
+  @Builder suggestionChipMenu(chip: ComposerSuggestionChip) {
+    Menu() {
+      if (canDirectSendSuggestion(chip)) {
+        MenuItem({ content: tr('suggestion_send_now') })
+          .onClick(() => this.sendSuggestionNow(chip))
+          .id('chat.suggestion.send_now')
+      }
+      MenuItem({ content: tr('suggestion_fill_in') })
+        .onClick(() => this.fillSuggestion(chip))
+        .id('chat.suggestion.fill_in')
+    }
+  }
+  @Builder suggestionChipsBar() {
+    if (this.composerSuggestions.length > 0) {
+      Scroll() {
+        Row({ space: Tokens.spaceS }) {
+          ForEach(this.composerSuggestions, (chip: ComposerSuggestionChip, index: number) => {
+            Button({ type: ButtonType.Capsule }) {
+              Row({ space: Tokens.spaceS }) {
+                SymbolGlyph($r('sys.symbol.wand_and_stars'))
+                  .fontSize('14vp')
+                  .fontColor([Colors.ai])
+                Text(chip.text)
+                  .fontSize(Tokens.typeSecondary)
+                  .maxFontScale(Tokens.interfaceScaleFor(Tokens.typeSecondary))
+                  .fontColor(Colors.ink)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .constraintSize({ maxWidth: 220 })
+                Text(tr('suggestion_use'))
+                  .fontSize(Tokens.typeLabel)
+                  .maxFontScale(Tokens.interfaceScaleFor(Tokens.typeLabel))
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(Colors.link)
+                  .maxLines(1)
+              }
+              .alignItems(VerticalAlign.Center)
+            }
+            .constraintSize({ minHeight: Tokens.controlBar })
+            .padding({ left: Tokens.spaceM, right: Tokens.spaceM, top: Tokens.spaceXs, bottom: Tokens.spaceXs })
+            .backgroundColor(Colors.aiWash)
+            .border({
+              width: PhoneStyle.surfaceEdgeWidth(0.5),
+              color: PhoneStyle.cardBorder(this.environment.dark),
+              radius: Tokens.radiusCapsule
+            })
+            .accessibilityText(chip.text)
+            .accessibilityDescription(tr(canDirectSendSuggestion(chip) ? 'suggestion_hint_safe' : 'suggestion_hint_risky'))
+            .onClick(() => this.fillSuggestion(chip))
+            .bindContextMenu(this.suggestionChipMenu(chip), ResponseType.LongPress)
+            .id('chat.suggestion.' + String(index))
+          }, (chip: ComposerSuggestionChip, index: number) => String(index) + ':' + chip.text + ':' + String(chip.risky))
+        }
+        .padding({ left: Tokens.spaceXs, right: Tokens.spaceXs })
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .width('100%')
+      .id('chat.suggestions')
+    }
+  }
   private queueSendNowKey(owner: ClientModel = this.model, row: ResourceRow = this.model.selected): string {
     if (!row || !row.id) return '';
     return JSON.stringify([owner.scope(), row.machine, row.session || row.id]);
@@ -3340,7 +3449,7 @@ export struct Conversation {
           onRemove: (id: string) => this.attachments.remove(id), onEdit: (id: string) => this.attachments.editPhoto(id), onPreview: (item: ChatAttachment) => this.preview(item) })
       ForEach(this.model.draftMessageQuotes(),(ref:Record<string,Object>) => {
         Row({space:Tokens.gap}) {
-          Rect().width(3).height(28).fill(Colors.ai).borderRadius(2)
+          Rect().width(3).height(28).fill(Colors.ai).borderRadius(Tokens.radiusCapsule)
           Column({space:2}) {
             Text(tr(Wire.text(ref,'part')==='selection' ? 'chat_lift_quote_part' : 'chat_lift_quote_whole').replace('{author}',Wire.text(ref,'title')))
               .fontSize(Tokens.caption).maxFontScale(Tokens.interfaceScaleFor(Tokens.caption)).fontColor(Colors.secondary).maxLines(1)
@@ -3476,7 +3585,7 @@ export struct Conversation {
         color:this.composerRim(),radius:25}).borderRadius(25).width('100%').id('chat.composer')
       .animation(Motion.layout(this.environment.reduceMotion))
       .shadow(this.model.style==='beautiful'
-        ? {radius:8,color:this.environment.dark ? '#40000000' : '#12000000',offsetY:5}
+        ? {radius:8,color:Colors.floatingShadow,offsetY:5}
         : PhoneStyle.floatingElevation(this.environment.dark))
   }
 
@@ -3526,6 +3635,7 @@ export struct Conversation {
       if (this.contextUsage || (this.model.canCompose() && this.sessionIdentity.agent)) this.composerIdentity()
       if (this.model.canCompose() && !this.model.decision) {
         if (this.attachments.busy && !this.sending && (this.attachments.errorKey === 'chat_attachment_storage_unavailable' || this.model.error === 'cache_unavailable')) Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('retry')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('retry', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('retry')).bindTips(tr('retry')).onClick(() => { this.attachmentKey = ''; this.syncAttachments(); })
+        this.suggestionChipsBar()
         this.composer()
       } else if (!this.model.canSend() && !this.model.decision) {
         if (this.model.takeoverOffered()) Row({space:Tokens.gap}) {

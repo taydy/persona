@@ -50,6 +50,23 @@ test('past the budget the least recently active sessions go first; held ones and
     'nothing is stored when even the rows that must stay do not fit');
 });
 
+test('an oversized mixed-age directory decodes each raw row at most twice, including ties and held sessions', () => {
+  const sessions = Array.from({length: 384}, (_, index) =>
+    row('s' + index, { updated_at: index * 97 % 11, undelivered: index === 0 ? [{ id: 'held' }] : [] }));
+  let parses = 0;
+  const parse = JSON.parse;
+  let text;
+  try {
+    JSON.parse = (...args) => { parses++; return parse(...args); };
+    text = encodeSessionSnapshot(sessions, [], [], 16000);
+  } finally { JSON.parse = parse; }
+  assert.ok(parses <= 2 * sessions.length, 'sorting the eviction candidates must not reparse row JSON');
+  const kept = JSON.parse(text).sessions.map(item => Number(item.id.slice(1)));
+  assert.ok(kept.length > 1 && kept.length < sessions.length);
+  const priority = sessions.map((_, index) => index).slice(1).sort((a, b) => (b * 97 % 11) - (a * 97 % 11) || a - b);
+  assert.deepEqual(kept, [0, ...priority.slice(0, kept.length - 1)].sort((a, b) => a - b));
+});
+
 test('an absent, cut or malformed snapshot reads as none', () => {
   const text = encodeSessionSnapshot([row('a')], [], []);
   assert.deepEqual(decodeSessionSnapshot(text).sessions.map(item => item.id), ['a']);

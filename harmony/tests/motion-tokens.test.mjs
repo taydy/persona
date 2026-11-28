@@ -43,10 +43,19 @@ test('drawer spring velocity clamps extreme flings and rejects invalid spans', (
 
 test('status motion marks guard every repeating animation with visibility, foreground, and reduceMotion', () => {
   const source = readFileSync(new URL('../entry/src/main/ets/components/StatusMotionMarks.ets', import.meta.url), 'utf8');
-  for (const name of ['NeedsYouPulseDot', 'WorkingArcSpinner', 'StreamTailCaret']) {
+  for (const name of ['NeedsYouPulseDot', 'WorkingArcSpinner', 'SessionWorkingDot', 'StreamTailCaret']) {
     assert.ok(source.includes(`export struct ${name}`), name);
   }
-  assert.equal((source.match(/shouldAnimateLoop\(this\.visible, this\.env\.foreground, this\.env\.reduceMotion\)/g) || []).length, 3);
-  assert.equal((source.match(/onVisibleAreaChange\(/g) || []).length, 3);
+  assert.equal((source.match(/shouldAnimateLoop\(this\.visible, this\.env\.foreground, this\.env\.reduceMotion\)/g) || []).length, 4);
+  assert.equal((source.match(/onVisibleAreaChange\(/g) || []).length, 4);
   assert.ok(source.includes('HitTestMode.None'));
+});
+
+test('working sessions breathe using only halo opacity and retain a solid center', () => {
+  const marks = readFileSync(new URL('../entry/src/main/ets/components/StatusMotionMarks.ets', import.meta.url), 'utf8');
+  const dot = marks.slice(marks.indexOf('export struct SessionWorkingDot'), marks.indexOf('export struct StreamTailCaret'));
+  assert.ok(MotionTokens.sessionWorkingHalfBreathMs * 2 >= 4000);
+  assert.match(dot, /playMode: PlayMode.Alternate/);
+  assert.doesNotMatch(dot, /\.rotate\(|\.scale\(/);
+  assert.match(dot, /Circle\(\)\.width\(this\.diameter \* 0\.5\).*fill\(this\.tint\)/);
 });

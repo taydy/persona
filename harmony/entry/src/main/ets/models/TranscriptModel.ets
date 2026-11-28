@@ -1,7 +1,7 @@
 import { decisionSourceItem } from './InteractionHistory';
 import type { LiveToolCall } from '../core/Domain';
 import type { TranscriptItem, TranscriptBatch, TranscriptAction, TranscriptSnapshot } from '../core/Domain';
-import { TranscriptReducer, TranscriptSync, transcriptExchanges } from '../core/Domain';
+import { TranscriptReducer, TranscriptSync, currentTurnStartedAt, transcriptExchanges } from '../core/Domain';
 import { ConversationPlanReplay, samePlanSummary } from '../core/ConversationPlan';
 import type { ConversationPlan } from '../core/ConversationPlan';
 import { HubRepository, segment } from './HubRepository';
@@ -45,6 +45,7 @@ interface OlderPage {
   owner: TranscriptSync;
   before: number;
   request: Promise<Record<string, Object>>;
+  turnStartedAt?: number;
 }
 
 // A visible conversation owns its subscription, paging and continuity state.
@@ -60,6 +61,12 @@ export class TranscriptModel {
   private mergingOlder?: Promise<void>;
   private mergingOwner?: TranscriptSync;
   private refreshing: boolean = false;
+  private opening: boolean = false;
+  private lastVerifiedHistory: number = 0;
+  // A directory notification is a fallback for quiet/legacy sessions. Live batches and explicit reads remain immediate.
+  canDeferDirectoryRead(): boolean {
+    return this.opening || this.refreshing || this.lastVerifiedHistory > 0 && Date.now() - this.lastVerifiedHistory < 15000;
+  }
   private refreshAgain: boolean = false;
   private fillRequested: boolean = false;
   private pendingFetches: Promise<void> = Promise.resolve();
@@ -123,6 +130,9 @@ export class TranscriptModel {
   private replaceLiveTools(frame: ToolActivityFrame, paneThinking: boolean, paneCompacting: boolean = false): void {
     if (paneThinking === this.paneThinking && paneCompacting === this.paneCompacting && frame.same(this.toolActivity)) return;
     this.toolActivity = frame; this.paneThinking = paneThinking; this.paneCompacting = paneCompacting;
+    this.notifyToolDisplay();
+  }
+  private notifyToolDisplay(): void {
     if (this.historyReaders > 0) this.pendingTools = true;
     else this.toolsChanged();
   }
@@ -207,19 +217,22 @@ export class TranscriptModel {
     return JSON.parse(JSON.stringify(canonical)) as TranscriptBatch;
   }
   async open(): Promise<void> {
-    const owner = this.sync;
-    const cached = await this.local.get('transcript:' + this.key);
-    if (!this.active) return;
-    if (cached && this.currentRead(owner)) {
-      try {
-        const snapshot = JSON.parse(cached) as TranscriptSnapshot;
-        this.observeHistory(snapshot.history);
-        this.reducer.restore(snapshot);
-        this.emit();
-      } catch (_) {}
-    }
-    if (this.liveSubscription) await this.drive(this.sync.reconnect());
-    await this.latest();
+    this.opening = true;
+    try {
+      const owner = this.sync;
+      const cached = await this.local.get('transcript:' + this.key);
+      if (!this.active) return;
+      if (cached && this.currentRead(owner)) {
+        try {
+          const snapshot = JSON.parse(cached) as TranscriptSnapshot;
+          this.observeHistory(snapshot.history);
+          this.reducer.restore(snapshot);
+          this.emit();
+        } catch (_) {}
+      }
+      if (this.liveSubscription) await this.drive(this.sync.reconnect());
+      await this.latest();
+    } finally { this.opening = false; }
   }
   async latest(): Promise<void> {
     if (!this.active) return;
@@ -238,7 +251,7 @@ export class TranscriptModel {
       this.observeHistory(batch.history);
       owner = this.sync;
       await this.drive(owner.settle(this.reducer.latest(batch)));
-      if (this.currentRead(owner)) { this.historyReady = Wire.has(data, 'has_more'); this.emit(); }
+      if (this.currentRead(owner)) { this.lastVerifiedHistory = Date.now(); this.historyReady = Wire.has(data, 'has_more'); this.emit(); }
     } catch (error) {
       if (this.currentRead(owner)) this.failure(error as Error);
       else this.refreshAgain = this.active;
@@ -331,6 +344,25 @@ export class TranscriptModel {
     this.bufferedOlder = page;
     page.request.catch(() => { if (this.bufferedOlder === page) this.bufferedOlder = undefined; });
     return page;
+  }
+  /** Read the opening from the same folded page the timeline prefetches, without inserting rows into the list. */
+  turnStartedBefore(before: number): number {
+    if (!this.active || !this.historyKey || before <= 0 || before !== this.reducer.firstSeq || this.reducer.hasMore !== true) return 0;
+    this.prefetchOlder(before);
+    const page = this.bufferedOlder;
+    if (!page || page.owner !== this.sync || page.before !== before) return 0;
+    if (page.turnStartedAt === undefined) {
+      page.turnStartedAt = 0;
+      page.request.then((data: Record<string, Object>): void => {
+        if (!this.currentRead(page.owner) || this.bufferedOlder !== page || this.reducer.firstSeq !== before ||
+          Wire.text(data, 'history') !== this.historyKey) return;
+        const items = this.batch(data).items;
+        if (!items.length || items[items.length - 1].seq >= before) return;
+        page.turnStartedAt = currentTurnStartedAt(transcriptExchanges(items));
+        if (page.turnStartedAt > 0) this.notifyToolDisplay();
+      }).catch(() => {});
+    }
+    return page.turnStartedAt;
   }
   prefetchOlder(before: number): void {
     if (!this.active || before <= 0 || this.warmedBefore === before || this.reducer.hasMore !== true) return;

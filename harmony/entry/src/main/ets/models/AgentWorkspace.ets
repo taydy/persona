@@ -113,6 +113,7 @@ export class AgentWorkspace {
   @Trace filterCounts:Record<string,Object> = {};
   @Trace groupingMode: string = 'state';
   @Trace machineFilter: string = '';
+  @Trace machineFilterName: string = '';
   @Trace currentHubOnly: boolean = false;
   @Trace search: string = '';
   @Trace history: boolean = false;
@@ -256,7 +257,7 @@ export class AgentWorkspace {
     this.quickFilter = 'all'; this.filterCounts = {}; this.unpinnedRows = []; this.unreadShownRows = []; this.filterKept = [];
     this.preferredGrouping = this.defaultGrouping; this.groupingMode = this.defaultGrouping;
     this.supportsTodos = false; this.supportsDirections = false;
-    this.machineFilter = ''; this.search = ''; this.history = false; this.selectedKey = '';
+    this.machineFilter = ''; this.machineFilterName = ''; this.search = ''; this.history = false; this.selectedKey = '';
     this.readingDetail = false; this.freezeSuppressed = false;
     this.preferences = new Map<string, AgentPreferences>(); this.pinsSpaces = []; this.pinsSessions = []; this.mutesSpaces = []; this.mutesSessions = []; this.mutesAllowed = [];
     try {
@@ -270,7 +271,8 @@ export class AgentWorkspace {
       this.preferredGrouping = AGENT_GROUPINGS.includes(storedGrouping) ? storedGrouping : this.defaultGrouping;
       this.groupingMode = this.resolvedGrouping();
       const savedMachine = Wire.text(saved, 'machine');
-      this.machineFilter = this.machineForShownHub(savedMachine); this.search = Wire.text(saved, 'search');
+      this.machineFilter = this.machineForShownHub(savedMachine);
+      this.machineFilterName = this.machineFilter ? Wire.text(saved, 'machine_name') : ''; this.search = Wire.text(saved, 'search');
       this.history = Wire.bool(saved, 'history');
       if (this.history && client.connected && !this.historySupported()) this.history = false;
       this.selectedKey = Wire.text(saved, 'selected');
@@ -432,8 +434,19 @@ export class AgentWorkspace {
     this.rebuild(); this.refreezeAfterFilter(); this.saveViewLater();
   }
 
-  async setMachineFilter(value: string): Promise<void> {
-    this.releaseFreeze(); this.filterKept = []; this.machineFilter = this.machineForShownHub(value); this.rebuild(); this.saveViewLater();
+  rememberMachineName(identity: string, name: string): void {
+    if (!identity || identity !== this.machineFilter || !name || name === identity || name === this.machineFilterName) return;
+    this.machineFilterName = name;
+    this.saveViewLater();
+  }
+
+  async setMachineFilter(value: string, name: string = ''): Promise<void> {
+    this.releaseFreeze(); this.filterKept = [];
+    const key = this.machineForShownHub(value);
+    if (key !== this.machineFilter) this.machineFilterName = '';
+    this.machineFilter = key;
+    if (key && name) this.machineFilterName = name;
+    this.rebuild(); this.saveViewLater();
     if (this.history) {
       const client = this.client;
       if (client) await this.loadHistory(client, this.revision, true);
@@ -464,6 +477,7 @@ export class AgentWorkspace {
     this.hubModeLoaded = true; this.currentHubOnly = value; this.releaseFreeze(); this.filterKept = [];
     this.historyRequest++; this.historyRows = []; this.historyLoaded = false; this.loading = false;
     this.machineFilter = this.machineForShownHub(this.machineFilter);
+    if (!this.machineFilter) this.machineFilterName = '';
     if (this.history && !this.historySupported()) this.history = false;
     this.latestSourceRows = this.history ? [] : this.rowsForClient(client);
     this.rebuild(); this.saveViewLater();
@@ -927,7 +941,9 @@ export class AgentWorkspace {
     const visible = (id:string):boolean => !ids.has(id);
     const quick = this.quickFilter === 'needsYou';
     const affected = matches.filter((id:string) => ids.has(id)).length;
-    this.filterCounts['needsYou'] = Math.max(0,Wire.number(this.filterCounts,'needsYou') - affected);
+    if (typeof this.filterCounts['needsYou'] === 'number') {
+      this.filterCounts['needsYou'] = Math.max(0, Wire.number(this.filterCounts,'needsYou') - affected);
+    }
     if (quick) this.unpinnedRows = this.unpinnedRows.filter((row:ResourceRow) => visible(coreRowId(row)));
     this.groups = this.groups.filter((group:AgentWorkspaceGroup):boolean => {
       if (!quick && group.id !== 'state/needs') return true;
@@ -1052,7 +1068,9 @@ export class AgentWorkspace {
     decisions:AgentDecisionQueue): void {
     if (this.standaloneView || !this.isBoundTo(root)) return;
     this.projectRows=rows; this.search=query; this.quickFilter=quick; this.supervisorQueue=decisions;
-    this.machineFilter=this.machineForShownHub(machine);
+    const filter = this.machineForShownHub(machine);
+    if (filter !== this.machineFilter) this.machineFilterName = '';
+    this.machineFilter = filter;
     this.preferredGrouping=AGENT_GROUPINGS.includes(grouping) ? grouping : this.defaultGrouping;
     this.groupingMode=this.resolvedGrouping();
     this.latestSourceRows=this.rowsForClient(root);
@@ -1186,9 +1204,9 @@ export class AgentWorkspace {
       this.persistTimer = -1;
       if (!client || !this.loadCurrent(client, revision) || this.viewScope !== viewScope) return;
       const values: Object[] = [this.quickFilter, this.preferredGrouping, this.machineFilter, this.search, this.history, this.selectedKey,
-        this.folded, this.expandedIdle, this.expandedQuiet];
+        this.folded, this.expandedIdle, this.expandedQuiet, this.machineFilter ? this.machineFilterName : ''];
       client.saveView('agent-workspace', JSON.stringify(Wire.payload(['quick', 'grouping', 'machine', 'search', 'history', 'selected',
-        'folded', 'expanded_idle', 'expanded_quiet'], values)))
+        'folded', 'expanded_idle', 'expanded_quiet', 'machine_name'], values)))
         .catch(() => undefined);
     }, 180);
   }

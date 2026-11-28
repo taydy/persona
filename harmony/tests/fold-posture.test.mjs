@@ -306,7 +306,7 @@ test('64vp icon rail, 3-dot header, 3-tab Live Workbench, relay wiring, and bord
   // Wide split agentRow uses live motion marks & PhoneStyle.cardBorder.
   const wideRow = agents.slice(agents.indexOf('  @Builder agentRow('), agents.indexOf('  @Builder rowContext('));
   assert.match(wideRow, /NeedsYouPulseDot\(/);
-  assert.match(wideRow, /WorkingArcSpinner\(/);
+  assert.match(wideRow, /SessionWorkingDot\(/);
   assert.match(agents, /PhoneStyle\.cardBorder\(/);
 
   // Duplicate place suppression in AgentDirectoryRowContent & ProjectsPage + worktree dividers & borderless card styling.

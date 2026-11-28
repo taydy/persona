@@ -87,6 +87,7 @@ export struct WorkingArcSpinner {
   @Param tint: ResourceColor = Colors.working;
   @Param surface: ResourceColor = Colors.surface;
   @Param showCoreDot: boolean = true;
+  @Param active: boolean = true;
   @Local private env: NativeEnvironment = nativeEnvironment;
   @Local private visible: boolean = false;
   @Local private turning: boolean = false;
@@ -96,16 +97,16 @@ export struct WorkingArcSpinner {
   aboutToAppear(): void { this.mounted = true; this.syncLoop(); }
   aboutToDisappear(): void { this.mounted = false; this.generation++; this.turning = false; }
 
-  private eligible(): boolean {
-    return this.mounted && shouldAnimateLoop(this.visible, this.env.foreground, this.env.reduceMotion);
+  @Computed get canTurn(): boolean {
+    return this.active && shouldAnimateLoop(this.visible, this.env.foreground, this.env.reduceMotion);
   }
 
-  @Monitor('visible', 'env.foreground') syncLoop(): void {
+  @Monitor('canTurn') syncLoop(): void {
     const gen = ++this.generation;
     this.turning = false;
-    if (!this.eligible()) return;
+    if (!this.mounted || !this.canTurn) return;
     this.getUIContext().postFrameCallback(new StatusMotionFrame(() => {
-      if (gen === this.generation && this.eligible()) this.turning = true;
+      if (gen === this.generation && this.mounted && this.canTurn) this.turning = true;
     }));
   }
 
@@ -153,6 +154,49 @@ export struct WorkingArcSpinner {
       const next = shown && ratio > 0;
       if (next !== this.visible) this.visible = next;
     })
+  }
+}
+
+/** An ongoing session stays legible through a full breath and when system motion is reduced. */
+@ComponentV2
+export struct SessionWorkingDot {
+  @Param diameter: number = 14;
+  @Param tint: ResourceColor = Colors.working;
+  @Param surface: ResourceColor = Color.Transparent;
+  @Param active: boolean = true;
+  @Local private env: NativeEnvironment = nativeEnvironment;
+  @Local private visible: boolean = false;
+  @Local private bright: boolean = false;
+  private mounted: boolean = false;
+  private generation: number = 0;
+
+  @Computed get breathes(): boolean {
+    return this.active && shouldAnimateLoop(this.visible, this.env.foreground, this.env.reduceMotion);
+  }
+
+  aboutToAppear(): void { this.mounted = true; this.syncLoop(); }
+  aboutToDisappear(): void { this.mounted = false; this.generation++; this.bright = false; }
+
+  @Monitor('breathes') syncLoop(): void {
+    const gen = ++this.generation;
+    this.bright = false;
+    if (!this.mounted || !this.breathes) return;
+    this.getUIContext().postFrameCallback(new StatusMotionFrame(() => {
+      if (this.mounted && gen === this.generation && this.breathes) this.bright = true;
+    }));
+  }
+
+  build() {
+    Stack() {
+      Circle().width(this.diameter).height(this.diameter).fill(this.tint)
+        .opacity(this.bright ? 0.36 : 0.12)
+        .animation(this.bright ? { duration: MotionTokens.sessionWorkingHalfBreathMs, curve: Curve.EaseInOut,
+          iterations: -1, playMode: PlayMode.Alternate } : undefined)
+      Circle().width(this.diameter * 0.5).height(this.diameter * 0.5).fill(this.tint)
+    }.width(this.diameter + 2).height(this.diameter + 2).borderRadius((this.diameter + 2) / 2)
+      .backgroundColor(this.surface).hitTestBehavior(HitTestMode.None).accessibilityLevel('no-hide-descendants')
+      .id('agents.working.dot')
+      .onVisibleAreaChange([0], (shown: boolean, ratio: number) => { this.visible = shown && ratio > 0; })
   }
 }
 

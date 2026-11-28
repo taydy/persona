@@ -211,6 +211,7 @@ export function activityHeading(work: ToolTurnProjection, t: WorkWords): Activit
   }
   if (!result.total && foldedFailures === folded) result.failures = foldedFailures;
   if (latest) {
+    if (work.liveTurnStartedAt !== undefined) result.startedAt = work.liveTurnStartedAt;
     result.kind = activityKind(latest); result.motion = toolMotion(latest); result.status = 'working';
     result.title = runningToolTitle(latest, t, work.agent);
   } else if (result.total || folded) {

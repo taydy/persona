@@ -157,6 +157,22 @@ function rawUpdate() {
   return new Uint8Array([0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 1, 2, 3, 0, 4, 5, 6, 0]);
 }
 
+test('a scoped session desktop uses the matching owner-local machine throughout the stream', async () => {
+  const { screen, parent, row } = screenFixture(new TestStream());
+  parent.profile.id = row.group = 'sample-hub';
+  const machine = parent.machines[0];
+  machine.manager = '';
+  const foreign = ResourceRow.from(machine.data(), 'machine'); foreign.group = 'other-hub';
+  parent.machines = [foreign, machine];
+  const opening = screen.open(parent, row);
+  try {
+    await waitFor(() => screen.socketReady);
+    assert.equal(screen.isCurrent(screen.attempt), true);
+    parent.machines = [foreign];
+    assert.equal(screen.isCurrent(screen.attempt), false);
+  } finally { screen.close(); await opening; }
+});
+
 test('a port-stream failure while connect is pending invalidates the attempt before RFB can start', async () => {
   const stream = new TestStream();
   stream.failBeforeConnectResolves = true;

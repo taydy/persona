@@ -232,13 +232,14 @@ test('unknown git and terminal key outcomes remain blocked without a replay', as
   assert.equal(workspace.gitWriteState, 'unknown');
   assert.equal(workspace.canWriteGit(), false);
 
-  workspace.selectTab(3); await waitForTurn();
-  assert.equal(workspace.screenControlRequested, false);
-  assert.equal(workspace.enableScreenControl(), true);
-  assert.equal(await workspace.sendScreenKeys(['ctrl+c'], 'typed text', workspace.screenRevision), false);
-  assert.equal(workspace.screenControlRequested, false);
+  workspace.selectTab(2); await waitForTurn();
+  assert.equal(workspace.terminalTextMode, true);
+  assert.equal(workspace.terminalControlRequested, false);
+  workspace.setTerminalControl(true);
+  assert.equal(await workspace.submitTerminalInput('typed text'), false);
+  assert.equal(workspace.terminalControlRequested, false);
   assert.equal(state.calls.filter((call) => call.path.endsWith('/keys')).length, 1);
-  assert.equal(await workspace.sendScreenKeys(['ctrl+c'], 'typed text', workspace.screenRevision), false);
+  assert.equal(await workspace.submitTerminalInput('typed text'), false);
   assert.equal(state.calls.filter((call) => call.path.endsWith('/keys')).length, 1);
   workspace.hide();
 });
@@ -261,20 +262,117 @@ test('workspace mutations are disabled for an unconfirmed, offline, or read-only
   readOnly.workspace.hide();
 });
 
-test('the terminal screen is read-only by default and sends keys only after explicit enablement', async () => {
+test('legacy snapshot links open the unified terminal; text input needs consent and sends one request', async () => {
   const { state, workspace } = fixture();
-  await waitForTurn();
-  workspace.selectTab(3); await waitForTurn();
-  assert.equal(workspace.screenText, 'terminal screen');
-  assert.equal(workspace.screenControlRequested, false);
-  assert.equal(workspace.canControlScreen(), true);
-  assert.equal(workspace.enableScreenControl(), true);
-  const revision = workspace.screenRevision;
-  assert.equal(await workspace.sendScreenKeys(['enter'], 'pwd', revision), true);
-  const keys = state.calls.find((call) => call.path.endsWith('/keys'));
-  assert.deepEqual(keys.body, { keys: ['enter'], text: 'pwd' });
-  assert.equal(await workspace.sendScreenKeys(['not-a-key'], '', revision), false);
-  workspace.hide();
+  try {
+    workspace.selectTab(3); await waitForTurn();
+    assert.equal(workspace.tab, 2);
+    assert.equal(workspace.terminalTextMode, true);
+    assert.equal(workspace.terminalText, 'terminal screen');
+    assert.equal(await workspace.submitTerminalInput('example'), false);
+    workspace.sendTerminalKey('ctrl_c');
+    assert.equal(state.calls.filter(call => call.path.endsWith('/keys')).length, 0);
+    assert.equal(workspace.canControlTerminal(), true);
+    workspace.setTerminalControl(true);
+    assert.equal(await workspace.submitTerminalInput('example'), true);
+    workspace.sendTerminalKey('not-a-key');
+    workspace.sendTerminalKey('ctrl_c');
+    await waitForTurn();
+    assert.deepEqual(state.calls.filter(call => call.path.endsWith('/keys')).map(call => call.body), [
+      { keys: ['enter'], text: 'example' }, { keys: ['ctrl+c'], text: '' }
+    ]);
+    workspace.setTerminalControl(false);
+    assert.equal(await workspace.submitTerminalInput('example'), false);
+  } finally { workspace.hide(); }
+});
+
+test('the local demo can display its bundled terminal snapshot without enabling real input', async () => {
+  const { client, workspace } = fixture();
+  client.demo = true;
+  try {
+    workspace.selectTab(2); await waitForTurn();
+    assert.equal(workspace.terminalTextMode, true);
+    assert.equal(workspace.terminalText, 'terminal screen');
+    assert.equal(workspace.canControlTerminal(), false);
+    workspace.setTerminalControl(true);
+    assert.equal(await workspace.submitTerminalInput('sample'), false);
+  } finally { workspace.hide(); }
+});
+
+test('text input admits its own journal record but rejects a released control grant before dispatch', async () => {
+  const { state, workspace } = fixture();
+  try {
+    workspace.selectTab(2); await waitForTurn();
+    workspace.setTerminalControl(true);
+    state.beforeDispatch = call => state.blocked.push({path: call.path, method: 'POST'});
+    assert.equal(await workspace.submitTerminalInput('first'), true);
+    state.blocked = [];
+    state.beforeDispatch = () => { workspace.setTerminalControl(false); workspace.setTerminalControl(true); };
+    assert.equal(await workspace.submitTerminalInput('second'), false);
+    assert.equal(state.calls.filter(call => call.path.endsWith('/keys')).length, 1);
+  } finally { workspace.hide(); }
+});
+
+test('real-time terminal frames position complete lines and resume split CSI commands', () => {
+  const { workspace } = fixture({ features: ['terminal_stream'] });
+  const send = (seq, text) => workspace.onEvent({ type: 'terminal', machine_id: 'm1', session_id: 's1',
+    epoch: 'sample', seq, full: seq === 1, cols: 80, rows: 15, data: Buffer.from(text).toString('base64') });
+  try {
+    workspace.selectTab(2);
+    send(1, '\x1b[2J\x1b[12;1Hterminal sample\x1b[K');
+    const rows = Array(15).fill('');
+    rows[11] = 'terminal sample';
+    assert.deepEqual(workspace.terminalText.split('\n'), rows);
+
+    send(2, '\x1b[3;');
+    send(3, '4fOK\x1b[1D!\x1b[0C.\x1b[Hhome');
+    rows[2] = '   O! .';
+    rows[0] = 'home';
+    assert.deepEqual(workspace.terminalText.split('\n'), rows);
+  } finally { workspace.hide(); }
+});
+
+test('only unsupported streaming falls back; late events cannot grant text input or start parallel polls', async () => {
+  const { state, client, workspace } = fixture({features: ['terminal_control', 'terminal_stream']});
+  let resolveSnapshot;
+  state.handle = call => call.path.includes('/screen?') ? new Promise(done => { resolveSnapshot = done; }) : undefined;
+  const event = (type, data) => workspace.onEvent({type, machine_id: 'm1', session_id: 's1', ...data});
+  try {
+    workspace.selectTab(2);
+    event('terminal', {epoch: 'sample-epoch', seq: 1, full: true, cols: 80, rows: 24,
+      data: Buffer.from('sample live output').toString('base64')});
+    assert.equal(workspace.terminalText.trim(), 'sample live output');
+    assert.equal(await workspace.submitTerminalInput('before consent'), false);
+    workspace.setTerminalControl(true);
+    event('terminal_control', {state: 'active'});
+    assert.equal(await workspace.submitTerminalInput('sample input'), true);
+    assert.equal(state.calls.some(call => call.path.endsWith('/keys')), false);
+    event('terminal', {error: 'temporary'});
+    event('terminal_control', {state: 'unsupported'});
+    assert.equal(workspace.terminalTextMode, false);
+    assert.equal(state.calls.filter(call => call.path.includes('/screen?')).length, 0);
+    workspace.setTerminalControl(true);
+    event('terminal', {error: 'stream unavailable', unsupported: true});
+    event('terminal', {error: 'stream unavailable', unsupported: true});
+    event('terminal_control', {state: 'active'});
+    assert.equal(workspace.terminalTextMode, true);
+    assert.equal(workspace.terminalControlState, 'off');
+    assert.equal(await workspace.submitTerminalInput('example'), false);
+    assert.equal(state.calls.filter(call => call.path.includes('/screen?')).length, 1);
+    workspace.onDisconnected();
+    workspace.onConnected();
+    assert.equal(workspace.terminalTextMode, false);
+    resolveSnapshot({text: 'stale snapshot'});
+    await waitForTurn();
+    assert.notEqual(workspace.terminalText, 'stale snapshot');
+    assert.equal(workspace.terminalPollTimer, -1);
+    client.features = ['terminal_control'];
+    workspace.onDisconnected(); workspace.onConnected();
+    assert.equal(workspace.terminalTextMode, true);
+    resolveSnapshot({text: 'fresh snapshot'});
+    await waitForTurn();
+    assert.equal(workspace.terminalText, 'fresh snapshot');
+  } finally { workspace.hide(); }
 });
 
 test('dev preview opens the authorized native stream without putting the Hub token in its URL', async () => {

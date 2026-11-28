@@ -541,11 +541,14 @@ test('All Hubs retains a deliberately chosen foreign machine across reloads and 
   await workspace.open(home.client);
   assert.deepEqual(workspace.visibleRows().map((row) => row.group).sort(), ['home', 'work']);
   const selected = workspace.machineIdentity(work.client.machines[0]);
-  await workspace.setMachineFilter(selected);
+  await workspace.setMachineFilter(selected,'Notebook');
   assert.deepEqual(workspace.visibleRows().map((row) => row.group), ['work']);
   await new Promise((resolve) => setTimeout(resolve, 240));
   const restored = new AgentWorkspace();
   await restored.open(home.client);
+  assert.equal(restored.machineFilterName,'Notebook');
+  restored.rememberMachineName(workspace.machineIdentity(home.client.machines[0]), 'Different computer');
+  assert.equal(restored.machineFilterName,'Notebook');
   assert.equal(restored.currentHubOnly, false);
   assert.equal(restored.machineFilter, selected);
   assert.deepEqual(restored.visibleRows().map((row) => row.group), ['work']);

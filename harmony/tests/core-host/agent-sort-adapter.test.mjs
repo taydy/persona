@@ -96,8 +96,21 @@ test('phone source chips count and filter the same search-scoped native inventor
       assert.deepEqual(new Set(projection.filtered), new Set(expected));
       assert.equal(projection.filter_counts.terminal, 2);
       assert.equal(projection.filter_counts.feishu, 1);
+      assert.equal(projection.filter_counts.working, 5, 'status totals use the same search and span both pane sources');
     }
   } finally {
     await host.end();
   }
+});
+
+test('sort input copies preferences once per scoped owner, preserving last-row precedence', () => {
+  const input = nativeInput(cases[0]), exemplar=input.rows[0];
+  input.rows=Array.from({length:500},(_,i)=>({...exemplar,id:String(i),
+    raw:{...exemplar.raw,app_hub_group:i%2?'one':'two',manager:'owner'}}));
+  const visited=[];
+  input.preferencesFor=row=>{visited.push(row.id);return {...prefs,pinsSessions:[row.id]};};
+  const value=coreAgentSortInput(input);
+  assert.deepEqual(visited.sort(),['498','499']);
+  assert.deepEqual(value.manager_preferences['one|owner'].pins.sessions,['499']);
+  assert.deepEqual(value.manager_preferences['two|owner'].pins.sessions,['498']);
 });

@@ -92,9 +92,6 @@ export struct SessionTools {
   @Local previewRatio: number = 1;
   @Local previewServerIndex: number = 0;
   @Local previewStartConfirmName: string = '';
-  @Local screenInput: string = '';
-  @Local screenControlConfirmOpen: boolean = false;
-  @Local terminalControlConfirmOpen: boolean = false;
   @Local gitSheetOpen: boolean = false;
   @Local gitSheetMode: string = '';
   @Local commitFilePath: string = '';
@@ -136,7 +133,7 @@ export struct SessionTools {
     this.fileActionEntry = undefined; this.fileEditMode = '';
     this.transferOpen = false;
     this.fileEditBusy = false; this.pickerBusy = false; this.previewBusy = false; this.transferError = '';
-    this.previewPathDraft = '/'; this.previewInput = '';
+    this.previewPathDraft = '/'; this.previewInput = ''; this.terminalInput = '';
     this.previewPixels?.release(); this.previewPixels = undefined;
     this.onWorkspaceReady(this.workspace);
   }
@@ -679,33 +676,16 @@ export struct SessionTools {
   private confirmTerminalControl(takeover: boolean = false): void {
     if (!this.workspace.canControlTerminal()) return;
     const revision = this.workspace.currentRevision(), target = this.workspace.currentTarget();
-    this.getUIContext().showAlertDialog({ title: tr('session_tools_terminal_control_confirm'),
+    const textMode = this.workspace.terminalTextMode;
+    this.getUIContext().showAlertDialog({ title: tr(textMode ? 'session_tools_terminal_screen_control_confirm' : 'session_tools_terminal_control_confirm'),
       message: this.model.machineName(this.workspace.currentMachineId()) + '\n' + this.workspace.cwd,
       primaryButton: { value: tr('cancel'), action: () => {} },
       secondaryButton: { value: tr('continue'), action: () => {
         if (!this.workspace.isCurrent() || revision !== this.workspace.currentRevision() || target !== this.workspace.currentTarget()) return;
+        if (textMode !== this.workspace.terminalTextMode) return;
         if (takeover) this.workspace.takeOverTerminal(); else this.workspace.setTerminalControl(true);
       } }
     });
-  }
-
-  private confirmScreenControl(): void {
-    if (!this.workspace.canControlScreen()) return;
-    const revision = this.workspace.currentRevision(), target = this.workspace.currentTarget();
-    this.getUIContext().showAlertDialog({ title: tr('session_tools_terminal_screen_control_confirm'),
-      message: this.model.machineName(this.workspace.currentMachineId()) + '\n' + this.workspace.cwd,
-      primaryButton: { value: tr('cancel'), action: () => {} },
-      secondaryButton: { value: tr('continue'), action: () => {
-        if (!this.workspace.isCurrent() || revision !== this.workspace.currentRevision() || target !== this.workspace.currentTarget()) return;
-        if (!this.workspace.enableScreenControl()) this.transferError = tr('session_tools_view_only');
-      } }
-    });
-  }
-
-  private sendTerminalScreenText(): void {
-    if (!this.screenInput) return;
-    this.workspace.sendScreenKeys(['enter'], this.screenInput, this.workspace.screenRevision);
-    this.screenInput = '';
   }
 
   @Builder fileMenu() {
@@ -2067,7 +2047,8 @@ export struct SessionTools {
               .accessibilityLevel('no')
             Text(tr('terminal')).fontSize(Tokens.title).maxFontScale(Tokens.interfaceScaleFor(Tokens.title)).fontWeight(FontWeight.Medium).fontColor(Colors.ink)
           }
-          Text(this.controlDescription()).fontSize(13).maxFontScale(Tokens.interfaceScaleFor(13)).fontColor(Colors.secondary)
+          Text(this.workspace.terminalTextMode ? tr('session_tools_terminal_text_mode') + ' · ' + this.controlDescription() : this.controlDescription())
+            .id(this.workspace.terminalTextMode ? 'terminal.mode.text' : 'terminal.mode.live').fontSize(13).maxFontScale(Tokens.interfaceScaleFor(13)).fontColor(Colors.secondary)
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
         if (this.workspace.terminalControlState === 'active') Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('release')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('release', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('release')).bindTips(tr('release')).onClick(() => { Haptics.tap(); this.workspace.setTerminalControl(false); })
         else if (this.workspace.terminalControlState === 'busy') Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('takeover')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('takeover', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('takeover')).bindTips(tr('takeover')).enabled(this.workspace.canControlTerminal())
@@ -2082,7 +2063,7 @@ export struct SessionTools {
         .shadow(PhoneStyle.cardElevation(this.env.dark))
       if (this.workspace.terminalError) Text(trError(this.workspace.terminalError)).fontSize(Tokens.meta).fontColor($r('app.color.persona_danger')).padding({ left: 4, right: 4 })
       Scroll() {
-        Text(this.workspace.terminalText || tr('session_tools_terminal_waiting'))
+        Text(this.workspace.terminalText || tr('session_tools_terminal_waiting')).id('terminal.output')
           .fontFamily('monospace').fontSize(12.5).lineHeight('19fp').fontColor(Colors.ink).width('100%').textAlign(TextAlign.Start).copyOption(CopyOptions.LocalDevice).padding(12)
       }
         .layoutWeight(1)
@@ -2101,7 +2082,7 @@ export struct SessionTools {
               .layoutWeight(1).constraintSize({ minHeight: 42, maxHeight: 84 }).backgroundColor(Color.Transparent)
               .fontSize(14).fontColor(Colors.ink).placeholderColor(Colors.secondary)
               .onChange((value: string) => this.terminalInput = value)
-            Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('send')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('send', true)]) }.attributeModifier(ButtonStyles.iconPrimary).accessibilityText(tr('send')).bindTips(tr('send')).onClick(() => { Haptics.tap(); this.sendTerminalInput(); })
+            Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('send')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('send', true)]) }.attributeModifier(ButtonStyles.iconPrimary).accessibilityText(tr('send')).bindTips(tr('send')).onClick(() => { Haptics.tap(); this.sendTerminalInput(); }).enabled(!this.workspace.textKeyBusy)
           }
             .width('100%')
             .padding({ left: 10, right: 6, top: 4, bottom: 4 })
@@ -2115,73 +2096,6 @@ export struct SessionTools {
               this.terminalKeyButton('↑', 'term.up', false, () => this.workspace.sendTerminalKey('up'))
               this.terminalKeyButton('↓', 'term.down', false, () => this.workspace.sendTerminalKey('down'))
               this.terminalKeyButton('Ctrl-C', 'term.ctrlc', true, () => this.workspace.sendTerminalKey('ctrl_c'))
-            }.padding({ top: 1, bottom: 2 })
-          }.scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off).width('100%').align(Alignment.Start)
-        }.width('100%')
-      }
-    }.width('100%').height('100%').padding({ left: this.paneHorizontalPadding(), right: this.paneHorizontalPadding(), top: this.paneTopPadding(10), bottom: 12 }).backgroundColor(Colors.grouped)
-  }
-
-  @Builder terminalScreenView() {
-    Column({ space: 10 }) {
-      Row({ space: Tokens.gap }) {
-        Column({ space: 3 }) {
-          Row({ space: 7 }) {
-            Circle()
-              .width(8)
-              .height(8)
-              .fill(this.workspace.screenControlRequested ? Colors.positive : Colors.secondary)
-              .accessibilityLevel('no')
-            Text(tr('session_tools_terminal_screen')).fontSize(Tokens.title).maxFontScale(Tokens.interfaceScaleFor(Tokens.title)).fontWeight(FontWeight.Medium).fontColor(Colors.ink)
-          }
-          Text(tr(this.workspace.screenControlRequested ? 'session_tools_terminal_screen_control_active' : 'session_tools_terminal_screen_view_only'))
-            .fontSize(13).maxFontScale(Tokens.interfaceScaleFor(13)).fontColor(Colors.secondary)
-        }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-        Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('refresh')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('refresh', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('refresh')).bindTips(tr('refresh')).onClick(() => { Haptics.tap(); this.workspace.refreshScreen(); })
-        if (this.workspace.screenControlRequested) Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('release')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('release', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('release')).bindTips(tr('release')).onClick(() => { Haptics.tap(); this.workspace.revokeScreenControl(); })
-        else Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('control')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('control', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('control')).bindTips(tr('control')).enabled(this.workspace.canControlScreen()).onClick(() => { Haptics.tap(); this.confirmScreenControl(); })
-      }
-        .width('100%')
-        .padding({ left: 14, right: 10, top: 10, bottom: 10 })
-        .backgroundColor(Colors.surface)
-        .borderRadius(Tokens.radiusCard)
-        .border({ width: PhoneStyle.surfaceEdgeWidth(0.5), color: this.cardRim(), radius: Tokens.radiusCard })
-        .shadow(PhoneStyle.cardElevation(this.env.dark))
-      if (this.workspace.screenError) Text(trError(this.workspace.screenError)).fontSize(Tokens.meta).fontColor($r('app.color.persona_danger')).padding({ left: 4, right: 4 })
-      if (this.transferError) Text(this.transferError).fontSize(Tokens.meta).fontColor($r('app.color.persona_danger')).padding({ left: 4, right: 4 })
-      Scroll() {
-        Text(this.workspace.screenText || tr('session_tools_terminal_waiting'))
-          .fontFamily('monospace').fontSize(12.5).lineHeight('19fp').fontColor(Colors.ink).width('100%').textAlign(TextAlign.Start).copyOption(CopyOptions.LocalDevice).padding(12)
-      }
-        .layoutWeight(1)
-        .width('100%')
-        .align(Alignment.TopStart)
-        .backgroundColor(Colors.codeCanvas)
-        .borderRadius(Tokens.radiusCard)
-        .clip(true)
-        .border({ width: PhoneStyle.surfaceEdgeWidth(0.5), color: this.cardRim(), radius: Tokens.radiusCard })
-        .shadow(PhoneStyle.cardElevation(this.env.dark))
-      if (this.workspace.screenControlRequested) {
-        Column({ space: 8 }) {
-          Row({ space: 8 }) {
-            TextInput({ text: this.screenInput, placeholder: tr('session_tools_terminal_screen_input') })
-              .layoutWeight(1).height(42).backgroundColor(Color.Transparent)
-              .fontSize(14).fontColor(Colors.ink).placeholderColor(Colors.secondary)
-              .onChange((value: string) => this.screenInput = value)
-            Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('send')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('send', true)]) }.attributeModifier(ButtonStyles.iconPrimary).accessibilityText(tr('send')).bindTips(tr('send')).onClick(() => { Haptics.tap(); this.sendTerminalScreenText(); })
-          }
-            .width('100%')
-            .padding({ left: 10, right: 6, top: 4, bottom: 4 })
-            .backgroundColor(Colors.surface)
-            .borderRadius(20)
-            .border({ width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.floatingBorder(this.env.dark), radius: 20 })
-          Scroll() {
-            Row({ space: 8 }) {
-              this.terminalKeyButton('Esc', 'scr.esc', false, () => this.sendTerminalScreenKey('esc'))
-              this.terminalKeyButton('Tab', 'scr.tab', false, () => this.sendTerminalScreenKey('tab'))
-              this.terminalKeyButton('↑', 'scr.up', false, () => this.sendTerminalScreenKey('up'))
-              this.terminalKeyButton('↓', 'scr.down', false, () => this.sendTerminalScreenKey('down'))
-              this.terminalKeyButton('Ctrl-C', 'scr.ctrlc', true, () => this.sendTerminalScreenKey('ctrl+c'))
             }.padding({ top: 1, bottom: 2 })
           }.scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off).width('100%').align(Alignment.Start)
         }.width('100%')
@@ -2249,27 +2163,19 @@ export struct SessionTools {
     }.width('100%').height('100%')
   }
 
-  private sendTerminalScreenKey(key: string): void {
-    const revision = this.workspace.screenRevision;
-    this.workspace.sendScreenKeys([key], '', revision).then((ok: boolean) => {
-      if (!ok && this.workspace.screenError) this.transferError = trError(this.workspace.screenError);
-    });
-  }
-
   private controlDescription(): string {
     const state = this.workspace.terminalControlState;
     if (state === 'active') return tr('session_tools_control_active');
     if (state === 'starting') return tr('session_tools_control_starting');
     if (state === 'busy') return tr('session_tools_control_busy');
     if (state === 'unsupported') return tr('session_tools_view_only');
-    return tr('session_tools_control_off');
+    return tr(this.workspace.terminalTextMode ? 'session_tools_view_only' : 'session_tools_control_off');
   }
 
-  private sendTerminalInput(): void {
-    if (!this.terminalInput) return;
-    this.workspace.sendTerminalText(this.terminalInput);
-    this.workspace.sendTerminalKey('enter');
-    this.terminalInput = '';
+  private async sendTerminalInput(): Promise<void> {
+    const input = this.terminalInput, revision = this.workspace.currentRevision();
+    if (await this.workspace.submitTerminalInput(input) && revision === this.workspace.currentRevision() && this.terminalInput === input)
+      this.terminalInput = '';
   }
 
   private measureTerminal(area: Area): void {
@@ -2354,7 +2260,6 @@ export struct SessionTools {
       if (this.workspace.tab === 0) this.fileView()
       else if (this.workspace.tab === 1) this.gitView()
       else if (this.workspace.tab === 2) this.terminalView()
-      else if (this.workspace.tab === 3) this.terminalScreenView()
       else this.previewView()
     }.width('100%').height('100%')
       .onAreaChange((_old: Area, area: Area) => {
