@@ -1,3 +1,4 @@
+import { registerSnapshotTaskpool } from './support/session-snapshot-taskpool.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerHooks, stripTypeScriptTypes } from 'node:module';
@@ -46,7 +47,7 @@ registerHooks({
       export class HttpFailure extends Error { constructor(status=0,codeOrUnknown=false,unknownOrPending=false,pending=false) { super('synthetic failure'); this.status=status; this.resultUnknown=typeof codeOrUnknown==='string'?unknownOrPending:codeOrUnknown; this.resultPending=typeof codeOrUnknown==='string'?pending:unknownOrPending; } }
       export class HubTransport {async request(...args){return globalThis.clientTestRequest(...args);} close(){} } export class EndpointConfig {constructor(baseUrl='',hubId='',token='',pin='',managerId='',alternateUrls=[]){Object.assign(this,{baseUrl,hubId,token,pin,managerId,alternateUrls});}} export class CredentialVault {}
       export class LocalStore { data=new Map(); revision(){return 0;} accepts(){return true;} async put(k,v) {this.data.set(k,v);} async get(k) { return this.data.get(k)||''; } async remove(k){this.data.delete(k);} allowHub() {} async purgeHub(hub) {for(const key of this.data.keys())if(globalThis.clientIsHubStateKey(key,hub))this.data.delete(key);} }
-      export class HubRepository {} export class TranscriptModel {} export class SessionWorkspace {}
+      export class HubRepository {} export class TranscriptModel { async open() {} close() {} } export class SessionWorkspace {}
       export class SshTunnel { initialize(){} stop(){} async bind(client){this.client=client;} async acquire(){if(globalThis.clientSshAcquire)return globalThis.clientSshAcquire(this.client);return undefined;} async forget(){} }
       export class KnowledgeRecording { static async forgetProfile(){} }
       export const dictationPreference = {choice:"auto",last:"",load(){},remember(){}};
@@ -68,6 +69,7 @@ registerHooks({
     return next(url, context);
   }
 });
+registerSnapshotTaskpool();
 const {isHubStateKey}=await import('../entry/src/main/ets/core/StorageOwnership.ts');globalThis.clientIsHubStateKey=isHubStateKey;
 const contextReference=JSON.stringify({kind:'todo',id:'source',title:'Source'});
 globalThis.clientTestUUID=0;
@@ -200,6 +202,23 @@ test('a history read waiting for decisions cannot reopen a hidden conversation',
   assert.equal(model.transcript, undefined);
   assert.equal(model.chatHistoryLoading, false);
   assert.equal(model.error, '');
+});
+
+test('opening a transcript starts its history read without waiting for Hub decisions', async () => {
+  const {model}=fixture(), decisions=deferred(), history=deferred();
+  delete model.loadChat;
+  model.repository.decisions=()=>decisions.promise;
+  model.transcriptKey=model.target();
+  let reads=0;
+  model.transcript={latest(){reads++;return history.promise;},close(){}};
+  const loading=model.showConversation(model.selected);
+  assert.equal(reads,1);
+  assert.equal(model.chatHistoryLoading,true);
+  model.hideConversation();
+  history.resolve();decisions.resolve([]);
+  await loading;
+  assert.equal(model.transcript,undefined);
+  assert.equal(model.decisionReadyTarget,'');
 });
 
 test('a cached transcript preview publishes only into the selection that requested it', async () => {
@@ -2219,4 +2238,14 @@ test('the composer can send a quote without an extra note and keeps attachments 
     model.sourceContext=context;model.draft='';assert.equal(model.hasSendableContext(),false);assert.equal(await model.send(),false);
   }
   assert.equal(writes.length,1);
+});
+
+
+test('a manual refresh arriving during a directory-only read still verifies chat history',async()=>{
+ const {model}=fixture(),gate=deferred(),modes=[];
+ model.refreshCurrent=async background=>{modes.push(background);if(background)await gate.promise;};
+ const passive=model.refresh(true),another=model.refresh(true),manual=model.refresh();
+ assert.deepEqual(modes,[true]);
+ gate.resolve();await Promise.all([passive,another,manual]);
+ assert.deepEqual(modes,[true,false]);
 });

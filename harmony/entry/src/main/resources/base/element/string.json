@@ -2921,16 +2921,8 @@
       "value": "Take control of this terminal?"
     },
     {
-      "name": "session_tools_terminal_screen",
-      "value": "Computer screen"
-    },
-    {
       "name": "session_tools_terminal_screen_control_confirm",
-      "value": "Allow input on the computer screen?"
-    },
-    {
-      "name": "session_tools_terminal_screen_input",
-      "value": "Type to computer"
+      "value": "Allow input in the session terminal?"
     },
     {
       "name": "session_tools_trash_title",
@@ -6071,14 +6063,6 @@
     {
       "name": "session_tools_rename",
       "value": "Rename"
-    },
-    {
-      "name": "session_tools_terminal_screen_control_active",
-      "value": "Terminal control enabled"
-    },
-    {
-      "name": "session_tools_terminal_screen_view_only",
-      "value": "View only"
     },
     {
       "name": "upstream_error",
@@ -11607,6 +11591,18 @@
     {
       "name": "minimal",
       "value": "Minimal"
+    },
+    {
+      "name": "session_computer_screen",
+      "value": "Computer screen"
+    },
+    {
+      "name": "session_tools_terminal_text_mode",
+      "value": "Text mode"
+    },
+    {
+      "name": "session_tools_terminal_unavailable",
+      "value": "Terminal unavailable"
     }
   ]
 }

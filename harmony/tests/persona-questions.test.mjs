@@ -1,3 +1,4 @@
+import { registerSnapshotTaskpool } from './support/session-snapshot-taskpool.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerHooks, stripTypeScriptTypes } from 'node:module';
@@ -83,6 +84,7 @@ registerHooks({
   }
 });
 
+registerSnapshotTaskpool();
 const { ClientModel } = await import('../entry/src/main/ets/models/ClientModel.ets');
 const { Decision, HubProfile, ResourceRow } = await import('../entry/src/main/ets/models/Wire.ets');
 

@@ -50,8 +50,7 @@ export function compactRow(row: Payload): Payload {
   return copy;
 }
 
-function activity(row: Payload): number {
-  const data = parsed(row['raw']);
+function activity(data: Payload): number {
   for (const field of ACTIVITY_FIELDS) {
     const value = data[field];
     const at = typeof value === 'string' ? Date.parse(value) : typeof value === 'number' ? value : NaN;
@@ -60,10 +59,10 @@ function activity(row: Payload): number {
   return 0;
 }
 
-/** A row carrying an undelivered message the owner still has to see is never dropped. */
-function held(row: Payload): boolean {
-  const entries = parsed(row['raw'])['undelivered'];
-  return Array.isArray(entries) && entries.length > 0;
+interface EvictionCandidate {
+  index: number;
+  at: number;
+  bytes: number;
 }
 
 /**
@@ -77,13 +76,18 @@ export function encodeSessionSnapshot(sessions: Payload[], conversations: Payloa
   const whole = JSON.stringify({ sessions: rows, conversations: chats, heldActions: heldActions, sidebarConfig: sidebarConfig });
   let size = utf8Bytes(whole);
   if (size <= budget) return whole;
-  const sizes = rows.map((row: Payload): number => utf8Bytes(JSON.stringify(row)) + 1);
-  const order = rows.map((_row: Payload, index: number): number => index).filter((index: number): boolean => !held(rows[index]))
-    .sort((a: number, b: number): number => activity(rows[a]) - activity(rows[b]) || b - a);
+  const candidates: EvictionCandidate[] = [];
+  rows.forEach((row: Payload, index: number) => {
+    const data = parsed(row['raw']), undelivered = data['undelivered'];
+    if (Array.isArray(undelivered) && undelivered.length > 0) return;
+    candidates.push({ index: index, at: activity(data), bytes: utf8Bytes(JSON.stringify(row)) + 1 });
+  });
+  candidates.sort((a: EvictionCandidate, b: EvictionCandidate): number => a.at - b.at || b.index - a.index);
   const dropped = new Set<number>();
-  for (const index of order) {
+  for (const candidate of candidates) {
     if (size <= budget) break;
-    dropped.add(index); size -= sizes[index];
+    dropped.add(candidate.index);
+    size -= candidate.bytes;
   }
   const text = JSON.stringify({ sessions: rows.filter((_row: Payload, index: number): boolean => !dropped.has(index)),
     conversations: chats, heldActions: heldActions, sidebarConfig: sidebarConfig });

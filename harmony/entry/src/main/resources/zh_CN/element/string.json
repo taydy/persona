@@ -2921,16 +2921,8 @@
       "value": "接管此终端？"
     },
     {
-      "name": "session_tools_terminal_screen",
-      "value": "电脑屏幕"
-    },
-    {
       "name": "session_tools_terminal_screen_control_confirm",
-      "value": "允许在电脑屏幕上操作？"
-    },
-    {
-      "name": "session_tools_terminal_screen_input",
-      "value": "在电脑上输入"
+      "value": "允许向会话终端输入？"
     },
     {
       "name": "session_tools_trash_title",
@@ -6071,14 +6063,6 @@
     {
       "name": "session_tools_rename",
       "value": "重命名"
-    },
-    {
-      "name": "session_tools_terminal_screen_control_active",
-      "value": "已开启终端控制"
-    },
-    {
-      "name": "session_tools_terminal_screen_view_only",
-      "value": "仅查看"
     },
     {
       "name": "upstream_error",
@@ -11607,6 +11591,18 @@
     {
       "name": "minimal",
       "value": "最低"
+    },
+    {
+      "name": "session_computer_screen",
+      "value": "电脑屏幕"
+    },
+    {
+      "name": "session_tools_terminal_text_mode",
+      "value": "文本模式"
+    },
+    {
+      "name": "session_tools_terminal_unavailable",
+      "value": "会话终端不可用"
     }
   ]
 }

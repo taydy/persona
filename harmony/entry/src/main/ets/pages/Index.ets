@@ -1935,7 +1935,7 @@ struct Index {
     this.stack.pushPath({ name: 'computer', param: param }); this.savePath();
   }
   private selectedComputer(): ResourceRow | undefined {
-    return this.detailModel.machines.find((row: ResourceRow) => row.id === this.detailModel.selected.machine);
+    return this.detailModel.selectedScreenMachine();
   }
   private async handoffResource(row: ResourceRow): Promise<void> {
     const generation = this.model.connectionGeneration(), scope = this.model.scope(), source = this.activeChild;
@@ -2772,26 +2772,29 @@ struct Index {
         action:()=>{ if (valid()) { this.directionPermissionsTarget=JSON.stringify([owner.scope(),owner.selected.key()]);
           this.directionPermissionsVisible=true; } }});
     }
+    const computer = this.selectedComputer();
+    if (computer) sheets.push({ title: tr('session_computer_screen'), identity: 'session.mode.computer_screen', action: () => {
+      if (!valid()) return;
+      const current = this.selectedComputer();
+      if (current && current.key() === computer.key()) this.openComputer(current);
+    } });
     if (!this.wide() && owner.selected.machine && (name === 'session' || name === 'tools')) {
       if (name === 'tools') sheets.push({title: tr('session_back_to_chat'), identity: 'session.mode.chat',
         action: () => { if (valid()) this.phoneBack(); }});
-      const labels = ['files', 'git', 'terminal', 'session_tools_terminal_screen', 'preview'];
-      const identities = ['files', 'git', 'terminal', 'terminal_screen', 'preview'];
-      for (const pick of [2, 1, 0, 3, 4]) {
-        sheets.push({title: tr(labels[pick]), identity:'session.mode.' + identities[pick], action: () => {
+      const tabs: Map<string, number> = new Map<string, number>([['terminal', 2], ['git', 1], ['files', 0], ['preview', 4]]);
+      tabs.forEach((pick: number, label: string) => {
+        sheets.push({title: tr(label), identity:'session.mode.' + label, action: () => {
           if (!valid()) return;
           if (name === 'tools') owner.selectWorkspaceTab(pick);
           else this.openTools('', pick);
         }});
-      }
+      });
     }
     const main = this.model.mainActivityRow();
     if (main && name === 'conversation' && owner.target(owner.selected) === this.model.target(main)) {
       sheets.push({ title: tr('background_activity'), identity: 'background-activity-menu', action: () => { if (valid()) this.openActivity(); } });
     }
     if (owner.isChat() && owner.selected.machine) sheets.push({ title: tr('interaction_history'), action: () => { if (valid()) this.openHistory(); } });
-    const computer = this.selectedComputer();
-    if (computer) sheets.push({ title: tr('computer_screen_open'), action: () => { if (valid()) this.openComputer(computer); } });
     if (owner.selected.machine && (this.wide() || name === 'conversation')) sheets.push({ title: tr('workspace'), action: () => { if (valid()) this.openTools(); } });
     const canEdit = owner.connected && !owner.demo;
     if (owner.selected.kind !== 'session' || canEdit && sessionModeAvailable(owner.selected, 'permission_mode')) sheets.push({ title: tr('permissions'), action: () => { if (valid()) this.openSettings('session_permissions', true); } });
@@ -4145,10 +4148,15 @@ struct Index {
       if (revision !== this.routeRevision || this.activeChild !== key || !this.model.owns(generation, scope)) return;
       if (this.detailModel !== view) this.detailModel.hideConversation();
       this.detailModel = view;
-      if (row.key() !== view.selected.key()) await view.select(row);
-      else if (name === 'session' || name === 'conversation') { if (view.connected) view.showConversation(row); }
-      if (revision !== this.routeRevision || this.activeChild !== key || !this.model.owns(generation, scope) || view.selected.key() !== row.key()) return;
-      this.markDetailReady(key);
+      const ownsRoute = (): boolean => revision === this.routeRevision && this.activeChild === key && this.model.owns(generation, scope);
+      const ready = (): void => {
+        if (ownsRoute() && view.selected.key() === row.key() && !this.targetReady(name,param)) this.markDetailReady(key);
+      };
+      if (row.key() !== view.selected.key()) {
+        await view.select(row, true, ownsRoute, name === 'session' ? ready : undefined);
+      } else if (name === 'session' || name === 'conversation') { if (view.connected) view.showConversation(row); }
+      if (!ownsRoute() || view.selected.key() !== row.key()) return;
+      ready();
       if (name === 'assistant' || name === 'settings' && descriptor.page === 'voice') view.watchDecisions(true);
     } catch (error) { if (revision === this.routeRevision && this.activeChild === key && this.model.owns(generation, scope)) this.model.reportError(error as Error); }
   }

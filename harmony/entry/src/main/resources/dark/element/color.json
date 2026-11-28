@@ -459,6 +459,10 @@
     {
       "name": "persona_code_literal",
       "value": "#F0B27B"
+    },
+    {
+      "name": "persona_brand_claude",
+      "value": "#D97757"
     }
   ]
 }

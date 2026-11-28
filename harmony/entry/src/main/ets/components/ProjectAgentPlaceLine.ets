@@ -16,6 +16,7 @@ export struct ProjectAgentPlaceLine {
   @Local availableWidth: number = 0;
 
   @Computed get fit(): string {
+    if (this.availableWidth <= 0) return 'place';
     const ui = this.getUIContext(), scale = this.fontScale;
     const width = (text:string, size:number): number => !text ? 0 :
       ui.px2vp(Math.ceil(ui.getMeasureUtils().measureText({textContent:text,fontSize:Tokens.interfaceFontVp(size,scale)})));
@@ -51,8 +52,8 @@ export struct ProjectAgentPlaceLine {
       }
       if (this.starter) Text(tr('session_space_starter')).fontSize(12).maxFontScale(Tokens.interfaceScaleFor(12)).fontColor(Colors.secondary).maxLines(1)
     }.width('100%').margin({top:2})
-      .onAreaChange((before:Area,after:Area) => {
-        const width = Number.parseFloat(String(after.width));
+      .onSizeChange((_before: SizeOptions, after: SizeOptions) => {
+        const width = Number(after.width);
         if (width>0 && width!==this.availableWidth) this.availableWidth = width;
       })
   }

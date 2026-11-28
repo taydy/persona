@@ -122,6 +122,7 @@ struct MessageSurface {
   @Param own: boolean = false;
   @Param agentPrompt: boolean = false;
   @Param personaReply: boolean = false;
+  @Param agentTranscript: boolean = false;
   @Param structured: boolean = false;
   @Param text: string = '';
   @Param maximum: number = Tokens.readingMax;
@@ -163,7 +164,7 @@ struct MessageSurface {
           this.own ? { left: Tokens.inset, right: Tokens.inset, top: 10, bottom: 10 } : 0)
       .backgroundColor(this.surfaceFill())
       .borderRadius(this.own || this.personaReply ? Tokens.bubble : 0)
-      .border(this.own || this.personaReply ? { width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.cardBorder(this.env.dark), radius: Tokens.bubble } : { width: 0 })
+      .border(!this.agentTranscript && (this.own || this.personaReply) ? { width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.cardBorder(this.env.dark), radius: Tokens.bubble } : { width: 0 })
       .shadow(this.personaReply ? PhoneStyle.cardElevation(this.env.dark) : { radius: 0, color: Color.Transparent })
       .clip(this.own).id(this.sourceId)
   }
@@ -352,6 +353,7 @@ export struct Conversation {
   private lastReadingFrame: ReadingFrameOrigin | undefined;
   private priorReadingFrame: ReadingFrameOrigin | undefined;
   private scrollingByHand: boolean = false;
+  private lastDragSample: number = 0;
   private lastManualAnchor: ReadingAnchor | undefined = undefined;
   private manuallyReading: boolean = false;
   private selectedReadingLine: string = '';
@@ -664,6 +666,14 @@ export struct Conversation {
     this.readingMotion++; this.scrollingByHand = true;
     if (this.searchHitId && this.seekingHit) this.readingRestoring = false;
   }
+  private sampleDragAnchor(): void {
+    if (!this.scrollingByHand) return;
+    const now = Date.now();
+    if (now - this.lastDragSample < 100) return;
+    this.lastDragSample = now;
+    this.recordReading(this.firstVisibleIndex);
+  }
+
   private finishReadingMotion(): void {
     if (!this.scrollingByHand) return;
     this.scrollingByHand = false;
@@ -1002,6 +1012,7 @@ export struct Conversation {
     this.trackScrollMotion(offset, source);
     this.userScrolling = true;
     if (offset < 0) this.atEnd = false;
+    if (!this.atEnd && !this.resumeHistory) this.trackHistoryRendering(this.lastVisibleIndex);
   }
   private reachedLatest(): void {
     if (!this.active || this.photoOpen || !this.scroller.isAtEnd()) return;
@@ -1049,12 +1060,17 @@ export struct Conversation {
   }
   private trackHistoryRendering(last: number): void {
     const hold = this.active && this.userScrolling && !this.atEnd &&
-      this.model.selected.kind === 'session' && last < this.readingPrefix() + this.lines.length - 1;
+      this.model.selected.kind === 'session' && (this.scrollingByHand || last < this.readingPrefix() + this.lines.length - 1);
     if (hold && !this.resumeHistory) this.resumeHistory = this.model.holdHistoryRendering();
     else if (!hold && this.resumeHistory) this.releaseHistoryRendering();
   }
   private finishScroll(): void {
     if (this.userScrolling) this.reachedLatest();
+    if (this.scrollingByHand) {
+      this.recordReading(this.firstVisibleIndex);
+      this.rememberTailPosition();
+    }
+    this.lastDragSample = 0;
     this.finishReadingMotion();
     this.userScrolling = false;
     if (this.resumeHistory) this.releaseHistoryRendering();
@@ -2291,8 +2307,7 @@ export struct Conversation {
     return undefined;
   }
   @Computed get handoffComputer(): ResourceRow | undefined {
-    return this.model.machines.find(row => row.id === this.model.selected.machine && row.supportsScreen() &&
-      (!row.group || row.group === this.model.profile.id) && (!row.manager || row.manager === this.model.profile.manager));
+    return this.model.selectedScreenMachine();
   }
   @Builder desktopWaitContent() {
     Column({space:3}) {
@@ -2564,9 +2579,10 @@ export struct Conversation {
             this.trackHistoryRendering(end);
             this.approachHistory(start);
             this.lastVisibleIndex = end;
-            this.firstVisibleIndex = start; this.recordReading(start); this.rememberTailPosition();
+            this.firstVisibleIndex = start;
+            if (!this.scrollingByHand) { this.recordReading(start); this.rememberTailPosition(); }
           })
-          .onDidScroll(() => { if (this.scrollingByHand) this.recordReading(this.firstVisibleIndex); })
+          .onDidScroll(() => this.sampleDragAnchor())
           .onReachEnd(() => this.reachedLatest())
           .onScrollStop(() => this.finishScroll())
   }
@@ -2602,7 +2618,8 @@ export struct Conversation {
         }.id('chat.work.' + entry.item.message!.id)
       } else if (entry.item.message!.work) {
         this.workBody(entry)
-        if (entry.item.message!.turnChanges) {
+        if (entry.item.message!.turnChanges && (entry.item.soleProcessGroup ?
+          !this.closedSoloGroups.includes(entry.item.message!.id) : this.expanded.includes(entry.item.message!.id))) {
           TurnChangesCard({ changes: entry.item.message!.turnChanges!, onOpenFile: (path: string) => this.onOpenFile(path) })
         }
       }
@@ -2651,10 +2668,10 @@ export struct Conversation {
         }.width('100%').alignItems(VerticalAlign.Center).padding({top:4,bottom:4}).id('chat.live.activity')
       } else if (entry.item.message!.text && entry.item.message!.id !== this.issueEchoId) {
         WithTheme({ colorMode: this.environment.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT, theme: nativeMessageTheme(this.look, this.model.style, entry.item.message!.role === 'user', this.environment.dark) }) {
-        MessageSurface({ sourceId:'chat.lift.source.'+entry.item.id, personaReply:entry.item.message!.role === 'assistant' && this.model.selected.kind === 'conversation', own: entry.item.message!.role === 'user', structured: entry.item.message!.role === 'user' && structuredBubble(entry.item.message!.text), text:entry.item.message!.text, maximum: entry.item.message!.role === 'user' ? this.messageMaximum(entry.item.message!) : Tokens.readingMax,
+        MessageSurface({ sourceId:'chat.lift.source.'+entry.item.id, agentTranscript:this.model.selected.kind === 'session', personaReply:entry.item.message!.role === 'assistant' && this.model.selected.kind === 'conversation', own: entry.item.message!.role === 'user', structured: entry.item.message!.role === 'user' && structuredBubble(entry.item.message!.text), text:entry.item.message!.text, maximum: entry.item.message!.role === 'user' ? this.messageMaximum(entry.item.message!) : Tokens.readingMax,
           timeHint:this.timeHint(entry.item.message!), onTime:() => this.toggleMessageTime(entry.item.message!) }) {
           if (entry.item.message!.role === 'assistant' && this.model.selected.kind === 'conversation') AssistantMessage({ streaming:this.isStreamingMessage(entry.item.message!), model: this.model, documents:this.documents, feed: this.feed, message: entry.item.message!, active: this.active, workspaceRoot:this.markdownWorkspace, mediaWidth:Math.min(Tokens.readingMax,this.availableWidth - 2 * Tokens.page), onPreview:(request: ConversationPhotoRequest) => this.showPhoto(request), onEditImage:(image: LoadedMessageImage) => this.editReceivedImage(image), onOpenFile:(path: string) => this.onOpenFile(path), onLink: (address: string) => this.onLink(address), onOpenResource: (row: ResourceRow) => this.onOpenResource(row) })
-          else MarkdownText({ streaming:this.isStreamingMessage(entry.item.message!), transcript: true, documents:this.documents, text: entry.item.message!.text, narration:entry.item.message!.narration, ownMessage:entry.item.message!.role === 'user',
+          else MarkdownText({ streaming:this.isStreamingMessage(entry.item.message!), transcript: true, agentTranscript:this.model.selected.kind === 'session', documents:this.documents, text: entry.item.message!.text, narration:entry.item.message!.narration, ownMessage:entry.item.message!.role === 'user',
             onBodyTap:entry.item.message!.role === 'user' && entry.item.message!.at > 0 ? () => this.toggleMessageTime(entry.item.message!) : undefined,
             messageId:entry.item.message!.id, clipped:entry.item.message!.userTextClipped,
             readOriginal:() => this.model.readFullUserText(entry.item.message!),

@@ -236,6 +236,7 @@ test('an Agent still follows its latest line after the first list layout and a s
   layout();
   assert.deepEqual(scrolls, ['bottom', 'bottom']);
   v.timelinePositionChanged();
+  v.trackHistoryRendering=()=>{};
   v.userScroll(-40, 1);
   bottom = false;
   v.recordReading(2);
@@ -341,6 +342,7 @@ test('manual scrolling immediately offers the jump, and a later update marks it 
     readingMotion:0,tailMarker:'',lines:[row],
     scroller:{isAtEnd:()=>false,getItemRect:()=>({y:15})},model:{messages:[{id:'m',text:'first'}]}});
   view.markLatest([row]);
+  view.trackHistoryRendering=()=>{};
   view.userScroll(-20,source.SCROLLER);
   assert.equal(view.atEnd,true,'relayout and programmatic offsets keep the tail attached');
   view.userScroll(-20,source.DRAG);view.markLatest([{id:'older'},row]);
@@ -621,4 +623,33 @@ test('the last briefing keeps its reading room above the phone decision dock', (
   page.availableWidth=402;page.assistantDockVisible=false;assert.equal(page.transcriptEndInset(),0);
   page.model.selected.kind='session';assert.equal(page.transcriptEndInset(),44);
   page.lines=[];assert.equal(page.transcriptEndInset(),0);
+});
+
+
+test('a burst of drag callbacks samples the anchor once and settling saves exact geometry',()=>{
+ const Reader=new Function('return '+stripTypeScriptTypes('class Reader {'+['sampleDragAnchor','finishScroll'].map(method).join('\n')+'}'))();
+ const view=new Reader(), samples=[];
+ Object.assign(view,{scrollingByHand:true,userScrolling:true,lastDragSample:0,firstVisibleIndex:3,
+   recordReading:index=>samples.push(index),rememberTailPosition(){samples.push('tail');},finishReadingMotion(){},
+   reachedLatest(){},tailLayoutChanged(){}});
+ view.sampleDragAnchor();view.firstVisibleIndex=4;
+ for(let i=0;i<8;i++)view.sampleDragAnchor();
+ assert.deepEqual(samples,[3]);
+ view.finishScroll();
+ assert.deepEqual(samples,[3,4,'tail']);
+});
+
+
+test('dragging within a single tall last log row holds incoming updates until release',()=>{
+ const Reader=new Function('ScrollSource','return '+stripTypeScriptTypes('class Reader {'+
+   ['userScroll','trackHistoryRendering','releaseHistoryRendering'].map(method).join('\n')+'}'))({DRAG:1});
+ let holds=0, releases=0;
+ const view=Object.assign(new Reader(),{active:true,atEnd:true,lines:[{}],lastVisibleIndex:2,
+   readingPrefix:()=>2,trackScrollMotion(){this.scrollingByHand=true;},
+   model:{selected:{kind:'session'},holdHistoryRendering(){holds++;return ()=>{releases++;};}}});
+ view.userScroll(-10,1);view.userScroll(-30,1);
+ assert.equal(holds,1);
+ view.trackHistoryRendering(2);
+ assert.equal(releases,0);
+ view.releaseHistoryRendering();assert.equal(releases,1);
 });

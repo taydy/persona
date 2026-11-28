@@ -18,6 +18,7 @@ import { pasteboard } from '@kit.BasicServicesKit';
 import { tr } from '../design/Strings';
 import { IconActions } from '../design/IconActions';
 import { ClientModel } from '../models/ClientModel';
+import { ConversationCode } from './ConversationCode';
 import { TranscriptImage } from './TranscriptImage';
 import { conversationImageKey, messageImageGalleryWindow } from '../core/MessageImageGallery';
 import type { ConversationPhotoRequest, LoadedMessageImage, MessageImageGalleryEntry } from '../core/MessageImageGallery';
@@ -170,6 +171,7 @@ export struct MarkdownText {
   private readSequence: number = 0;
   @Event hold: (change: () => void) => void = change => change();
   @Param transcript: boolean = false;
+  @Param agentTranscript: boolean = false;
   @Param documents: ConversationMarkdownCache | undefined = undefined;
   @Param workspaceRoot: string = '';
   @Param mediaModel: ClientModel | undefined = undefined;
@@ -646,6 +648,8 @@ export struct MarkdownText {
       this.inlineText(block.inlines, this.proseSize, false, TextAlign.Start, false)
     } else if (block.kind === 'heading') {
       this.inlineText(block.inlines, this.compact ? Tokens.meta : this.headingSize(block.level), true)
+    } else if (block.kind === 'code' && this.agentTranscript) {
+      ConversationCode({ code: block.text, language: block.language, onBodyTap: this.onBodyTap, hold: this.hold })
     } else if (block.kind === 'code') {
       this.codeBlockCard(block, path || 'code')
     } else if (block.kind === 'raw') {
@@ -657,7 +661,7 @@ export struct MarkdownText {
     } else if (block.kind === 'quote' && this.ownMessage) {
       UserPassage({ preview:markdownVisibleText(block.children), limit:2, overflow:this.clipped || this.overflows(markdownVisibleText(block.children),16,2),
         ink:this.quotedInk, actionInk:this.primaryInk, proseSize:16, identity:this.messageId + '.quote.' + path, hold:this.hold, onBodyTap:this.onBodyTap, onReveal:() => { void this.loadOriginal(); } }) {
-        MarkdownText({ text:block.children.map(b => b.source).join('\n\n'), documents:this.documents, transcript:true, quoteInk:true, messageInk:this.primaryInk, messageQuoteInk:this.quotedInk,
+        MarkdownText({ text:block.children.map(b => b.source).join('\n\n'), documents:this.documents, transcript:true, agentTranscript:this.agentTranscript, quoteInk:true, messageInk:this.primaryInk, messageQuoteInk:this.quotedInk,
           workspaceRoot:this.workspaceRoot, onOpenFile:this.onOpenFile, onLink:this.onLink, onBodyTap:this.onBodyTap })
       }
     } else if (block.kind === 'quote') {

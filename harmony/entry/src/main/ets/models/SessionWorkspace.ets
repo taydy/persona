@@ -211,12 +211,10 @@ export class SessionWorkspace {
   @Trace fileWriteError: string = '';
   @Trace fileConflictName: string = '';
   @Trace trashUndo: WorkspaceTrashItem[] = [];
-  @Trace screenText: string = '';
-  @Trace screenError: string = '';
-  @Trace screenBusy: boolean = false;
-  @Trace screenKeyBusy: boolean = false;
-  @Trace screenControlRequested: boolean = false;
-  @Trace screenRevision: number = 0;
+  @Trace terminalTextMode: boolean = false;
+  @Trace textKeyBusy: boolean = false;
+  private textPollBusy: boolean = false;
+  private textControlLease: number = 0;
   @Trace previewServers: WorkspacePreviewServer[] = [];
   @Trace previewError: string = '';
   @Trace previewState: string = 'idle';
@@ -262,7 +260,6 @@ export class SessionWorkspace {
   private terminalOscEscape: boolean = false;
   private terminalPending: Uint8Array = new Uint8Array(0);
   private terminalPollTimer: number = -1;
-  private screenPollTimer: number = -1;
   private previewPollTimer: number = -1;
   private fsRefreshTimer: number = -1;
   private revision: number = 0;
@@ -306,7 +303,6 @@ export class SessionWorkspace {
     this.fileWriteBusy = false; this.fileWriteState = 'idle'; this.fileWriteError = ''; this.fileConflictName = ''; this.trashUndo = [];
     this.fileError = '';
     this.gitError = '';
-    this.screenText = ''; this.screenError = ''; this.screenRevision = 0; this.screenBusy = false; this.screenControlRequested = false;
     this.previewServers = []; this.previewError = ''; this.previewState = 'idle'; this.previewFrame = undefined;
     this.previewMessage = ''; this.previewPort = 0; this.previewPath = '/'; this.previewName = '';
     this.previewExternalUrl = '';
@@ -409,15 +405,6 @@ export class SessionWorkspace {
     return this.canUsePreview() && this.sessionWritable() && !this.hasPending(this.requestPath('/preview/start'));
   }
 
-  canControlScreen(): boolean {
-    if (!this.current() || !this.visible || this.tab !== 3 || this.screenKeyBusy || this.hasPending(this.screenKeysPath()) ||
-      !this.machineTrustedOnline() || !this.sessionWritable()) return false;
-    const data = this.model?.selected.data();
-    const caps = data ? Wire.object(data, 'capabilities') : Wire.payload([], []);
-    const sourced = !!data && !!Wire.text(data, 'source_kind');
-    return !sourced || Wire.bool(caps, 'terminal');
-  }
-
   private hasPending(path: string): boolean {
     const records = this.model?.repo().mutations?.blocked() || [];
     return records.some((record) => record.path === path && record.method === 'POST');
@@ -468,19 +455,18 @@ export class SessionWorkspace {
   }
 
   selectTab(value: number): void {
-    const next = Math.max(0, Math.min(4, value));
+    // Restored links to the former terminal snapshot tab now open the unified terminal.
+    const next = value === 3 ? 2 : Math.max(0, Math.min(4, value));
     if (next === this.tab && this.visible) return;
     if (next !== this.tab) {
       this.revision++;
       this.gitStashEpoch++; this.gitStashBusy=false; this.gitPrEpoch++; if (this.gitPrBusy) this.gitPrKey=''; this.gitPrBusy=false;
       this.fileListEpoch++; if (this.findBusy) this.resetFileFind();
       this.gitStatusEpoch++; this.gitHistoryEpoch++; this.gitHistoryBusy=false; this.closeGitShow(); this.closeGitDiff();
-      this.fileBusy = false; this.fileReadBusy = false; this.gitBusy = false; this.gitDiffBusy = false; this.screenBusy = false;
-      this.screenKeyBusy = false;
+      this.fileBusy = false; this.fileReadBusy = false; this.gitBusy = false; this.gitDiffBusy = false;
       this.fileWriteBusy = false; this.gitWriteBusy = false;
     }
     if (this.tab === 2 && next !== 2) this.releaseTerminal(true);
-    if (this.tab === 3 && next !== 3) this.stopScreen(true);
     if (this.tab === 4 && next !== 4) this.closePreview();
     this.tab = next;
     if (this.visible) this.activateTab(next);
@@ -490,24 +476,21 @@ export class SessionWorkspace {
     if (!this.current()) return;
     if (value === 0) {
       this.releaseTerminal(true);
-      this.stopScreen(true); this.closePreview();
+      this.closePreview();
       this.sendFsWatch([this.currentPath || this.cwd], false);
       this.loadFiles();
       this.loadFileGitMarks();
     } else if (value === 1) {
       this.releaseTerminal(true);
-      this.stopScreen(true); this.closePreview();
+      this.closePreview();
       this.sendFsWatch([], true);
       this.loadGit();
     } else if (value === 2) {
-      this.stopScreen(true); this.closePreview();
+      this.closePreview();
       this.sendFsWatch([], false);
       this.startTerminal(false);
-    } else if (value === 3) {
-      this.releaseTerminal(true); this.closePreview(); this.sendFsWatch([], false);
-      this.startScreenPoll();
     } else {
-      this.releaseTerminal(true); this.stopScreen(true); this.sendFsWatch([], false);
+      this.releaseTerminal(true); this.sendFsWatch([], false);
       this.loadPreviewServers();
     }
   }
@@ -598,13 +581,11 @@ export class SessionWorkspace {
     this.fileTransfer.hide();
     this.resetBusyState();
     if (this.fsRefreshTimer !== -1) clearTimeout(this.fsRefreshTimer);
-    if (this.terminalPollTimer !== -1) clearTimeout(this.terminalPollTimer);
-    if (this.screenPollTimer !== -1) clearTimeout(this.screenPollTimer);
     if (this.previewPollTimer !== -1) clearTimeout(this.previewPollTimer);
-    this.fsRefreshTimer = -1; this.terminalPollTimer = -1; this.screenPollTimer = -1; this.previewPollTimer = -1;
+    this.fsRefreshTimer = -1; this.previewPollTimer = -1;
     this.sendFsWatch([], false, true);
     this.releaseTerminal(true);
-    this.stopScreen(false); this.closePreview();
+    this.closePreview();
     this.connectionReady = false;
   }
 
@@ -629,14 +610,11 @@ export class SessionWorkspace {
     this.terminalSubscribed = false;
     this.fsWatchPath = '';
     this.fsWatchGit = false;
-    if (this.terminalPollTimer !== -1) clearTimeout(this.terminalPollTimer);
     if (this.fsRefreshTimer !== -1) clearTimeout(this.fsRefreshTimer);
-    if (this.screenPollTimer !== -1) clearTimeout(this.screenPollTimer);
     if (this.previewPollTimer !== -1) clearTimeout(this.previewPollTimer);
-    this.terminalPollTimer = -1; this.fsRefreshTimer = -1; this.screenPollTimer = -1; this.previewPollTimer = -1;
-    this.screenControlRequested = false;
+    this.fsRefreshTimer = -1; this.previewPollTimer = -1;
     this.releaseTerminal(false);
-    this.stopScreen(false); this.closePreview();
+    this.closePreview();
   }
 
   onBinary(_payload: ArrayBuffer): void {
@@ -649,6 +627,7 @@ export class SessionWorkspace {
     try { event = typeof raw === 'string' ? Wire.parse(raw) : raw; } catch (_) { return; }
     const type = Wire.text(event, 'type');
     if (type === 'terminal' || type === 'terminal_control') {
+      if (!this.terminalSubscribed || this.terminalTextMode) return;
       if (Wire.text(event, 'machine_id') !== this.machineId || Wire.text(event, 'session_id') !== this.sessionId || this.tab !== 2) return;
       if (type === 'terminal_control') { this.terminalControlState = Wire.text(event, 'state', 'off'); return; }
       this.receiveTerminal(event);
@@ -1198,75 +1177,6 @@ export class SessionWorkspace {
 
   closeGitDiff():void { this.gitDiffEpoch++; this.gitDiffPath=''; this.gitDiff=''; this.gitDiffTruncated=false; this.gitDiffError=''; this.gitDiffBusy=false; }
 
-  private canReadScreen(): boolean {
-    if (!this.current() || !this.visible || this.tab !== 3 || !this.machineTrustedOnline()) return false;
-    const data = this.model?.selected.data();
-    const caps = data ? Wire.object(data, 'capabilities') : Wire.payload([], []);
-    const sourced = !!data && !!Wire.text(data, 'source_kind');
-    return !sourced || Wire.bool(caps, 'terminal');
-  }
-
-  private startScreenPoll(): void {
-    this.screenControlRequested = false;
-    this.screenError = '';
-    if (!this.canReadScreen()) { this.screenError = 'screen_unavailable'; return; }
-    this.pollScreen();
-  }
-
-  private pollScreen(): void {
-    if (!this.canReadScreen() || this.screenBusy) return;
-    const revision = this.revision, target = this.ownerTarget;
-    this.screenBusy = true;
-    this.request('/api/v1/sessions/' + segment(this.machineId) + '/' + segment(this.sessionId) + '/screen?lines=60&source=visible')
-      .then((result: Record<string, Object>) => {
-        if (!this.activeRevision(revision, target, 3)) return;
-        this.screenText = Wire.text(result, 'text'); this.screenRevision++; this.screenError = '';
-      }).catch((error: Error) => {
-        if (this.activeRevision(revision, target, 3)) this.screenError = this.message(error);
-      }).finally(() => {
-        if (revision !== this.revision) return;
-        this.screenBusy = false;
-        if (this.visible && this.tab === 3 && this.current()) this.screenPollTimer = setTimeout(() => this.pollScreen(), 1200);
-      });
-  }
-
-  refreshScreen(): void {
-    if (!this.screenBusy) { this.screenError = ''; this.pollScreen(); }
-  }
-
-  private stopScreen(clear: boolean): void {
-    if (this.screenPollTimer !== -1) clearTimeout(this.screenPollTimer);
-    this.screenPollTimer = -1; this.screenBusy = false; this.screenKeyBusy = false; this.screenControlRequested = false;
-    if (clear) this.screenText = '';
-  }
-
-  enableScreenControl(): boolean {
-    if (!this.canControlScreen()) return false;
-    this.screenControlRequested = true;
-    return true;
-  }
-
-  revokeScreenControl(): void { this.screenControlRequested = false; }
-
-  async sendScreenKeys(keys: string[], text: string, expectedRevision: number): Promise<boolean> {
-    if (!this.screenControlRequested || this.screenKeyBusy || !this.canControlScreen() || expectedRevision !== this.screenRevision || (!keys.length && !text)) return false;
-    const safeKeys = keys.filter((key: string) => ['enter', 'esc', 'tab', 'backspace', 'up', 'down', 'left', 'right', 'ctrl+c', 'ctrl+d'].includes(key));
-    if (keys.length && safeKeys.length !== keys.length) return false;
-    const revision = this.revision, screenRevision = this.screenRevision;
-    this.screenKeyBusy = true;
-    try {
-      await this.request(this.screenKeysPath(), 'POST', Wire.payload(['keys', 'text'], [safeKeys as Object, text]));
-      if (revision === this.revision && this.current() && screenRevision === this.screenRevision) this.pollScreen();
-      return true;
-    } catch (error) {
-      if (revision === this.revision && this.current()) {
-        this.screenError = this.message(error as Error);
-        if (this.hasPending(this.screenKeysPath())) this.screenControlRequested = false;
-      }
-      return false;
-    } finally { if (revision === this.revision) this.screenKeyBusy = false; }
-  }
-
   async loadPreviewServers(): Promise<void> {
     if (!this.current() || !this.visible || this.tab !== 4) return;
     if (!this.feature('preview')) { this.previewState = 'unsupported'; this.previewError = 'preview_unavailable'; return; }
@@ -1432,12 +1342,15 @@ export class SessionWorkspace {
     if (this.previewState !== 'unsupported') this.previewState = 'idle';
   }
 
+  private canReadTerminal(): boolean {
+    if (!this.visible || this.tab !== 2 || !this.connectionReady || !this.current() || !this.model?.connected) return false;
+    const data = this.model!.selected.data();
+    return !Wire.text(data, 'source_kind') || Wire.bool(Wire.object(data, 'capabilities'), 'terminal');
+  }
+
   canControlTerminal(): boolean {
-    if (!this.current() || !this.visible || this.tab !== 2 || !this.feature('terminal_control') ||
-      !this.machineTrustedOnline() || !this.sessionWritable()) return false;
-    const data = this.model?.selected.data();
-    const caps = data ? Wire.object(data, 'capabilities') : Wire.payload([], []);
-    return !data || !Wire.text(data, 'source_kind') || Wire.bool(caps, 'terminal');
+    return this.canReadTerminal() && this.machineTrustedOnline() && this.sessionWritable() &&
+      (this.terminalTextMode ? !this.hasPending(this.screenKeysPath()) : this.feature('terminal_control'));
   }
 
   private startTerminal(continuing: boolean): void {
@@ -1450,11 +1363,13 @@ export class SessionWorkspace {
 
   setTerminalControl(on: boolean): void {
     if (!this.current() || !this.visible || this.tab !== 2) return;
-    if (on && !this.canControlTerminal()) {
-      this.terminalControlState = 'unsupported';
+    if (on && !this.canControlTerminal()) return;
+    this.terminalControlRequested = on;
+    if (this.terminalTextMode) {
+      this.textControlLease++;
+      this.terminalControlState = on ? 'active' : 'off';
       return;
     }
-    this.terminalControlRequested = on;
     if (on) {
       this.terminalControlState = 'starting';
       this.sendTerminalSubscribe(false, false);
@@ -1466,7 +1381,7 @@ export class SessionWorkspace {
   }
 
   takeOverTerminal(): void {
-    if (!this.canControlTerminal()) return;
+    if (this.terminalTextMode || !this.canControlTerminal()) return;
     this.terminalControlRequested = true;
     this.terminalControlState = 'starting';
     this.sendTerminalSubscribe(false, true);
@@ -1478,15 +1393,42 @@ export class SessionWorkspace {
     const nextRows = Math.max(TERMINAL_ROWS_MIN, Math.min(TERMINAL_ROWS_MAX, Math.floor(rows)));
     if (nextCols === this.terminalCols && nextRows === this.terminalRows) return;
     this.terminalCols = nextCols; this.terminalRows = nextRows;
-    if (this.terminalControlRequested && ['active', 'starting'].includes(this.terminalControlState)) {
+    if (!this.terminalTextMode && this.terminalControlRequested && ['active', 'starting'].includes(this.terminalControlState)) {
       const control = Wire.payload(['cols', 'rows'], [nextCols, nextRows]);
       const body = Wire.payload(['type', 'machine_id', 'session_id', 'control'], ['terminal_input', this.machineId, this.sessionId, control]);
       this.sendSocket(body);
     }
   }
 
+  async submitTerminalInput(text: string): Promise<boolean> {
+    if (!text || !this.terminalControlRequested || this.terminalControlState !== 'active' || !this.canControlTerminal()) return false;
+    if (this.terminalTextMode) return this.sendTextModeKeys(['enter'], text);
+    this.sendTerminalText(text);
+    this.sendTerminalKey('enter');
+    return true;
+  }
+
+  private async sendTextModeKeys(keys: string[], text: string): Promise<boolean> {
+    const revision = this.revision, lease = this.textControlLease;
+    // Check outstanding writes before the repository journals this request as pending.
+    if (!this.terminalTextMode || this.textKeyBusy || !this.terminalControlRequested || !this.canControlTerminal()) return false;
+    const admitted = (): boolean => this.revision === revision && this.textControlLease === lease && this.terminalTextMode &&
+      this.terminalControlRequested && this.canReadTerminal() && this.machineTrustedOnline() && this.sessionWritable();
+    this.textKeyBusy = true;
+    try {
+      await this.request(this.screenKeysPath(), 'POST', Wire.payload(['keys', 'text'], [keys as Object, text]), admitted);
+      return true;
+    } catch (error) {
+      if (revision === this.revision && this.current()) {
+        this.terminalError = this.message(error as Error);
+        if (this.hasPending(this.screenKeysPath())) this.setTerminalControl(false);
+      }
+      return false;
+    } finally { if (revision === this.revision) this.textKeyBusy = false; }
+  }
+
   sendTerminalText(text: string): void {
-    if (this.terminalControlState !== 'active' || !this.terminalControlRequested || !text ||
+    if (this.terminalTextMode || this.terminalControlState !== 'active' || !this.terminalControlRequested || !text ||
       !this.current() || !this.visible || this.tab !== 2 || !this.model?.connected || !this.connectionReady) return;
     let terminalBytes = text;
     if (/\n/.test(text)) terminalBytes = '\u001b[200~' + text.replace(/\r\n/g, '\n').replace(/\n/g, '\r') + '\u001b[201~';
@@ -1494,13 +1436,19 @@ export class SessionWorkspace {
   }
 
   private sendTerminalBytes(text: string): void {
-    if (this.terminalControlState !== 'active' || !this.terminalControlRequested || !text ||
+    if (this.terminalTextMode || this.terminalControlState !== 'active' || !this.terminalControlRequested || !text ||
       !this.current() || !this.visible || this.tab !== 2 || !this.model?.connected || !this.connectionReady) return;
     const body = Wire.payload(['type', 'machine_id', 'session_id', 'text'], ['terminal_input', this.machineId, this.sessionId, text]);
     this.sendSocket(body);
   }
 
   sendTerminalKey(key: string): void {
+    if (this.terminalTextMode) {
+      const snapshotKey = key === 'escape' ? 'esc' : key.replace('ctrl_', 'ctrl+');
+      if (['enter', 'tab', 'esc', 'backspace', 'up', 'down', 'left', 'right', 'ctrl+c', 'ctrl+d'].includes(snapshotKey))
+        this.sendTextModeKeys([snapshotKey], '');
+      return;
+    }
     let text: string = '';
     switch (key) {
       case 'enter': text = '\r'; break;
@@ -1548,27 +1496,41 @@ export class SessionWorkspace {
       const body = Wire.payload(['type', 'machine_id', 'session_id'], ['terminal_unsubscribe', this.machineId, this.sessionId]);
       this.sendSocket(body);
     }
+    this.terminalTextMode = false;
+    this.textPollBusy = false;
+    this.textKeyBusy = false;
     this.terminalSubscribed = false;
     this.terminalControlRequested = false;
     this.terminalControlState = 'off';
   }
 
   private beginTerminalPoll(): void {
-    this.terminalControlState = 'unsupported';
+    if (this.terminalTextMode) return;
+    this.terminalTextMode = true;
+    this.terminalControlRequested = false;
+    this.terminalControlState = 'off';
+    this.terminalEpoch = '';
+    this.terminalSeq = 0;
     this.pollTerminal();
   }
 
-  private pollTerminal(): void {
-    if (!this.visible || this.tab !== 2 || !this.current()) return;
-    const revision = this.revision;
-    this.request('/api/v1/sessions/' + segment(this.machineId) + '/' + segment(this.sessionId) + '/screen?lines=60&source=visible')
-      .then((result: Record<string, Object>) => {
-        if (revision !== this.revision || !this.visible || this.tab !== 2 || !this.current()) return;
-        this.terminalText = Wire.text(result, 'text'); this.terminalError = '';
-      }).catch((error: Error) => { if (revision === this.revision) this.terminalError = this.message(error); })
-      .finally(() => {
-        if (revision === this.revision && this.visible && this.tab === 2) this.terminalPollTimer = setTimeout(() => this.pollTerminal(), 1000);
-      });
+  private async pollTerminal(): Promise<void> {
+    if (!this.terminalTextMode || this.textPollBusy || !this.visible || this.tab !== 2 || !this.current() || !this.connectionReady) return;
+    const revision = this.revision, target = this.ownerTarget;
+    const current = (): boolean => this.terminalTextMode && this.activeRevision(revision, target, 2);
+    if (!this.canReadTerminal()) { this.terminalError = 'session_tools_terminal_unavailable'; return; }
+    this.textPollBusy = true;
+    try {
+      const result = await this.request('/api/v1/sessions/' + segment(this.machineId) + '/' + segment(this.sessionId) + '/screen?lines=60&source=visible');
+      if (current()) { this.terminalText = Wire.text(result, 'text'); this.terminalError = ''; }
+    } catch (error) {
+      if (current()) this.terminalError = this.message(error as Error);
+    } finally {
+      if (current()) {
+        this.textPollBusy = false;
+        this.terminalPollTimer = setTimeout(() => this.pollTerminal(), 1000);
+      }
+    }
   }
 
   private receiveTerminal(event: Record<string, Object>): void {
@@ -1633,8 +1595,13 @@ export class SessionWorkspace {
       return;
     }
     if (this.terminalEscape === 2) {
-      this.terminalCsi += char;
-      if (code >= 0x40 && code <= 0x7e) { this.applyCsi(this.terminalCsi); this.terminalCsi = ''; this.terminalEscape = 0; }
+      if (code >= 0x40 && code <= 0x7e) {
+        this.applyCsi(this.terminalCsi, char);
+        this.terminalCsi = '';
+        this.terminalEscape = 0;
+      } else {
+        this.terminalCsi += char;
+      }
       return;
     }
     if (code === 0x1b) { this.terminalEscape = 1; return; }
@@ -1650,12 +1617,12 @@ export class SessionWorkspace {
     this.terminalCursorColumn = Math.min(this.terminalGridCols, this.terminalCursorColumn + 1);
   }
 
-  private applyCsi(value: string): void {
-    const final = value.charAt(value.length - 1);
-    const nums = value.replace(/^[?=>!]+/, '').replace(/[ -/]+/g, '').split(';');
-    const first = nums[0] ? Number(nums[0]) : (final === 'J' || final === 'K' ? 0 : 1);
-    const second = Number(nums[1] || '1');
+  private applyCsi(parameters: string, final: string): void {
     if (final === 'm' || final === 'h' || final === 'l' || final === 'n' || final === 'c') return;
+    if (!/^[0-9;]*$/.test(parameters)) return;
+    const nums = parameters.split(';');
+    const first = Number(nums[0]) || (final === 'J' || final === 'K' ? 0 : 1);
+    const second = Number(nums[1]) || 1;
     if (final === 'J') {
       if (first === 2 || first === 3) this.terminalGrid = blankGrid(this.terminalGridCols, this.terminalGridRows);
       else if (first === 0) for (let row = this.terminalCursorRow; row < this.terminalGridRows; row++) {
@@ -1714,6 +1681,5 @@ export class SessionWorkspace {
     this.gitStatusEpoch++; this.gitHistoryEpoch++; this.gitHistoryBusy=false; this.closeGitShow(); this.closeGitDiff();
     this.fileBusy = false; this.fileReadBusy = false; this.fileWriteBusy = false;
     this.gitBusy = false; this.gitDiffBusy = false; this.gitWriteBusy = false;
-    this.screenBusy = false; this.screenKeyBusy = false;
   }
 }

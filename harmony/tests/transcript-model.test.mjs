@@ -462,3 +462,16 @@ test('the activity reader loads history without publishing seen, replacing a cha
   assert.deepEqual(sent,[]);
   assert.deepEqual(writes,[]);
 });
+
+
+test('directory events can coalesce with an opening or fresh history but explicit latest still reads',async()=>{
+ let reads=0,release;const gate=new Promise(r=>{release=r;});
+ const {model}=historyFixture(async()=>{reads++;return historyPage('h',[1]);});
+ model.local.get=()=>gate;
+ const open=model.open();assert.equal(model.canDeferDirectoryRead(),true);
+ release('');await open;
+ assert.equal(reads,1);assert.equal(model.canDeferDirectoryRead(),true);
+ await model.latest();assert.equal(reads,2);
+ model.lastVerifiedHistory=Date.now()-20000;
+ assert.equal(model.canDeferDirectoryRead(),false);
+});

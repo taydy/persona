@@ -1,3 +1,4 @@
+import { registerSnapshotTaskpool } from './support/session-snapshot-taskpool.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
@@ -180,6 +181,7 @@ registerHooks({
   }
 });
 
+registerSnapshotTaskpool();
 const { NativeLiveView } = await import('../entry/src/main/ets/platform/NativeLiveView.ets');
 const {
   decodeInteractionDecision,

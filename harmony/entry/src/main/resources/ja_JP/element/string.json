@@ -2921,16 +2921,8 @@
       "value": "このターミナルを操作しますか？"
     },
     {
-      "name": "session_tools_terminal_screen",
-      "value": "コンピューター画面"
-    },
-    {
       "name": "session_tools_terminal_screen_control_confirm",
-      "value": "コンピューター画面での入力を許可しますか？"
-    },
-    {
-      "name": "session_tools_terminal_screen_input",
-      "value": "コンピューターに入力"
+      "value": "セッションのターミナルへの入力を許可しますか？"
     },
     {
       "name": "session_tools_trash_title",
@@ -6071,14 +6063,6 @@
     {
       "name": "session_tools_rename",
       "value": "名前を変更"
-    },
-    {
-      "name": "session_tools_terminal_screen_control_active",
-      "value": "ターミナルの操作が有効です"
-    },
-    {
-      "name": "session_tools_terminal_screen_view_only",
-      "value": "表示のみ"
     },
     {
       "name": "upstream_error",
@@ -11607,6 +11591,18 @@
     {
       "name": "minimal",
       "value": "最小"
+    },
+    {
+      "name": "session_computer_screen",
+      "value": "コンピューター画面"
+    },
+    {
+      "name": "session_tools_terminal_text_mode",
+      "value": "テキストモード"
+    },
+    {
+      "name": "session_tools_terminal_unavailable",
+      "value": "ターミナルを利用できません"
     }
   ]
 }

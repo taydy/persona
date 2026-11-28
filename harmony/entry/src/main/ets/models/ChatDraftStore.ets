@@ -1,6 +1,7 @@
 import type { LocalStore } from '../platform/LocalStore';
 import { ResourceRow, Wire } from './Wire';
-import { decodeSessionSnapshot, encodeSessionSnapshot } from '../core/SessionSnapshot';
+import { decodeSessionSnapshot } from '../core/SessionSnapshot';
+import { packSessionSnapshot } from '../platform/SessionSnapshotWorker';
 
 function plainRow(row: ResourceRow): Record<string, Object> {
   return Wire.payload(['id', 'title', 'detail', 'kind', 'state', 'manager', 'group', 'machine', 'session', 'path', 'raw'],
@@ -87,9 +88,10 @@ export class ChatDraftStore {
     const key = 'snapshot:' + scope; return this.transaction(key, (): Promise<string> => this.local.get(key));
   }
   async saveSessionSnapshot(scope: string, sessions: ResourceRow[], conversations: ResourceRow[], heldActions: Record<string, Object>[], current: () => boolean, sidebarConfig?: string): Promise<void> {
-    // Bounded: the store writes a value it cannot read back past about 2 MB (core/SessionSnapshot.ts).
-    const key = 'snapshot:' + scope, value = encodeSessionSnapshot(sessions.map(plainRow), conversations.map(plainRow), heldActions, undefined, sidebarConfig);
+    const key = 'snapshot:' + scope, rows = sessions.map(plainRow), chats = conversations.map(plainRow);
     await this.transaction(key, async (epoch: number): Promise<void> => {
+      if (!current()) return;
+      const value = await packSessionSnapshot(rows, chats, heldActions, sidebarConfig);
       if (!current()) return;
       if (value) await this.local.put(key, value, epoch); else await this.local.remove(key, epoch);
     });

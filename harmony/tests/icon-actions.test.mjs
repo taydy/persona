@@ -47,16 +47,15 @@ test('every quick filter keeps its complete localized accessible label and appli
  const labels=vm.runInNewContext('('+labelSource+')');
  assert.deepEqual(Array.from(vm.runInNewContext(keys)),['all','needsYou','unread','working','backgroundWaiting','feishu','terminal']);
  assert.deepEqual({...labels},{all:'all',needsYou:'needs_you',unread:'agent_group_unread',working:'working',backgroundWaiting:'agent_group_background',feishu:'agent_source_lark_group',terminal:'terminal'});
- assert.match(source,/!known \|\| key === 'all' \|\| key === this\.workspace\.quickFilter \|\| Wire.number\(counts,key\)>0/);
- assert.match(filters,/ForEach\(this.shownQuickFilters,[\s\S]*Button\(\{ type: ButtonType.Capsule \}\)[\s\S]*Text\(tr\(QUICK_LABELS\[key\]\)/);
+ assert.match(filters,/ForEach\(this.shownQuickFilters,[\s\S]*Button\(\{ type: ButtonType.Capsule, stateEffect: false \}\)[\s\S]*Text\(tr\(QUICK_LABELS\[key\]\)/);
  assert.match(filters,/accessibilityText\(tr\(QUICK_LABELS\[key\]\)\)/);
- assert.match(filters,/accessibilityDescription\(key !== 'all' && this.workspace.filterCounts\[key\] !== undefined/);
+ assert.match(filters,/accessibilityDescription\(key !== 'all' && typeof this\.workspace\.filterCounts\[key\] === 'number' \? String\(Wire\.number\(this\.workspace\.filterCounts,key\)\) : ''\)/);
  assert.match(filters,/accessibilitySelected\(this\.workspace\.quickFilter === key\)/);
  assert.match(source,/private quickHeight\(\): number \{ return PhoneStyle.formSize\(44,57.7,this.environment.fontScale\)/);
  assert.match(filters,/responseRegion\(\{x:0,y:0,width:'100%',height:this.quickHeight\(\)\}\)/);
  assert.match(filters,/onClick\([\s\S]*this\.workspace\.setQuickFilter\(key\)[\s\S]*\.id\('agents\.quick\.' \+ key\)/);
- assert.match(filters,/\.scrollable\(ScrollDirection\.Horizontal\)/);
- assert.ok(filters.indexOf('this.filterControl()')>filters.indexOf('.scrollable(ScrollDirection.Horizontal)'));
+ assert.match(filters,/\.listDirection\(Axis\.Horizontal\)/);
+ assert.ok(filters.indexOf('this.filterControl()')>filters.indexOf('.listDirection(Axis.Horizontal)'));
 });
 
 test('magnified project and Agent views keep symbols inside their slots and give titles and fields room to grow', () => {

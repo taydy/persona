@@ -74,14 +74,20 @@ export function coreAgentSortInput(input: AgentListInput): CoreSortInput {
   const mutesSpaces: string[] = [], mutesSessions: string[] = [], mutesAllowed: string[] = [];
   const hubPreferences: Record<string, Object> = {};
   const managerPreferences: Record<string, Object> = {};
-  input.rows.forEach((row) => {
-    const current = input.preferencesFor(row), group = rowText(row.raw, 'app_hub_group');
+  // The wire maps are per owner. Read the last row for each owner, as repeated assignments did.
+  const owners = new Set<string>();
+  for (let i = input.rows.length - 1; i >= 0; i--) {
+    const row = input.rows[i], group = rowText(row.raw, 'app_hub_group'), manager = rowText(row.raw, 'manager');
+    const key = manager ? 'manager/' + group + '|' + manager : 'hub/' + group;
+    if (owners.has(key)) continue;
+    owners.add(key);
+    const current = input.preferencesFor(row);
     const preferences: Record<string, Object> = {
       pins: {spaces: current.pinsSpaces.slice(), sessions: current.pinsSessions.slice()},
       mutes: {spaces: current.mutesSpaces.slice(), sessions: current.mutesSessions.slice(), allowed: current.mutesAllowed.slice()}
     };
-    if (rowText(row.raw, 'manager')) {
-      managerPreferences[group + '|' + rowText(row.raw, 'manager')] = preferences;
+    if (manager) {
+      managerPreferences[group + '|' + manager] = preferences;
     } else if (group) hubPreferences[group] = preferences;
     else {
       // The legacy maps belong to the default Hub only; never concatenate owners.
@@ -91,7 +97,7 @@ export function coreAgentSortInput(input: AgentListInput): CoreSortInput {
       mutesSessions.splice(0, mutesSessions.length, ...current.mutesSessions);
       mutesAllowed.splice(0, mutesAllowed.length, ...current.mutesAllowed);
     }
-  });
+  }
   return {sessions: input.rows.map((row) => row.raw), machines: input.machines,
     pins: {spaces: pinsSpaces, sessions: pinsSessions}, mutes: {spaces: mutesSpaces, sessions: mutesSessions, allowed: mutesAllowed},
     hub_preferences: hubPreferences,

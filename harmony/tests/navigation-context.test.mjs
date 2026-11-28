@@ -194,6 +194,48 @@ test('callbacks from a hidden workspace cannot open a destination in the new rou
  shell.activeChild='another-tab';shell.openFrom('resources',param,target);
  await new Promise(resolve=>setImmediate(resolve));assert.equal(pushed.length,1);
 });
+test('the session and tools menus each expose one terminal and one desktop entry', () => {
+  const clientSource = readFileSync(new URL('../entry/src/main/ets/models/ClientModel.ets', import.meta.url), 'utf8');
+  const resolver = clientSource.match(/^  selectedScreenMachine\([\s\S]*?^  \}/m)[0];
+  const Client = new Function('ResourceRow', 'return ' + stripTypeScriptTypes('class Client {' + resolver + '}'))(ResourceRow);
+  const Menu = new Function('tr', 'Wire', 'sessionModeAvailable', 'return ' + stripTypeScriptTypes('class Menu {' +
+    ['selectedComputer', 'showChatActions', 'childKey'].map(method).join('\n') + '}'))(key => key, Wire, () => false);
+  const owner = new Client(), menu = new Menu(), desktops = [], tabs = [];
+  const local = ResourceRow.from({ id: 'machine', os: 'mac', online: true }, 'machine');
+  const foreign = local.copy('other-hub');
+  Object.assign(owner, { connected: true, demo: false, profile: { id: 'chosen-hub', manager: 'chosen-manager' },
+    machines: [foreign, local], selected: row('session', 'chosen-manager', 'session'), mainId: '', messages: [],
+    isChat: () => true, canStop: () => false, canAutoRenameAgent: () => false, scope: () => 'chosen', connectionGeneration: () => 3,
+    owns: () => true, target: () => 'sample-chat', selectWorkspaceTab: index => tabs.push(index) });
+  Object.assign(menu, { detailModel: owner, model: { mainActivityRow: () => undefined }, targetReady: () => true,
+    wide: () => false, mainDestination: () => false, hideChatTitle: () => false, chatMenuRevision: 0,
+    openComputer: target => desktops.push(target), openTools: (_path, tab) => tabs.push(tab) });
+  const entry = id => menu.chatMenuActions.find(item => item.identity === 'session.mode.' + id);
+  for (const source of ['session', 'tools']) {
+    menu.activeChild = menu.childKey(source, 'sample');
+    menu.showChatActions(source, 'sample');
+    assert.equal(entry('computer_screen').title, 'session_computer_screen');
+    assert.equal(entry('terminal_screen'), undefined);
+    assert.equal(entry('terminal').title, 'terminal');
+    entry('computer_screen').action();
+    entry('terminal').action();
+  }
+  assert.deepEqual(desktops.map(r => [r.group, r.manager, r.id]), Array(2).fill(['chosen-hub', 'chosen-manager', 'machine']));
+  assert.deepEqual(tabs, [2, 2]);
+  assert.equal(local.group, '');
+  assert.equal(local.manager, '');
+  const staleAction = entry('computer_screen').action;
+  owner.machines = [foreign];
+  staleAction();
+  assert.equal(desktops.length, 2);
+  menu.showChatActions('tools', 'sample');
+  assert.equal(entry('computer_screen'), undefined);
+  assert.ok(entry('terminal'));
+  owner.machines = [local];
+  owner.connected = false;
+  assert.equal(owner.selectedScreenMachine(), undefined);
+});
+
 test('computer routes capture the machine owner and restore independently of chat selection',async()=>{
  const {shell,detail,pushed}=fixture(),machine=row('mac','owner-b','machine');
  shell.openComputer(machine);shell.openComputer(machine);assert.equal(pushed.length,1);assert.equal(pushed[0].name,'computer');
@@ -522,4 +564,21 @@ test('the compact system-area backgrounds follow the visible page and drawer', (
   assert.match(source,/padding\(\{top:this\.compactNavigationInset\(\)\}\)\.clip\(true\)\s*\.backgroundColor\(this\.compactInsetSurface\(\)\)/);
   assert.match(source,/\.background\(this\.compactInsetSurface\(\),\s*\{ ignoresLayoutSafeAreaEdges: this\.compactInsetEdges\(\) \}\)/);
   assert.doesNotMatch(source,/\.overlay\(this\.knowledge|@Builder knowledgeNavigationInset/);
+});
+
+
+test('a selected Agent session can present its history before remote sync settles, and a stale route cannot present',async()=>{
+ for (const leave of [false,true]) {
+  const {shell,detail}=fixture(), target=row('child','owner-b','session'), param=JSON.stringify(target), started=deferred(), network=deferred();
+  const key=shell.childKey('session',param);shell.activeChild=key;
+  let show,admit;
+  detail.select=async(r,_open,owns,present)=>{detail.selected=r;admit=owns;show=present;started.resolve();await network.promise;};
+  const opening=shell.restoreTarget('session',param);await started.promise;
+  if(leave)shell.activeChild='other';
+  assert.equal(admit(),!leave);
+  show();
+  assert.equal(shell.targetReady('session',param),!leave);
+  network.resolve();await opening;
+  assert.equal(shell.targetReady('session',param),!leave);
+ }
 });

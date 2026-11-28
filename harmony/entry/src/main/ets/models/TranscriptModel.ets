@@ -61,6 +61,12 @@ export class TranscriptModel {
   private mergingOlder?: Promise<void>;
   private mergingOwner?: TranscriptSync;
   private refreshing: boolean = false;
+  private opening: boolean = false;
+  private lastVerifiedHistory: number = 0;
+  // A directory notification is a fallback for quiet/legacy sessions. Live batches and explicit reads remain immediate.
+  canDeferDirectoryRead(): boolean {
+    return this.opening || this.refreshing || this.lastVerifiedHistory > 0 && Date.now() - this.lastVerifiedHistory < 15000;
+  }
   private refreshAgain: boolean = false;
   private fillRequested: boolean = false;
   private pendingFetches: Promise<void> = Promise.resolve();
@@ -211,19 +217,22 @@ export class TranscriptModel {
     return JSON.parse(JSON.stringify(canonical)) as TranscriptBatch;
   }
   async open(): Promise<void> {
-    const owner = this.sync;
-    const cached = await this.local.get('transcript:' + this.key);
-    if (!this.active) return;
-    if (cached && this.currentRead(owner)) {
-      try {
-        const snapshot = JSON.parse(cached) as TranscriptSnapshot;
-        this.observeHistory(snapshot.history);
-        this.reducer.restore(snapshot);
-        this.emit();
-      } catch (_) {}
-    }
-    if (this.liveSubscription) await this.drive(this.sync.reconnect());
-    await this.latest();
+    this.opening = true;
+    try {
+      const owner = this.sync;
+      const cached = await this.local.get('transcript:' + this.key);
+      if (!this.active) return;
+      if (cached && this.currentRead(owner)) {
+        try {
+          const snapshot = JSON.parse(cached) as TranscriptSnapshot;
+          this.observeHistory(snapshot.history);
+          this.reducer.restore(snapshot);
+          this.emit();
+        } catch (_) {}
+      }
+      if (this.liveSubscription) await this.drive(this.sync.reconnect());
+      await this.latest();
+    } finally { this.opening = false; }
   }
   async latest(): Promise<void> {
     if (!this.active) return;
@@ -242,7 +251,7 @@ export class TranscriptModel {
       this.observeHistory(batch.history);
       owner = this.sync;
       await this.drive(owner.settle(this.reducer.latest(batch)));
-      if (this.currentRead(owner)) { this.historyReady = Wire.has(data, 'has_more'); this.emit(); }
+      if (this.currentRead(owner)) { this.lastVerifiedHistory = Date.now(); this.historyReady = Wire.has(data, 'has_more'); this.emit(); }
     } catch (error) {
       if (this.currentRead(owner)) this.failure(error as Error);
       else this.refreshAgain = this.active;
