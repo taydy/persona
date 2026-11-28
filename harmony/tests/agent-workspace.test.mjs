@@ -1245,6 +1245,21 @@ test('a large confirmed unread batch bounds concurrent requests and counts every
   assert.equal(workspace.unreadToMark().length, 0);
 });
 
+test('Mark all as read resolves the unread members of a collapsed family', async () => {
+  const parent = agent('parent', { state:'idle', status:'done' });
+  const child = id => agent(id, { parent_session_id:parent.id, state:'unread', status:'done' });
+  const { workspace, state } = await opened({ sessions:[parent, child('first'), child('second')] });
+  workspace.setQuickFilter('unread');
+  assert.deepEqual(workspace.visibleRows().map(row => row.id), ['parent']);
+  assert.equal(workspace.filterCounts.unread, 1);
+  const targets = workspace.unreadToMark();
+  assert.deepEqual(targets.map(row => row.id).sort(), ['first', 'second']);
+  state.calls.length = 0;
+  assert.equal(await workspace.markAllSeen(targets), 2);
+  assert.deepEqual(state.calls.filter(call => call.method === 'POST').map(call => call.path).sort(),
+    ['/api/v1/sessions/m1/first/seen', '/api/v1/sessions/m1/second/seen']);
+});
+
 test('Mark all as read under Unread marks every listed row at once and puts back a row the hub refuses', async () => {
   const first = agent('first', { state: 'unread', status: 'done' });
   const second = agent('second', { state: 'unread', status: 'done', machine_id: 'm2' });
