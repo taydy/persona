@@ -674,6 +674,8 @@ export interface ToolTurnProjection {
   readonly workKey: string;
   readonly running: boolean;
   readonly latestExchange?: boolean;
+  /** Set only on the current Claude command. Zero means its turn opening is unavailable. */
+  readonly liveTurnStartedAt?: number;
   readonly agent?: string;
   readonly phaseTitle?: string;
   readonly sectionTitle?: string;
@@ -863,6 +865,21 @@ export function transcriptExchanges(items: readonly TranscriptItem[]): Transcrip
     ended = item.kind === 'recap' || item.kind === 'turn_duration';
   }
   return groups;
+}
+
+export function currentTurnStartedAt(groups: readonly TranscriptItem[][], beforePage?: () => number): number {
+  const last = groups[groups.length - 1];
+  if (!last || last.some(item => item.kind === 'turn_duration' || item.kind === 'recap')) return 0;
+  for (let index = groups.length - 1; index >= 0; index--) {
+    const first = groups[index][0];
+    if (!first.wake && !inputBlock(first)) return index === 0 ? beforePage?.() ?? 0 : 0;
+    // A queued addition has its own display segment but shares the clock of the open turn.
+    if (first.queued === true && !first.wake && !first.supervision_user &&
+      !groups[index - 1]?.some(item => item.kind === 'turn_duration' || item.kind === 'recap')) continue;
+    const start = typeof first.ts === 'string' ? Date.parse(first.ts) : 0;
+    return start > 0 ? start : 0;
+  }
+  return beforePage?.() ?? 0;
 }
 
 /** Only recorded questions become quotes. Old nodes may have retained just the user's answer. */
@@ -1195,7 +1212,7 @@ function completedWorkSections(steps: WorkInspectionStep[], claude: boolean): Wo
 }
 
 /** Put each public update at its original position and keep receipts, images and reports attached to their call. */
-export function projectTranscriptRows(input: readonly TranscriptItem[], live: boolean, liveTools: readonly LiveToolCall[] = [], agent: string = '', actionLabel?: (action: string) => string): TranscriptDisplayRow[] {
+export function projectTranscriptRows(input: readonly TranscriptItem[], live: boolean, liveTools: readonly LiveToolCall[] = [], agent: string = '', actionLabel?: (action: string) => string, turnBeforePage?: () => number): TranscriptDisplayRow[] {
   const rows: TranscriptDisplayRow[] = [];
   const groups = transcriptExchanges(displayTranscriptItems(withLiveTools(input, liveTools)));
   groups.forEach((items, index) => {
@@ -1203,9 +1220,14 @@ export function projectTranscriptRows(input: readonly TranscriptItem[], live: bo
     const first = items[0], latestExchange = index === groups.length - 1;
     const running = live && latestExchange && first.kind !== 'recap' && !items.some(item => item.kind === 'turn_duration');
     const work = projectToolTurn(first.id, items, running);
-    const steps = new Map(work.inspectionSteps.map(step => [step.id, step]));
-    const events = new Set(work.events.map(item => item.id));
     const claude = agent === 'claude' || (!agent && items.some(item => typeof item.model === 'string' && item.model.startsWith('claude-')));
+    const steps = new Map<string, WorkInspectionStep>();
+    let currentCommand: ToolInspectionStep | undefined;
+    for (const step of work.inspectionSteps) {
+      steps.set(step.id, step);
+      if (running && claude && step.kind === 'tool' && !step.result) currentCommand = step;
+    }
+    const events = new Set(work.events.map(item => item.id));
     const final = (running && claude) || work.visibleAssistantText?.narration === true ? undefined : work.visibleAssistantText?.id;
     let reply: Extract<TranscriptDisplayRow, { item: TranscriptItem }> | undefined;
     let wrap: ToolInspectionStep | undefined;
@@ -1263,6 +1285,7 @@ export function projectTranscriptRows(input: readonly TranscriptItem[], live: bo
         }
       }
       rows.push({ kind: 'work', id: workKey, work: { ...work, workKey, latestExchange, agent: claude ? 'claude' : agent, phaseTitle, sectionTitle,
+        liveTurnStartedAt: currentCommand && lastPending === currentCommand ? currentTurnStartedAt(groups, turnBeforePage) : undefined,
         inspectionSteps: batch, toolCount, thoughtCount, unresolvedToolCount: unresolved } });
     };
     const flush = (): void => {

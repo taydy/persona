@@ -8,7 +8,7 @@ const source = readFileSync(new URL('../entry/src/main/ets/components/AgentListP
 const rowBindingSource = readFileSync(new URL('../entry/src/main/ets/models/RowBinding.ets', import.meta.url), 'utf8');
 const rowBindingCode = stripTypeScriptTypes(rowBindingSource.replace(/@ObservedV2\s*/g, '').replace(/@Trace\s*/g, '').replace(/\bexport\s+/g, ''));
 const { reconcileBoundRows } = new Function(rowBindingCode + '\nreturn { reconcileBoundRows };')();
-const { agentRowPreview, agentRowTone, runningSubagents } = await import('../entry/src/main/ets/core/AgentRowPreview.ts');
+const { agentFamilySummary, agentRowPreview, agentRowTone, runningSubagents } = await import('../entry/src/main/ets/core/AgentRowPreview.ts');
 
 function block(start, name) {
   const body = source.indexOf('{', start);
@@ -45,13 +45,15 @@ const BoundAgentRow = new Function('AgentRowPresentation', 'return ' + stripType
 const BoundAgentGroup = new Function('return ' + stripTypeScriptTypes(classCode('BoundAgentGroup')) + ';')();
 
 function pageClass(wire, translate) {
-  return new Function('BoundAgentRow', 'AgentRowPresentation', 'BoundAgentGroup', 'Wire', 'tr', 'Colors', 'reconcileBoundRows',
-    'agentRowPreview', 'agentRowTone', 'runningSubagents', 'herdrTabName',
-    stripTypeScriptTypes('class Page {\n' + ['isRowSelected','syncRowBindings', 'bindAgentRows', 'updateAgentRowPresentation', 'rowTime', 'rowStatus', 'rowStatusColor', 'needsStatusLabel', 'rowPlace','rowSpoken','subagentLine','rowTitle']
+  const familyClass = stripTypeScriptTypes(block(source.indexOf('class BoundAgentFamily {'), 'BoundAgentFamily'));
+  const BoundAgentFamily = new Function('return ' + familyClass)();
+  return new Function('BoundAgentRow', 'AgentRowPresentation', 'BoundAgentGroup', 'BoundAgentFamily', 'Wire', 'tr', 'Colors', 'reconcileBoundRows',
+    'agentRowPreview', 'agentRowTone', 'runningSubagents', 'herdrTabName', 'agentFamilySummary',
+    stripTypeScriptTypes('class Page {\n' + ['isRowSelected','syncRowBindings','syncFamilyBindings', 'bindAgentRows', 'updateAgentRowPresentation', 'rowTime', 'rowStatus', 'rowStatusColor', 'needsStatusLabel', 'rowPlace','rowSpoken','subagentLine','rowTitle']
       .map(methodCode).join('\n') + '\n}\n') + '\nreturn Page;')(
-        BoundAgentRow, AgentRowPresentation, BoundAgentGroup, wire, translate,
+        BoundAgentRow, AgentRowPresentation, BoundAgentGroup, BoundAgentFamily, wire, translate,
         { needs: 'needs', working: 'working', unread: 'unread', secondary: 'secondary' }, reconcileBoundRows,
-        agentRowPreview, agentRowTone, runningSubagents, herdrTabName);
+        agentRowPreview, agentRowTone, runningSubagents, herdrTabName, agentFamilySummary);
 }
 
 function methodsClass(names, globals) {
@@ -405,10 +407,17 @@ test('the horizontal filter retains the selection as live counts disappear and r
   page.workspace = {quickFilter:'working', quickCountsKnown:()=>false, filterCounts:{}};
   assert.deepEqual(page.shownQuickFilters,keys);
   page.workspace.quickCountsKnown=()=>true;
-  page.workspace.filterCounts={working:2, unread:1};
+  const zero = {needsYou:0, unread:0, working:0, backgroundWaiting:0, feishu:0, terminal:0};
+  page.workspace.filterCounts={...zero, working:2, unread:1};
   assert.deepEqual(page.shownQuickFilters,['all','unread','working']);
-  page.workspace.filterCounts={terminal:1};
+  page.workspace.filterCounts={...zero, terminal:1};
   assert.deepEqual(page.shownQuickFilters,['all','working','terminal']);
+  page.workspace.quickFilter='all';
+  page.workspace.filterCounts={feishu:0, terminal:0};
+  assert.deepEqual(page.shownQuickFilters,['all','needsYou','unread','working','backgroundWaiting'],
+    'a legacy core omits status totals even when working sessions are present');
+  page.workspace.filterCounts=zero;
+  assert.deepEqual(page.shownQuickFilters,['all'], 'every status and source is known to be empty');
 });
 
 
@@ -518,16 +527,44 @@ test('Agents keeps its horizontal filter buttons keyed by status during a cold s
   const render = block(source.indexOf('  @Builder filters('), 'filters');
   assert.match(render, /ForEach\(this.shownQuickFilters/);
   assert.match(render, /\(key: string\) => key/);
-  assert.match(render, /scrollable\(ScrollDirection.Horizontal\)/);
+  assert.match(render, /listDirection\(Axis.Horizontal\)/);
   assert.doesNotMatch(render, /CapsuleSegmentButtonV2|\bSelect\(/);
+});
+
+test('choosing an Agents filter fades its fill and reveals the actual chip by the shortest distance', () => {
+  const View = methodsClass(['revealQuickFilter'], { ScrollAlign: { AUTO: 'nearest' } });
+  const page = new View(), calls = [];
+  page.environment = { reduceMotion: false };
+  let rect = { x: 90, width: 84 };
+  page.quickViewportWidth = 240;
+  page.quickScroller = { getItemRect() { return rect; }, scrollToIndex(...args) { calls.push(args); } };
+  page.shownQuickFilters = ['all','unread','working'];
+  page.revealQuickFilter('unread');
+  assert.deepEqual(calls, [], 'a fully visible tap never starts a native scroll transaction');
+  rect = { x: 202, width: 64 };
+  page.revealQuickFilter('working');
+  page.environment.reduceMotion = true;
+  page.shownQuickFilters = ['all','working'];
+  rect = { x: -12, width: 64 };
+  page.revealQuickFilter('working');
+  page.revealQuickFilter('unread');
+  assert.deepEqual(calls, [[2,true,'nearest'],[1,false,'nearest']]);
+
+  const render = block(source.indexOf('  @Builder filters('), 'filters');
+  const chips = render.slice(render.indexOf('ForEach(this.shownQuickFilters'), render.indexOf(".id('agents.quick')"));
+  assert.doesNotMatch(chips, /Motion\.run|animateTo|\.scale\(|FontWeight\.Bold/);
+  assert.equal((chips.match(/\.animation\(/g) || []).length, 1, 'only the selection fill animates');
+  assert.match(chips, /\.backgroundColor\(this\.workspace\.quickFilter === key \? Colors\.selection : this\.compactRoot \? Colors\.surface : Colors\.control\)/);
+  assert.match(chips, /\.animation\(this\.workspace\.quickFilter === key \? Motion\.press\(this\.environment\.reduceMotion\) : undefined\)/);
+  assert.match(chips, /\.fontFeature\('tnum 1'\)/);
 });
 
 
 test('Needs You surfaces follow the visible oldest-first order as the decisions change', () => {
   const getter=block(source.indexOf('  @Computed get orderedNeedsRows'), 'orderedNeedsRows').replace('@Computed ', '');
-  const methods=['displayRows','startsSurface','endsSurface'].map(methodCode).join('\n');
+  const methods=['displayRows','startsSurface','endsSurface','familySortRow'].map(methodCode).join('\n');
   const Page=new Function('return '+stripTypeScriptTypes('class Page {\n'+getter+'\n'+methods+'\n}'))();
-  const page=new Page(), a={first:true,last:false,bound:{value:{waiting:20}}}, b={first:false,last:true,bound:{value:{waiting:10}}};
+  const page=new Page(), a={first:true,last:false,presentation:{indented:false},bound:{value:{waiting:20}}}, b={first:false,last:true,presentation:{indented:false},bound:{value:{waiting:10}}};
   const group={value:{id:'state/needs'},rows:[a,b]};
   page.groupBindings=[group];page.compactRoot=true;page.rail=false;
   page.decisions={waitingSince:(_,row)=>row.waiting};
@@ -599,4 +636,87 @@ test('herdrTabName is projected once per raw update and rowTitle toggles cleanly
   const railBlock = source.slice(source.indexOf('  @Builder railAvatar('), source.indexOf('  @Builder resultList('));
   assert.match(railBlock, /this\.rowTitle\(binding\)/);
   assert.doesNotMatch(railBlock, /binding\.bound\.value\.title/);
+});
+
+
+test('disclosing one family projects only its new children and preserves unrelated group bindings', () => {
+  const { page } = fixture();
+  const sessions = Array.from({length: 1200}, (_, i) => row({title: 'Session ' + i}, {id: String(i)}));
+  const parent = sessions[0], child = row({title: 'Child'}, {id:'child'});
+  const groups = [{id:'space/a', rows:sessions.slice(0,600)}, {id:'space/b', rows:sessions.slice(600)}];
+  const workspace = { ...family, groups, expandedFamilies:new Set(), isMuted:()=>false, visibleRows:()=>sessions,
+    groupingMode:'space', expandedChildren(r) { return this.expandedFamilies.has(r.key()) ? this.foldedChildren(r) : []; },
+    foldedChildren:r=>r===parent ? [child] : [], relations:{root:r=>r===child ? parent : undefined, kind:()=> 'subtask'},
+    displayRows(group) { return group===groups[0] && this.expandedFamilies.has(parent.key())
+      ? [parent,child,...group.rows.slice(1)] : group.rows; } };
+  page.workspace=workspace;
+  Object.assign(page.model,{scope:()=> 'test',profile:{id:'test',manager:'local'}});
+  page.groupBindings=[]; page.groupBindingSequence=0; page.taskRowsByKey=new Map();
+  const projected=[];
+  const project=page.updateAgentRowPresentation.bind(page);
+  page.updateAgentRowPresentation=(view,r)=>{projected.push(r);project(view,r);};
+  page.syncRowBindings();
+  const [affected,unrelated]=page.groupBindings, originalParent=affected.rows[0], stableRows=unrelated.rows;
+  projected.length=0;
+  workspace.expandedFamilies=new Set([parent.key()]);
+  page.syncFamilyBindings();
+  assert.deepEqual(projected,[child]);
+  assert.equal(affected.rows[0],originalParent);
+  assert.equal(affected.rows[1].bound.value,child);
+  projected.length=0;
+  workspace.expandedFamilies=new Set();
+  page.syncFamilyBindings();
+  assert.deepEqual(projected,[]);
+  assert.equal(affected.rows.length,600);
+  assert.equal(unrelated.rows,stableRows);
+});
+
+
+test('the computer filter shows the live or remembered name while its roster loads',()=>{
+  const Page=methodsClass(['machineLabel'],{tr:key=>key});
+  const v=new Page();
+  v.workspace={machineFilter:JSON.stringify(['hub','manager','computer-key']),machineFilterName:''};
+  v.selectedMachineName='';
+  assert.equal(v.machineLabel(),'machine');
+  v.workspace.machineFilterName='Notebook';assert.equal(v.machineLabel(),'Notebook');
+  v.selectedMachineName='New name';assert.equal(v.machineLabel(),'New name');
+  v.workspace.machineFilter='';assert.equal(v.machineLabel(),'agent_filter_all_machines');
+});
+
+test('several directory updates during a drag apply once when scrolling settles',()=>{
+  const start=source.indexOf('  catalogChanged(): void {');
+  const method=block(start,'catalogChanged');
+  const Page=new Function('return '+stripTypeScriptTypes('class Page {'+method+methodCode('finishListScroll')+'}'))();
+  let updates=0,decisions=0,bindings=0;
+  const v=Object.assign(new Page(),{active:true,listMoving:true,workspace:{update(){updates++;},selectExternal(){}},
+    reloadDecisions(){decisions++;},syncRowBindings(){bindings++;}});
+  for(let i=0;i<5;i++)v.catalogChanged();
+  assert.equal(updates,0);
+  v.finishListScroll();v.finishListScroll();
+  assert.deepEqual([updates,decisions,bindings],[1,1,0]);
+});
+
+test('space list keeps one idle heading, scoped row identities and each project disclosure', () => {
+  const Line = new Function('return '+stripTypeScriptTypes(block(source.indexOf('class SpaceListLine {'),'SpaceListLine')))();
+  const getter = name => block(source.indexOf('get '+name+'()'),name);
+  const Directory = new Function('SpaceListLine','return '+stripTypeScriptTypes('class Directory {'+
+    [getter('spaceListLines'),getter('quietSpaceGroups'),methodCode('hasGroupOverflow')].join('\n')+'}'))(Line);
+  const page = Object.assign(new Directory(), {spaceLineCache:new Map(), displayRows:group=>group.rows});
+  const group = (key,parent,rows,folded=false) => ({
+    key, rows, value:{parent,folded,rows,totalRowCount:rows.length,capped:false}
+  });
+  const open=group('active','',[{key:'session/A'}]);
+  const q1=group('q1','quiet',[],true), q2=group('q2','quiet',[],true);
+  page.groupBindings=[open,q1,q2];
+  const collapsed=page.spaceListLines;
+  assert.deepEqual(collapsed.map(item=>item.kind),['header','session','quiet','header','header']);
+  q1.rows=q1.value.rows=[{key:'session/B'}];q1.value.folded=false;q1.value.totalRowCount=3;
+  const expanded=page.spaceListLines;
+  assert.deepEqual(expanded.map(item=>item.kind),['header','session','quiet','header','session','more','header']);
+  assert.equal(expanded[4].group,q1);assert.equal(expanded[4].row,q1.rows[0]);
+  assert.equal(expanded[6],collapsed[4]);assert.equal(expanded[2],collapsed[2]);
+  assert.equal(new Set(expanded.map(item=>item.key)).size,expanded.length);
+  q1.rows=q1.value.rows=[];q1.value.folded=true;
+  assert.deepEqual(page.spaceListLines,collapsed);
+  page.groupBindings=[open];assert.deepEqual(page.spaceListLines.map(item=>item.kind),['header','session']);
 });

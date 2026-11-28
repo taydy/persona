@@ -15,13 +15,43 @@
   },
   {
     "name": "ask_user",
-    "description": "Ask the user one or more multiple-choice questions on their iPhone (a card in this conversation plus a push notification) and wait for the answers. Use it to confirm anything risky (sending messages / email for them, deleting, changing live systems) or to let them pick between options. AskUserQuestion does not work here; use this. They can also type a free-form answer. Waits up to 2 hours; if the user writes in this conversation instead of picking an option, the question is withdrawn and the tool returns at once, with their message following. If nobody answers in time, the question becomes a to-do that waits for the user's call (in their to-do list and the next briefing), and their answer comes to this conversation later as a new message. With a deadline (each question then recommends one of its options): if nobody answers by it and you marked it reversible, the recommended options are taken by default and recorded on the question's to-do; one that cannot be undone is only reminded again and keeps waiting. With wait false the card goes up the same way but the call returns at once: end the turn without guessing the answer; it comes later as a new message quoting the question and the answer (or saying the card was closed unanswered, or expired and became a to-do). Use wait false only where your instructions say to; a confirmation this same turn needs (approving a message before it is sent) keeps the default. A waiting call holds this turn, so anything else sent to this conversation waits behind it: once such a message waits and the question has been up for a couple of minutes, the call returns without the answer and the card stays up as with wait false; end the turn then.",
+    "description": "Ask multiple-choice questions with explicit decision rights. Use decision_scope=internal for execution choices or recommendations: a designated supervisor is woken and answers as the assistant. Owner decisions require why_owner or owner_action. For a personal unlock, use owner_action=personal_unlock and let the owner act in their own app; never request a password or private key. Owners can also type an answer. Default wait=true holds this turn; a user message withdraws a waiting question, and a queued message can release the turn after two minutes. With wait=false, return at once, end the turn without guessing, and receive one later receipt with the answer, cancellation or expiry, including after restart. Questions wait up to two hours, or until deadline. An unanswered internal question authorizes nothing. Owner deadline defaults require reversible=true and recommend on every question; outward, spending, personal and irreversible actions never take a default.",
     "input_schema": {
       "type": "object",
       "required": [
         "questions"
       ],
       "properties": {
+        "decision_scope": {
+          "type": "string",
+          "enum": [
+            "internal",
+            "owner"
+          ],
+          "description": "Internal execution questions go to a supervisor. Owner questions require why_owner or owner_action. Omitting all decision-right metadata is rejected."
+        },
+        "why_owner": {
+          "type": "string",
+          "enum": [
+            "priority",
+            "acceptance",
+            "only_owner_knows",
+            "visible_to_others",
+            "irreversible"
+          ],
+          "description": "Why this decision requires the owner; omit for internal execution questions"
+        },
+        "owner_action": {
+          "type": "string",
+          "enum": [
+            "personal_unlock",
+            "login",
+            "second_factor",
+            "experience_check",
+            "spending"
+          ],
+          "description": "An action only the owner can perform; never include credentials"
+        },
         "wait": {
           "type": "boolean",
           "description": "default true: hold this turn until the user answers. false: put the card up and return at once; the answer arrives later as a new message in this conversation"
@@ -86,7 +116,7 @@
   },
   {
     "name": "ask_user_withdraw",
-    "description": "Withdraw a pending ask_user question card created by this conversation when it is no longer needed. Only cancels this conversation's own ask_user question; another conversation's card and user-owned approvals, plans or screen dialogs are rejected. Repeated calls on an already-ended card of this conversation are idempotent.",
+    "description": "Withdraw a pending `ask_user` card of this conversation. Other chats' cards and user-owned approvals/plans/dialogs are rejected; already-ended own cards are idempotent.",
     "input_schema": {
       "type": "object",
       "required": [
@@ -94,12 +124,10 @@
       ],
       "properties": {
         "interaction_id": {
-          "type": "string",
-          "description": "the pending ask_user interaction ID (ix_…)"
+          "type": "string"
         },
         "reason": {
-          "type": "string",
-          "description": "optional short reason why the question is no longer needed"
+          "type": "string"
         }
       }
     },
@@ -584,7 +612,7 @@
         },
         "inbox_item": {
           "type": "string",
-          "description": "Inbox ID; for this conversation's eligible handoffs, omit for one, specify for several."
+          "description": "Inbox ID to link to the task. Omit to skip linking."
         },
         "resume": {
           "type": "boolean",
@@ -668,6 +696,53 @@
         }
       }
     }
+  },
+  {
+    "name": "agent_modes",
+    "description": "Change a running coding Agent's model, effort, or permission mode via `session.modes` (use `agent_switch` to change launcher). Give `model`, `effort`, and/or `permission_mode`. Permission-mode changes need owner phone approval; read-only tasks, pending approvals, assistant chats, stopped, or unsupported sessions are refused.",
+    "input_schema": {
+      "type": "object",
+      "required": [
+        "machine",
+        "session_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "machine": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        "permission_mode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "bypassPermissions"
+          ]
+        }
+      }
+    },
+    "defer_loading": true
   },
   {
     "name": "agent_switch",
@@ -1090,7 +1165,7 @@
   },
   {
     "name": "interaction_answer",
-    "description": "Answer another agent's card for the user when they said what to answer or told you to decide: each question by its own wording with an option label it offers (multi-select: an array); no free text (use agent_send). A card a 督办 message handed you is yours: answer a question or terminal dialog (an option's label or number), or allow/deny a permission, plan or dialog's Yes/No with allow, giving reason; kept as the task's decision, not the user's. You may always deny permissions/plans. Forms, secrets, allowing a message/reply as the user, spending or deletion, and folder-trust/Bypass Permissions dialogs are the user's: ask_escalate. Never other approvals or assistant questions.",
+    "description": "Answer a card handed to you as supervisor or internal reviewer. Use exact machine/session_id/interaction_id from the wake-up; maintenance session_id may be empty. Internal cards may belong to assistant chats; never answer your own. Questions use offered labels (arrays for multi-select), terminal dialogs use labels/numbers, permissions/plans use allow and reason. The answer is the assistant's and becomes a task decision. Secrets/forms, outward messages, spending, irreversible and trust/Bypass approvals need the owner (ask_escalate for task cards). Other assistant cards stay unavailable.",
     "input_schema": {
       "type": "object",
       "required": [
@@ -1182,7 +1257,7 @@
   },
   {
     "name": "inbox_suggest",
-    "description": "Submit the event’s recap and one suggestion (replaces any earlier one). Nothing goes out until the user confirms; the program executes it verbatim. `kind`: `reply` — message in the user's voice ready to send (no 【…】 blanks; omit unknowns and explain in `note`; Feishu sheet/Base `changes`: ref, field, listed value); `agent` — new Agent instruction in `text` (`machine`, `cwd` optional); `handoff` — hand to an existing eligible conversation on this manager (main, active leader, or linked task) with `machine`, `session`, and `text` as the note (processing chat only; refuses archived, unknown, or other-manager targets); `todo` — to-do title in `text` (action-led, no chat/people names), `due` only for an explicit deadline (`2006-01-02` all day or RFC 3339 with offset; omit if unsure and note why; confirming files the row); `conclusion` — dealt with, `text` conclusion, `outcome` `fyi` or `done`. `handback: true` returns confirmation here as an instruction for user judgment. `note`: 1–2 sentences on findings/evidence. `recap`: background, progress, blockers (≤600 chars) every time. `title` (no chat/person names) and `summary` (1 sentence on state and who waits) every time; source-titled items (mail, docs, PRs/issues) ignore `title`. `related`: ids of related items in other chats/sources. `recap` without `kind` creates no suggestion and may include `title`, `summary`, and `follow`. `follow` (valid only without `kind`) waits on the other side: `who` (empty = other side's reply), `next`, `check_at` (RFC 3339 with zone) or `check_in` (`30m`, `4h`, `2d`; default `24h`, clamped 30m–14d). `reported`: `{text, by}` records one completed external action unobserved by the program (never plans; `by` `agent`|`assistant`, default `assistant`; one line ≤120 chars; refused on filed items; deduped against latest). Call at end of turn. In a handed-off chat (context names event id), pass `item` to write back (also shown as a card); refuses unhanded or filed items.",
+    "description": "Submit the event’s recap and one suggestion (replaces any earlier one). Nothing goes out until the user confirms; the program executes it verbatim. `kind`: `reply` — message in the user's voice ready to send (no 【…】 blanks; omit unknowns and explain in `note`; to really `@` someone in a connector that supports mentions such as Feishu, pass `mentions` as `[{\"id\":\"\u003cverified user id\u003e\",\"name\":\"\u003cexact display name\u003e\"}]` from the source's search/member tool and write `@name` verbatim in `text` — `@name` without `mentions` is ordinary text; Feishu sheet/Base `changes`: ref, field, listed value); `agent` — new Agent instruction in `text` (`machine`, `cwd` optional); `handoff` — hand to an existing eligible conversation on this manager (main, active leader, or linked task) with `machine`, `session`, and `text` as the note (processing chat only; refuses archived, unknown, or other-manager targets); `todo` — to-do title in `text` (action-led, no chat/people names), `due` only for an explicit deadline (`2006-01-02` all day or RFC 3339 with offset; omit if unsure and note why; confirming files the row); `conclusion` — dealt with, `text` conclusion, `outcome` `fyi` or `done`. `handback: true` returns confirmation here as an instruction for user judgment. `note`: 1–2 sentences on findings/evidence. `recap`: background, progress, blockers (≤600 chars) every time. `title` (no chat/person names) and `summary` (1 sentence on state and who waits) every time; source-titled items (mail, docs, PRs/issues) ignore `title`. `related`: ids of related items in other chats/sources. `recap` without `kind` creates no suggestion and may include `title`, `summary`, and `follow`. `follow` (valid only without `kind`) waits on the other side: `who` (empty = other side's reply), `next`, `check_at` (RFC 3339 with zone) or `check_in` (`30m`, `4h`, `2d`; default `24h`, clamped 30m–14d). `reported`: `{text, by}` records one completed external action unobserved by the program (never plans; `by` `agent`|`assistant`, default `assistant`; one line ≤120 chars; refused on filed items; deduped against latest). Call at end of turn. In a handed-off chat (context names event id), pass `item` to write back (also shown as a card); refuses unhanded or filed items.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1280,6 +1355,26 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "mentions": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            }
           }
         },
         "changes": {
@@ -2369,7 +2464,7 @@
   },
   {
     "name": "conversations_switch",
-    "description": "Switch Assistant conversations to another launcher/model; preview first unless confirmed. Busy items queue until turn end without interruption or synthetic messages. Execution saves original settings and returns a batch ID. `restore_batch_id` restores completed items exactly; `batch_id` reads status. Independent changes are refused.",
+    "description": "Switch Assistant chats to another launcher/model; preview first unless confirmed. Busy chats queue at turn end without interruption. Execution saves originals and returns a batch ID; `restore_batch_id` restores completed items; `batch_id` reads status.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -2380,40 +2475,31 @@
           },
           "minItems": 1,
           "maxItems": 50,
-          "uniqueItems": true,
-          "description": "IDs from conversations_list"
+          "uniqueItems": true
         },
         "machine_id": {
-          "type": "string",
-          "description": "Assistant machine; defaults to current"
+          "type": "string"
         },
         "launcher": {
-          "type": "string",
-          "description": "target launcher"
+          "type": "string"
         },
         "model": {
-          "type": "string",
-          "description": "target model; empty uses launcher default"
+          "type": "string"
         },
         "effort": {
-          "type": "string",
-          "description": "target effort; empty uses launcher default"
+          "type": "string"
         },
         "permission_mode": {
-          "type": "string",
-          "description": "target mode; empty preserves each conversation's mode"
+          "type": "string"
         },
         "preview": {
-          "type": "boolean",
-          "description": "read-only; no batch, queue, or confirmation"
+          "type": "boolean"
         },
         "restore_batch_id": {
-          "type": "string",
-          "description": "batch to restore; excludes forward fields"
+          "type": "string"
         },
         "batch_id": {
-          "type": "string",
-          "description": "batch status; use alone"
+          "type": "string"
         }
       }
     },
@@ -3059,7 +3145,7 @@
               },
               "inbox_item": {
                 "type": "string",
-                "description": "Inbox ID or 'none' to skip; omit to link sole eligible handoff (multiple need ID; none stays unlinked). Never files/replies."
+                "description": "Inbox ID or 'none' to skip. Omit for strong-match inference outside continuations. Never files or replies."
               },
               "tier": {
                 "type": "string",
@@ -3500,7 +3586,7 @@
         },
         "inbox_item": {
           "type": "string",
-          "description": "Inbox source; omit for the conversation's sole eligible open handoff. Several require an id. Links the existing task and its Agents."
+          "description": "Inbox ID to link to the existing task and its Agents. Omit to skip linking."
         },
         "change": {
           "type": "string",
@@ -3580,7 +3666,7 @@
   },
   {
     "name": "task_start_screen",
-    "description": "Read the last 30 lines of the terminal tab a task's agent did not start in, while its computer keeps that tab (a 督办 message says until when): the question the tab's shell waits on, or where the agent's own screen stopped. Only for a task of this conversation whose start is being remedied; what it shows stays here, it is not kept with the task.",
+    "description": "Read the last 30 lines of a failed startup's kept tab while the start is being remedied. A supervision message says how long the tab is kept. Only the main conversation or the task's current supervising conversation may read it. See what stopped the shell or Agent. The screen stays in this conversation.",
     "input_schema": {
       "type": "object",
       "required": [
@@ -3601,7 +3687,7 @@
   },
   {
     "name": "task_start_keys",
-    "description": "Type into the terminal tab a task's agent did not start in, while its computer keeps that tab and no agent runs there: text as is (no enter, at most 32 characters), then keys by name (\"enter\", \"esc\", \"ctrl+c\", \"y\", \"n\", \"up\", \"down\"…, at most 8). Use it to answer the question the tab's shell waits on, or to get past where the agent's screen stopped; read the tab first with task_start_screen and again after. The keys, the text and your reason are kept with the task's history. It starts nothing: start the agent again with task_retry.",
+    "description": "Answer a failed startup's shell or Agent prompt in its kept terminal tab while no Agent runs there. Only the main conversation or the task's current supervising conversation may act. Read the tab with task_start_screen before and after. Send up to 32 characters without Enter, then up to 8 named keys (enter, esc, ctrl+c, y, n, up, down). The keys, text and reason go in the task history. Use task_retry to start again.",
     "input_schema": {
       "type": "object",
       "required": [
@@ -3636,7 +3722,7 @@
   },
   {
     "name": "task_retry",
-    "description": "Start a failed task's agent again: in its kept tab (once task_start_keys answered what stopped it), else in a new tab, reopening it; with launcher, on that launcher of the same computer and workspace. At most 3 retries; the hub never retries itself. Returns at once; the outcome comes as a 督办 message. Only this conversation's tasks; reason goes in their history.",
+    "description": "Retry a failed task in its kept tab after clearing the blocker, or reopen it in a new tab. An optional launcher uses the same computer and workspace. The main conversation may retry any task. Other conversations may retry only tasks they supervise. Up to 3 manual retries. Returns at once. Look for the result in supervision. The task history records the reason.",
     "input_schema": {
       "type": "object",
       "required": [

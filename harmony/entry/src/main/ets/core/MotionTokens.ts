@@ -28,6 +28,7 @@ export class MotionTokens {
   static readonly breathRingOpacity: number = 0.6;
   /** Working status arc rotation (Theme.Motion.workingArcTurn). */
   static readonly workingArcTurnMs: number = 1000;
+  static readonly sessionWorkingHalfBreathMs: number = 2200;
   /** Streaming tail caret pulse. */
   static readonly caretPulseMs: number = 650;
 }

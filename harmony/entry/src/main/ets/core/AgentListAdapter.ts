@@ -14,6 +14,10 @@ export class CoreAgentListAdapter implements AgentListAdapter {
     // The companion phone layouts consume the core's same filtered, unpinned inventory.
     const grouping = ['repo','todo','direction','app','recent'].includes(input.grouping) ? 'state' : input.grouping;
     const baseInput = coreAgentSortInput({ ...input, grouping, quick: sourceFilter ? 'all' : input.quick });
+    const families: Record<string,string> = {};
+    for (const row of input.rows) if (row.familyRoot) families[row.id] = row.familyRoot;
+    const hasFamilies = Object.keys(families).length > 0;
+    if (hasFamilies) baseInput.settings['filter_families'] = families;
     const selectedQuick = baseInput.settings['quick'];
     baseInput.settings['quick'] = 'all';
     baseInput.settings['inventory'] = true;
@@ -21,13 +25,16 @@ export class CoreAgentListAdapter implements AgentListAdapter {
     if (!base.filtered) throw new Error('missing_core_inventory');
     const included = new Set(base.filtered), kept = new Set(input.kept);
     const counts: Record<string, Object> = { ...base.filter_counts, feishu: 0, terminal: 0 };
+    const paneOwners: Record<string, Set<string>> = { feishu: new Set<string>(), terminal: new Set<string>() };
     const selected: Record<string, Object>[] = [];
     for (const row of input.rows) {
       if (!included.has(row.id)) continue;
       const origin = agentPaneSource(rowText(row.raw, 'pane_id'));
-      if (origin && row.raw['nested_subtask'] !== true) counts[origin] = Number(counts[origin]) + 1;
+      if (origin && (row.familyRoot || row.raw['nested_subtask'] !== true)) paneOwners[origin].add(row.familyRoot || row.id);
       if (sourceFilter && (origin === input.quick || kept.has(row.id))) selected.push(row.raw);
     }
+    counts['feishu'] = paneOwners.feishu.size;
+    counts['terminal'] = paneOwners.terminal.size;
     let shown = base;
     if (sourceFilter) {
       baseInput.sessions = selected;
@@ -36,13 +43,37 @@ export class CoreAgentListAdapter implements AgentListAdapter {
       baseInput.settings['quick'] = selectedQuick;
       shown = this.sort(baseInput);
     }
+    let groupedInput = baseInput;
+    if (hasFamilies) {
+      if (!shown.filtered) throw new Error('missing_core_inventory');
+      const matched = new Set(shown.filtered);
+      const owners = new Set<string>(), members: string[] = [];
+      for (const row of input.rows) {
+        if (!matched.has(row.id) || row.raw['hidden_by_directory'] === true || row.raw['deleted'] === true) continue;
+        const caps = row.raw['capabilities'] as Record<string, Object> | undefined;
+        if (input.query && row.raw['state'] === 'offline' && caps?.['read'] === false) continue;
+        owners.add(row.familyRoot || row.id);
+        members.push(row.id);
+      }
+      const roots = input.rows.filter(row => !row.familyRoot && owners.has(row.id));
+      // Group matches using their parents' own project, pin and timestamp.
+      const sessions = roots.map(row => row.familyState ? { ...row.raw, state: row.familyState } : row.raw);
+      const settings: Record<string,Object> = { ...baseInput.settings, query: '', include_filter_counts: false,
+        kept: baseInput.settings['quick'] === 'all' ? [] : Array.from(owners) };
+      delete settings['filter_families'];
+      groupedInput = { ...baseInput, sessions, settings };
+      const grouped = this.sort(groupedInput);
+      grouped.unread_shown = shown.unread_shown;
+      grouped.matchedMembers = members;
+      shown = grouped;
+    }
     if ((input.grouping === 'machine' || input.grouping === 'space') && !input.query &&
         (input.quick === 'all' || input.quick === 'needsYou') && Number(counts['needsYou']) > 0) {
-      const attention = this.sort({...baseInput, settings:{...baseInput.settings,grouping:'state',quick:'needsYou'}})
+      const attention = this.sort({...groupedInput, settings:{...groupedInput.settings,grouping:'state',quick:'needsYou',kept:[]}})
         .groups.find((group) => group.id === 'state/needs');
       if (attention) shown.groups = [attention, ...shown.groups];
     }
-    shown.queryMatches = base.filtered;
+    shown.queryMatches = hasFamilies ? Array.from(new Set(base.filtered.map(id => families[id] || id))) : base.filtered;
     shown.filter_counts = counts;
     return shown;
   }
@@ -74,14 +105,20 @@ export function coreAgentSortInput(input: AgentListInput): CoreSortInput {
   const mutesSpaces: string[] = [], mutesSessions: string[] = [], mutesAllowed: string[] = [];
   const hubPreferences: Record<string, Object> = {};
   const managerPreferences: Record<string, Object> = {};
-  input.rows.forEach((row) => {
-    const current = input.preferencesFor(row), group = rowText(row.raw, 'app_hub_group');
+  // The wire maps are per owner. Read the last row for each owner, as repeated assignments did.
+  const owners = new Set<string>();
+  for (let i = input.rows.length - 1; i >= 0; i--) {
+    const row = input.rows[i], group = rowText(row.raw, 'app_hub_group'), manager = rowText(row.raw, 'manager');
+    const key = manager ? 'manager/' + group + '|' + manager : 'hub/' + group;
+    if (owners.has(key)) continue;
+    owners.add(key);
+    const current = input.preferencesFor(row);
     const preferences: Record<string, Object> = {
       pins: {spaces: current.pinsSpaces.slice(), sessions: current.pinsSessions.slice()},
       mutes: {spaces: current.mutesSpaces.slice(), sessions: current.mutesSessions.slice(), allowed: current.mutesAllowed.slice()}
     };
-    if (rowText(row.raw, 'manager')) {
-      managerPreferences[group + '|' + rowText(row.raw, 'manager')] = preferences;
+    if (manager) {
+      managerPreferences[group + '|' + manager] = preferences;
     } else if (group) hubPreferences[group] = preferences;
     else {
       // The legacy maps belong to the default Hub only; never concatenate owners.
@@ -91,7 +128,7 @@ export function coreAgentSortInput(input: AgentListInput): CoreSortInput {
       mutesSessions.splice(0, mutesSessions.length, ...current.mutesSessions);
       mutesAllowed.splice(0, mutesAllowed.length, ...current.mutesAllowed);
     }
-  });
+  }
   return {sessions: input.rows.map((row) => row.raw), machines: input.machines,
     pins: {spaces: pinsSpaces, sessions: pinsSessions}, mutes: {spaces: mutesSpaces, sessions: mutesSessions, allowed: mutesAllowed},
     hub_preferences: hubPreferences,

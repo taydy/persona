@@ -7,9 +7,10 @@ import { ClientModel } from '../models/ClientModel';
 import { AgentDecisionCard, AgentDecisionQueue } from '../models/AgentDecisionQueue';
 import { AgentWorkspace, AgentWorkspaceGroup, agentGroupingLabels, NEEDS_GROUP } from '../models/AgentWorkspace';
 import { ProjectAgent, ProjectCatalog, ProjectWorktree } from '../models/ProjectCatalog';
+import { AgentFamilyLine, FamilyDisclosureButton } from './AgentFamilyLine';
 import { AgentDirectoryRowContent } from './AgentDirectoryRowContent';
 import { AgentNeedsYouMark } from './AgentNeedsYouMark';
-import { NeedsYouPulseDot, WorkingArcSpinner } from './StatusMotionMarks';
+import { NeedsYouPulseDot, SessionWorkingDot } from './StatusMotionMarks';
 import { recommendedOptionTitle, interactionToolName } from '../models/InteractionDecision';
 import { agentPaneSource } from '../core/AgentListAdapter';
 import { herdrTabName } from '../core/SessionNaming';
@@ -18,7 +19,7 @@ import { AgentRepositoryRows } from './AgentRepositoryRows';
 import { AgentTaskGrouping, agentTaskSectionsFor } from '../models/AgentTaskGrouping';
 import { AgentTaskSection } from '../models/AgentTaskSections';
 import { AgentTaskGroupRows } from './AgentTaskGroupRows';
-import { agentRowPreview, agentRowTone, runningSubagents } from '../core/AgentRowPreview';
+import { agentFamilySummary, agentRowPreview, agentRowTone, runningSubagents } from '../core/AgentRowPreview';
 import { ResourceRow, Wire } from '../models/Wire';
 import { unavailableSessionSources } from '../models/SessionRelations';
 import { BoundRow, reconcileBoundRows } from '../models/RowBinding';
@@ -28,7 +29,7 @@ import { Colors } from '../design/Colors';
 import { ButtonStyles, SelectStyles } from '../design/Controls';
 import { Symbols } from '../design/Symbols';
 import { ToolGlyph } from '../design/ToolGlyph';
-import { tr } from '../design/Strings';
+import { tr, trError } from '../design/Strings';
 import { nativeEnvironment, NativeEnvironment } from '../platform/NativeEnvironment';
 import { nativeSheetInset } from '../platform/NativeInsets';
 import { DeviceLook, deviceLook } from '../models/DeviceLook';
@@ -57,9 +58,9 @@ class AgentRowPresentation {
   @Trace lastText: string = '';
   @Trace rootTitle: string = '';
   @Trace relativeKind: string = '';
+  @Trace familyKind: string = 'relation_task';
+  @Trace familyCount: number = 0;
   @Trace familySummary: string = '';
-  @Trace familyHasTasks: boolean = false;
-  @Trace familyExpanded: boolean = false;
   @Trace indented: boolean = false;
   @Trace rawStatus: string = '';
   @Trace updatedAt: number = Number.NaN;
@@ -118,6 +119,26 @@ class BoundAgentGroup {
   constructor(identity: string, key: string, value: AgentWorkspaceGroup) { this.identity = identity; this.key = key; this.value = value; }
 }
 
+// Stable virtual-list entries allow collapsed project headers to be created on demand too.
+class SpaceListLine {
+  readonly kind: string;
+  readonly key: string;
+  readonly group: BoundAgentGroup;
+  readonly row?: BoundAgentRow;
+  constructor(kind: string, key: string, group: BoundAgentGroup, row?: BoundAgentRow) {
+    this.kind = kind; this.key = key; this.group = group; this.row = row;
+  }
+}
+
+class BoundAgentFamily {
+  readonly group: BoundAgentGroup;
+  readonly parent: BoundAgentRow;
+  shown: number;
+  constructor(group: BoundAgentGroup, parent: BoundAgentRow, shown: number) {
+    this.group = group; this.parent = parent; this.shown = shown;
+  }
+}
+
 /** The state mark on an Agent's avatar: Needs you breathes unless Reduce Motion is on. */
 @ComponentV2
 struct AgentStateMark {
@@ -173,6 +194,8 @@ export struct AgentListPage {
   @Param projectCatalog: ProjectCatalog = new ProjectCatalog();
   @Param taskGrouping: AgentTaskGrouping = new AgentTaskGrouping();
   @Param externalSearchControls:boolean = false;
+  private boundFamilies: Set<string> = new Set<string>();
+  private familyGroups: Map<string, BoundAgentFamily[]> = new Map();
   @Local taskRowsByKey: Map<string,BoundAgentRow> = new Map();
   @Local look: DeviceLook = deviceLook;
   @Computed get displayedAgentStyle():string {
@@ -210,6 +233,7 @@ export struct AgentListPage {
   @Local private pressedChoiceKey: string = '';
   private searchField: SearchController = new SearchController();
   private quickScroller: Scroller = new Scroller();
+  private quickViewportWidth: number = 0;
   private agentScroller: Scroller = new Scroller();
   private pullY: number = -1;
   private pullX: number = 0;
@@ -220,6 +244,10 @@ export struct AgentListPage {
   /** Row times read this, so they move on every 30 s while the list is on screen. */
   @Local clock: number = Date.now();
   private clockTimer: number = -1;
+  private spaceLineCache: Map<string, SpaceListLine> = new Map();
+  private listMoving: boolean = false;
+  private directoryPending: boolean = false;
+  private bindingsPending: boolean = false;
   private rowVisibility: Map<string, number> = new Map();
   private rowBindingOwner: Object | undefined;
   private rowBindingScope: string = '';
@@ -244,6 +272,7 @@ export struct AgentListPage {
   }
 
   aboutToAppear(): void {
+    this.rememberSelectedMachine();
     this.workspace.setCompactDisplay(this.displayedAgentStyle==='list');
     this.stopDecisionEvents=this.model.observeEvents((_payload:string, type:string) => {
       if (['interaction','interactions','interaction_resolved'].includes(type)) this.reloadDecisions();
@@ -251,7 +280,7 @@ export struct AgentListPage {
     });
     this.reloadDecisions(); this.syncRowBindings(); if (this.rail) this.syncRailBindings(); if (this.active) { this.activateWorkspace(); this.startClock(); }
     this.refreshPersonalAgents().catch(() => undefined); }
-  aboutToDisappear(): void { this.stopClock(); if (!this.externalSearchControls) this.taskGrouping.clear(); this.stopDecisionEvents?.(); this.retireDecisions(); this.resetSearchReveal(); this.editorOpen = false; this.filterSheetOpen = false; this.personalAgentsSheetOpen = false; this.editingAdmission = undefined; this.workspace.revokeRowActions(); if (!this.retainWorkspace) this.workspace.hide(); }
+  aboutToDisappear(): void { this.listMoving = false; this.directoryPending = false; this.bindingsPending = false; this.stopClock(); if (!this.externalSearchControls) this.taskGrouping.clear(); this.stopDecisionEvents?.(); this.retireDecisions(); this.resetSearchReveal(); this.editorOpen = false; this.filterSheetOpen = false; this.personalAgentsSheetOpen = false; this.editingAdmission = undefined; this.workspace.revokeRowActions(); if (!this.retainWorkspace) this.workspace.hide(); }
 
   private startClock(): void {
     this.clock = Date.now();
@@ -259,11 +288,11 @@ export struct AgentListPage {
   }
   private stopClock(): void { if (this.clockTimer !== -1) { clearInterval(this.clockTimer); this.clockTimer = -1; } }
 
-  @Monitor('active') visibleChanged(): void { if (this.active) this.startClock(); else this.stopClock(); if (this.active) { this.reloadDecisions(); this.refreshPersonalAgents().catch(() => undefined); } else this.retireDecisions(); if (!this.active) { this.resetSearchReveal(); this.editorOpen = false; this.filterSheetOpen = false; this.personalAgentsSheetOpen = false; this.editingRow = undefined; this.editingAdmission = undefined; this.workspace.revokeRowActions(); if (!this.retainWorkspace) this.workspace.hide(); } else this.activateWorkspace(); }
+  @Monitor('active') visibleChanged(): void { if (!this.active) { this.listMoving=false; this.directoryPending=false; this.bindingsPending=false; } if (this.active) this.startClock(); else this.stopClock(); if (this.active) { this.reloadDecisions(); this.refreshPersonalAgents().catch(() => undefined); } else this.retireDecisions(); if (!this.active) { this.resetSearchReveal(); this.editorOpen = false; this.filterSheetOpen = false; this.personalAgentsSheetOpen = false; this.editingRow = undefined; this.editingAdmission = undefined; this.workspace.revokeRowActions(); if (!this.retainWorkspace) this.workspace.hide(); } else this.activateWorkspace(); }
   @Monitor('model.forgottenEpoch') forgottenChanged(): void { this.retireDecisions(); this.reloadDecisions(); this.workspace.forgetHub(this.model.forgottenProfile); if (this.editingRow?.group === this.model.forgottenProfile) { this.editorOpen = false; this.editingRow = undefined; this.editingAdmission = undefined; } }
   @Monitor('model.profile') profileChanged(): void { this.taskGrouping.clear(); this.retireDecisions(); this.reloadDecisions(); this.resetSearchReveal(); this.editorOpen = false; this.personalAgentsSheetOpen = false; this.personalAgentCount = 0; this.editingAdmission = undefined; this.syncRowBindings(); if (!this.active) return; this.activateWorkspace(); this.refreshPersonalAgents().catch(() => undefined); }
   @Monitor('selectedRow') externalSelectionChanged(): void { this.workspace.selectExternal(this.selectedRow); }
-  @Monitor('model.directorySessions', 'model.directoryReady') directoryChanged(): void { if (!this.active) return; this.reloadDecisions(); this.workspace.update(this.model, this.readingDetail); this.workspace.selectExternal(this.selectedRow); }
+  @Monitor('model.directorySessions', 'model.directoryReady') directoryChanged(): void { if (this.active && !this.listMoving) this.reloadDecisions(); }
   @Computed get machineRosterKey(): string {
     // Ignore metrics and last_seen updates. A reachability change also invalidates cached child activity.
     const machines = this.model.directoryReady ? this.model.directoryMachines : this.model.machines;
@@ -273,6 +302,7 @@ export struct AgentListPage {
   @Monitor('model.directorySessions', 'model.directoryReady', 'model.sessionsReady', 'model.sessions', 'machineRosterKey')
   catalogChanged(): void {
     if (!this.active) return;
+    if (this.listMoving) { this.directoryPending = true; return; }
     this.workspace.update(this.model, this.readingDetail);
     this.workspace.selectExternal(this.selectedRow);
   }
@@ -288,7 +318,19 @@ export struct AgentListPage {
     this.reloadDecisions(); if (!this.active) return; this.workspace.update(this.model, this.readingDetail);
     if (this.model.connected) { this.refreshGroupingSupport(); this.workspace.refresh(this.model).catch(() => undefined); this.refreshPersonalAgents().catch(() => undefined); }
   }
-  @Monitor('workspace.groups', 'workspace.groupingMode') rowsChanged(): void { this.syncRowBindings(); }
+  @Monitor('workspace.groups', 'workspace.groupingMode') rowsChanged(): void {
+    if (!this.active) return;
+    if (this.listMoving) this.bindingsPending = true;
+    else this.syncRowBindings();
+  }
+  private finishListScroll(): void {
+    this.listMoving = false;
+    const directory = this.directoryPending, bindings = this.bindingsPending;
+    this.directoryPending = false; this.bindingsPending = false;
+    if (!this.active) return;
+    if (directory) { this.reloadDecisions(); this.catalogChanged(); }
+    else if (bindings) this.syncRowBindings();
+  }
   @Monitor('rail', 'groupBindings', 'workspace.unpinnedRows') railBindingsChanged(): void { this.syncRailBindings(); }
   @Monitor('readingDetail') detailChanged(): void { this.workspace.setReadingDetail(this.readingDetail); }
 
@@ -354,9 +396,51 @@ export struct AgentListPage {
     }).catch(() => undefined);
   }
 
+  // A disclosure changes membership inside existing groups. Directory/owner changes still use the full bind.
+  @Monitor('workspace.expandedFamilies') familyDisclosureChanged(): void { if (this.active) this.syncFamilyBindings(); }
+  private syncFamilyBindings(): void {
+    const open = this.workspace.expandedFamilies;
+    const changed: string[] = [];
+    for (const key of open) if (!this.boundFamilies.has(key)) changed.push(key);
+    for (const key of this.boundFamilies) if (!open.has(key)) changed.push(key);
+    this.boundFamilies = open;
+    let changedGroup = false;
+    const scope = this.rowBindingScope;
+    const newTaskRows: ResourceRow[] = [];
+    for (const key of changed) {
+      for (const family of this.familyGroups.get(key) || []) {
+        const group = family.group, parent = family.parent, index = group.rows.indexOf(parent);
+        if (index < 0) continue;
+        const children = this.workspace.expandedChildren(parent.bound.value);
+        const bound = reconcileBoundRows([], children, (row: ResourceRow) => row.key(), undefined, this.model, '', scope);
+        const added = this.bindAgentRows([], bound, true);
+        const atEnd = index + 1 + family.shown === group.rows.length;
+        parent.last = atEnd && !added.length;
+        added.forEach((item: BoundAgentRow, i: number) => {
+          item.first = false; item.last = atEnd && i === added.length - 1;
+        });
+        group.rows = group.rows.slice(0,index + 1).concat(added,group.rows.slice(index + 1 + family.shown));
+        family.shown = added.length;
+        changedGroup = true;
+      }
+      const task = this.taskRowsByKey.get(key);
+      if (task && open.has(key)) {
+        for (const child of this.workspace.expandedChildren(task.bound.value)) {
+          if (!this.taskRowsByKey.has(child.key())) newTaskRows.push(child);
+        }
+      }
+    }
+    if (newTaskRows.length) {
+      const rows = reconcileBoundRows([], newTaskRows, (row: ResourceRow) => row.key(), this.model, this.model, scope, scope);
+      for (const item of this.bindAgentRows([], rows, true)) this.taskRowsByKey.set(item.bound.value.key(), item);
+    }
+    if (changedGroup && this.rail) this.syncRailBindings();
+  }
+
   private syncRowBindings(): void {
-    this.mixedMachines = new Set(this.workspace.visibleRows().map((row: ResourceRow) => JSON.stringify([row.group, row.manager, row.machine]))).size > 1;
-    this.mixedHubs = new Set(this.workspace.visibleRows().map((row: ResourceRow) => row.group)).size > 1;
+    const visible = this.workspace.visibleRows();
+    this.mixedMachines = new Set(visible.map((row: ResourceRow) => JSON.stringify([row.group, row.manager, row.machine]))).size > 1;
+    this.mixedHubs = new Set(visible.map((row: ResourceRow) => row.group)).size > 1;
     const scope = JSON.stringify([this.model.scope(), this.model.profile.id, this.model.profile.manager]);
     const sameOwnerScope = this.rowBindingOwner === this.model && this.rowBindingScope === scope;
     const previous = sameOwnerScope ? this.groupBindings : [];
@@ -388,10 +472,24 @@ export struct AgentListPage {
       }
       next.push(binding);
     });
+    this.familyGroups = new Map();
+    for (const group of next) {
+      if (group.value.id === 'state/needs' && this.workspace.groupingMode !== 'state') continue;
+      for (const item of group.rows) {
+        if (!item.presentation.familySummary) continue;
+        const key = item.bound.value.key();
+        const matches = this.familyGroups.get(key);
+        const family = new BoundAgentFamily(group, item, this.workspace.expandedChildren(item.bound.value).length);
+        if (matches) matches.push(family);
+        else this.familyGroups.set(key, [family]);
+      }
+    }
+    this.boundFamilies = this.workspace.expandedFamilies;
     this.groupBindings = next;
     if (this.workspace.groupingMode === 'todo' || this.workspace.groupingMode === 'direction') {
       const prior = sameOwnerScope ? Array.from(this.taskRowsByKey.values()) : [];
-      const taskRows = reconcileBoundRows(prior.map((binding:BoundAgentRow)=>binding.bound),this.workspace.unpinnedRows,
+      const sessions = this.workspace.unpinnedRows.flatMap((row: ResourceRow): ResourceRow[] => [row, ...this.workspace.expandedChildren(row)]);
+      const taskRows = reconcileBoundRows(prior.map((binding:BoundAgentRow)=>binding.bound),sessions,
         (row:ResourceRow)=>row.key(),sameOwnerScope ? this.model : undefined,this.model,scope,scope);
       const mapped = new Map<string,BoundAgentRow>();
       for (const binding of this.bindAgentRows(prior,taskRows,true)) mapped.set(binding.bound.value.key(),binding);
@@ -441,26 +539,17 @@ export struct AgentListPage {
     }
     if (this.compactRoot && !this.rail || this.workspace?.groupingMode === 'app' || this.workspace?.groupingMode === 'recent') presentation.prepareActivity(row);
     const root = this.workspace.relations.root(row), kids = this.workspace.foldedChildren(row);
-    presentation.rootTitle = root?.title || root?.id || '';
+    presentation.rootTitle = root ? ((this.model.directoryOwnerFor(root)?.useHerdrTabName ?? this.model.useHerdrTabName) ? herdrTabName(root.data()) : '') || root.title || tr('agent_untitled') : '';
     presentation.relativeKind = root ? this.workspace.relations.kind(row) : '';
-    presentation.indented = !!root && this.workspace.foldFamilies() && !this.workspace.isPinned(row);
-    presentation.familyExpanded = this.workspace.familyExpanded(row);
+    presentation.indented = !!root && !this.workspace.isPinned(row);
     presentation.familySummary = '';
-    presentation.familyHasTasks = false;
-    if (kids.length && this.workspace.foldFamilies()) {
+    presentation.familyCount = kids.length;
+    if (kids.length) {
       const sides = kids.filter(child => this.workspace.relations.kind(child) === 'side').length;
+      presentation.familyKind = !sides ? 'relation_task' : sides === kids.length ? 'relation_side' : 'relation_related';
       const needs = kids.filter(child => child.state === 'needs_you').length;
-      const parts: string[] = [];
-      if (sides) parts.push(tr('relation_side_count').replace('{n}',String(sides)));
-      if (kids.length > sides) {
-        parts.push(tr('relation_task_count').replace('{n}', String(kids.length - sides)));
-        presentation.familyHasTasks = true;
-      }
-      if (needs) parts.push(tr('relation_needs_count').replace('{n}',String(needs)));
-      // The family line already counts its subtasks, so it says how many run instead of a second subagent line.
       const running = kids.filter(child => child.state === 'working').length;
-      if (running) parts.push(tr('relation_running_count').replace('{n}', String(running)));
-      presentation.familySummary = parts.join(' · ');
+      presentation.familySummary = agentFamilySummary(sides, kids.length - sides, needs, running, tr);
     }
     // A folded family also shows the state of its children, as the core sorts it and the Needs you section lists it.
     const state = this.workspace.familyState(row) || presentation.rawStatus;
@@ -480,7 +569,10 @@ export struct AgentListPage {
     presentation.subagents = runningSubagents(presentation.data);
     presentation.recentContent = content;
     presentation.place = [this.mixedHubs ? hub : '', machine].filter((value: string) => !!value).join(' · ');
-    presentation.metadata = [hub, machine, shortPath, state, content];
+    const previous = presentation.metadata;
+    if (previous[0] !== hub || previous[1] !== machine || previous[2] !== shortPath || previous[3] !== state || previous[4] !== content) {
+      presentation.metadata = [hub, machine, shortPath, state, content];
+    }
     presentation.selectionKey = JSON.stringify(row.group ? [row.group, row.kind, row.manager, machineId, sessionId] : [row.kind, row.manager, machineId, sessionId]);
   }
 
@@ -508,10 +600,21 @@ export struct AgentListPage {
       .filter((row: ResourceRow) => this.workspace.includesHub(row.group));
   }
 
+  @Computed get selectedMachineName(): string {
+    const key = this.workspace.machineFilter;
+    if (!key) return '';
+    const row = this.machineOptions().find((item: ResourceRow) =>
+      this.workspace.machineIdentity(item) === key || item.id === key);
+    return row && row.title && row.title !== row.id ? row.title : '';
+  }
+
+  @Monitor('selectedMachineName','workspace.machineFilter') rememberSelectedMachine(): void {
+    this.workspace.rememberMachineName(this.workspace.machineFilter,this.selectedMachineName);
+  }
+
   private machineLabel(): string {
     if (!this.workspace.machineFilter) return tr('agent_filter_all_machines');
-    const row = this.machineOptions().find((item: ResourceRow) => this.workspace.machineIdentity(item) === this.workspace.machineFilter || item.id === this.workspace.machineFilter);
-    return row?.title || this.workspace.machineFilter;
+    return this.selectedMachineName || this.workspace.machineFilterName || tr('machine');
   }
 
   private machineIndex(): number {
@@ -524,13 +627,13 @@ export struct AgentListPage {
   private machineSelectOptions(): SelectOption[] {
     const options: SelectOption[] = [{ value: tr('agent_filter_all_machines') }];
     const hubs = new Set(this.machineOptions().map((row: ResourceRow) => row.group)).size > 1;
-    this.machineOptions().forEach((row: ResourceRow) => options.push({ value: [hubs ? this.model.groupName(row) : '', row.title || row.id].filter((value: string) => !!value).join(' · ') }));
+    this.machineOptions().forEach((row: ResourceRow) => options.push({ value: [hubs ? this.model.groupName(row) : '', row.title && row.title !== row.id ? row.title : tr('machine')].filter((value: string) => !!value).join(' · ') }));
     return options;
   }
 
   private selectMachine(index: number): void {
     const machine = index > 0 ? this.machineOptions()[index - 1] : undefined;
-    this.workspace.setMachineFilter(machine ? this.workspace.machineIdentity(machine) : '').catch(() => undefined);
+    this.workspace.setMachineFilter(machine ? this.workspace.machineIdentity(machine) : '', machine && machine.title !== machine.id ? machine.title : '').catch(() => undefined);
   }
 
   @Computed get availableGroupings(): string[] {
@@ -589,6 +692,15 @@ export struct AgentListPage {
       } } });
   }
 
+  private async triggerAutoRename(row: ResourceRow): Promise<void> {
+    const label = row.title || tr('agent_untitled');
+    const err = await this.model.autoRenameAgent(row);
+    if (err && this.active) {
+      Haptics.error();
+      toastCenter.error(trError(err) + ' · ' + label);
+    }
+  }
+
   @Builder rowMenu(binding:BoundAgentRow) { this.sessionMenu(binding.bound.value,binding.presentation.spaceName) }
   @Builder sessionMenu(row:ResourceRow,spaceName:string) {
     Menu() {
@@ -613,6 +725,12 @@ export struct AgentListPage {
         .enabled(!this.workspace.busy).onClick(() => this.workspace.markSeen(row).catch(() => undefined))
       if (this.workspace.canRename(row)) MenuItem({ content: tr('rename') }).enabled(!this.workspace.busy)
         .onClick(() => this.openRename(row))
+      if (this.model.canAutoRenameAgent(row)) {
+        MenuItem({ content: tr('agent_auto_rename') })
+          .enabled(!this.workspace.busy && !this.model.isAutoRenamingRow(row))
+          .onClick(() => { void this.triggerAutoRename(row); })
+          .id('agents.menu.autoname')
+      }
       if (this.workspace.canClose(row)) MenuItem({ content: tr('close') }).enabled(!this.workspace.busy)
         .onClick(() => this.confirmClose(row))
       if (this.workspace.canDelete(row)) MenuItem({ content: tr('delete') }).enabled(!this.workspace.busy)
@@ -656,7 +774,7 @@ export struct AgentListPage {
             .padding({left:6,right:6}).height(PhoneStyle.formSize(18.33,25.67,this.environment.fontScale))
             .constraintSize({minWidth:PhoneStyle.formSize(20.33,23.67,this.environment.fontScale)})
             .backgroundColor(Colors.systemControls && Colors.styleID==='glass' ? $r('app.color.phone_agent_count_fill') : Colors.control)
-            .borderRadius(20)
+            .borderRadius(Tokens.radiusCapsule)
         }
         Blank().layoutWeight(1)
         if (binding.value.folded) SymbolGlyph(Symbols.expand).fontSize(Tokens.interfaceFontVp(12,this.environment.fontScale)).fontColor([Colors.tertiary])
@@ -707,9 +825,6 @@ export struct AgentListPage {
       this.needsYouHeader(binding)
     }.width('100%').padding({left:this.floatingStatusCards?16:4,right:this.floatingStatusCards?16:4,top:20})
     else Column({ space: 4 }) {
-      if (binding.value.parent === 'quiet') {
-        Text(tr('agent_group_quiet_spaces')).fontSize(15).maxFontScale(Tokens.interfaceScaleFor(15)).fontWeight(FontWeight.Medium).fontColor(Colors.ink).width('100%')
-      }
       Button({ type: ButtonType.Normal }) {
         Row({ space: 6 }) {
           Text(this.groupTitle(binding.value))
@@ -726,8 +841,8 @@ export struct AgentListPage {
     }.width('100%').padding({ top: 6 }).alignItems(HorizontalAlign.Start)
   }
   @Builder activityTotal(value:number) {
-    Text(String(value)).fontSize(13).maxFontScale(Tokens.interfaceScaleFor(13)).fontWeight(600).fontColor(Colors.secondary)
-      .padding({left:6,right:6,top:1,bottom:1}).backgroundColor(Colors.control).borderRadius(9)
+    Text(String(value)).fontSize(Tokens.typeCaption).maxFontScale(Tokens.interfaceScaleFor(Tokens.typeCaption)).fontWeight(600).fontColor(Colors.secondary)
+      .padding({left:6,right:6,top:1,bottom:1}).backgroundColor(Colors.control).borderRadius(Tokens.radiusBadge)
   }
 
   /** By Status sections, Pinned and Needs you say how many rows they hold, as iOS's section headers. */
@@ -923,32 +1038,8 @@ export struct AgentListPage {
   @Builder needsYouCards(binding:BoundAgentRow) {
     ListItem() {
       Column() {
-        Column() {
-          ForEach(this.decisions.forSession(this.model,binding.bound.value),(card:AgentDecisionCard,index:number) => {
-            Column({space:12}) {
-              Button({type:ButtonType.Normal}) {
-                Row({space:8}) {
-                  AgentNeedsYouMark({kind:card.request.kind,fontScale:this.environment.fontScale,surface:Colors.surface})
-                  Column({space:2}) {
-                    Text(this.cardTitle(card,binding)).fontSize(17).maxFontScale(Tokens.interfaceFontMaxScale).fontWeight(600)
-                      .lineHeight(PhoneStyle.settingsExampleLineHeight(20.33,27.67,this.environment.fontScale)).maxLines(2).fontColor(Colors.ink)
-                    if (!index) Text([this.rowTitle(binding),this.model.machineName(card.machine)].filter((v:string)=>!!v).join(' · '))
-                      .fontSize(12).maxFontScale(Tokens.interfaceScaleFor(12)).lineHeight(PhoneStyle.settingsExampleLineHeight(14.33,21.67,this.environment.fontScale))
-                      .fontColor(Colors.secondary).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis})
-                  }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                  SymbolGlyph(Symbols.expand).fontSize(Tokens.interfaceFontVp(12,this.environment.fontScale)).fontWeight(600).fontColor([Colors.tertiary])
-                }.width('100%')
-              }.width('100%').constraintSize({minHeight:0}).padding(0).backgroundColor(Color.Transparent)
-                .responseRegion([{x:0,y:-12,width:'100%',height:44},{x:0,y:0,width:'100%',height:'100%'}])
-                .onClick(() => this.openRow(binding.bound.value)).id('agents.request.'+card.request.id)
-              if (card.preview) Text(this.decisionPreview(card)).fontSize(17).maxFontScale(Tokens.interfaceFontMaxScale).fontColor(Colors.ink)
-                .lineSpacing(LengthMetrics.vp(PhoneStyle.sidebarMetric(17*(1.45-1.19),this.environment.fontScale)),{onlyBetweenLines:true})
-                .lineHeight(PhoneStyle.settingsExampleLineHeight(20.33,27.67,this.environment.fontScale)).maxLines(3).textAlign(TextAlign.Start)
-                .width('100%').onClick(() => this.openRow(binding.bound.value)).id('agents.preview.'+card.request.id)
-              if (card.quickOptions().length) this.decisionChoices(card,binding)
-            }.width('100%').alignItems(HorizontalAlign.Start).padding({left:20,right:20,top:index===0?19:20})
-          },(card:AgentDecisionCard) => card.key+card.request.raw)
-        }.width('100%').padding({bottom:19})
+        AgentFamilyLine({workspace:this.workspace,row:binding.bound.value,preferTab:this.model.directoryOwnerFor(binding.bound.value)?.useHerdrTabName ?? this.model.useHerdrTabName,inset:20,expandable:this.workspace.groupingMode==='state',
+          open:() => this.openRow(binding.bound.value),content:() => { this.decisionContent(binding) }})
         if (!this.detachedDecisionRows && !this.endsSurface(binding,'state/needs')) {
           Divider().strokeWidth(1).color(Colors.systemControls && Colors.styleID==='glass' ?
             $r('app.color.phone_agent_session_separator') : Colors.divider).margin({left:20,right:20})
@@ -967,11 +1058,45 @@ export struct AgentListPage {
       .id('agent.'+binding.bound.value.group+'.'+binding.bound.value.manager+'.'+binding.bound.value.machine+'.'+binding.bound.value.id)
   }
 
+  @Builder decisionContent(binding:BoundAgentRow) {
+    Column() {
+      ForEach(this.decisions.forSession(this.model,binding.bound.value),(card:AgentDecisionCard,index:number) => {
+        Column({space:12}) {
+          Button({type:ButtonType.Normal}) {
+            Row({space:8}) {
+              AgentNeedsYouMark({kind:card.request.kind,fontScale:this.environment.fontScale,surface:Colors.surface})
+              Column({space:2}) {
+                Text(this.cardTitle(card,binding)).fontSize(17).maxFontScale(Tokens.interfaceFontMaxScale).fontWeight(600)
+                  .lineHeight(PhoneStyle.settingsExampleLineHeight(20.33,27.67,this.environment.fontScale)).maxLines(2).fontColor(Colors.ink)
+                if (!index) Text([this.rowTitle(binding),this.model.machineName(card.machine)].filter((v:string)=>!!v).join(' · '))
+                  .fontSize(12).maxFontScale(Tokens.interfaceScaleFor(12)).lineHeight(PhoneStyle.settingsExampleLineHeight(14.33,21.67,this.environment.fontScale))
+                  .fontColor(Colors.secondary).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis})
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+              SymbolGlyph(Symbols.expand).fontSize(Tokens.interfaceFontVp(12,this.environment.fontScale)).fontWeight(600).fontColor([Colors.tertiary])
+            }.width('100%')
+          }.width('100%').constraintSize({minHeight:0}).padding(0).backgroundColor(Color.Transparent)
+            .responseRegion([{x:0,y:-12,width:'100%',height:44},{x:0,y:0,width:'100%',height:'100%'}])
+            .onClick(() => this.openRow(binding.bound.value)).id('agents.request.'+card.request.id)
+          if (card.preview) Text(this.decisionPreview(card)).fontSize(17).maxFontScale(Tokens.interfaceFontMaxScale).fontColor(Colors.ink)
+            .lineSpacing(LengthMetrics.vp(PhoneStyle.sidebarMetric(17*(1.45-1.19),this.environment.fontScale)),{onlyBetweenLines:true})
+            .lineHeight(PhoneStyle.settingsExampleLineHeight(20.33,27.67,this.environment.fontScale)).maxLines(3).textAlign(TextAlign.Start)
+            .width('100%').onClick(() => this.openRow(binding.bound.value)).id('agents.preview.'+card.request.id)
+          if (card.quickOptions().length) this.decisionChoices(card,binding)
+        }.width('100%').alignItems(HorizontalAlign.Start).padding({left:20,right:20,top:index===0?19:20})
+      },(card:AgentDecisionCard) => card.key+card.request.raw)
+    }.width('100%').padding({bottom:19})
+  }
+
+  private familySortRow(binding: BoundAgentRow): ResourceRow {
+    const row = binding.bound.value;
+    return binding.presentation.indented ? this.workspace.relations.root(row) || row : row;
+  }
+
   @Computed get orderedNeedsRows():BoundAgentRow[] {
     const group=this.groupBindings.find((item:BoundAgentGroup):boolean=>item.value.id==='state/needs');
     if (!group) return [];
     return group.rows.slice().sort((a:BoundAgentRow,b:BoundAgentRow) =>
-      this.decisions.waitingSince(this.model,a.bound.value)-this.decisions.waitingSince(this.model,b.bound.value));
+      this.decisions.waitingSince(this.model,this.familySortRow(a))-this.decisions.waitingSince(this.model,this.familySortRow(b)));
   }
   @Computed get detachedDecisionRows():boolean { return this.floatingStatusCards || this.displayedAgentStyle==='beautiful'; }
   private displayRows(group:BoundAgentGroup):BoundAgentRow[] {
@@ -983,12 +1108,12 @@ export struct AgentListPage {
   private endsSurface(row:BoundAgentRow,id:string):boolean {
     return this.compactRoot && !this.rail && id==='state/needs' ? this.orderedNeedsRows[this.orderedNeedsRows.length-1]===row : row.last;
   }
-  @Builder groupRow(binding:BoundAgentRow,groupId:string,endOfSurface:boolean=true) {
+  @Builder groupRow(binding:BoundAgentRow,groupId:string,endOfSurface:boolean=true,underProject:boolean=false) {
     if (this.compactRoot && !this.rail && groupId==='state/needs' && this.decisions.forSession(this.model,binding.bound.value).length)
       this.needsYouCards(binding)
     else if (this.compactRoot && !this.rail && binding.presentation.activity)
-      this.activityRow(binding,groupId,endOfSurface)
-    else this.agentRow(binding,groupId)
+      this.activityRow(binding,groupId,endOfSurface,0,underProject)
+    else this.agentRow(binding,groupId,0,underProject,!underProject || endOfSurface)
   }
   @Computed get floatingStatusCards():boolean {
     return this.compactRoot && !this.rail && this.displayedAgentStyle==='cards';
@@ -1001,27 +1126,41 @@ export struct AgentListPage {
     const place=[value.spaceName,agent.tab !== value.spaceName ? agent.tab : ''].filter((part:string)=>!!part).join(' › ');
     return [place,this.mixedMachines ? value.metadata[1] : ''].filter((part:string)=>!!part).join(' · ');
   }
-  @Builder activityRow(binding:BoundAgentRow,groupId:string,endOfSurface:boolean,depth:number=0) {
-    ListItem() {
-      Column() {
-        AgentDirectoryRowContent({agent:binding.presentation.activity!,display:this.displayedAgentStyle,muted:this.workspace.isMuted(binding.bound.value),
-          hideState:groupId.startsWith('state/') && groupId!=='state/muted',age:this.rowTime(binding.presentation),place:this.activityPlace(binding,groupId),
-          showsSource:!!binding.presentation.activitySource,sourceTitle:binding.presentation.activitySource ? tr(binding.presentation.activitySource) : '',
-          narrow:this.listWidth>0 && this.listWidth<296,leftInset:(groupId.includes('/project/') ? 36 : 20)+16*depth,
-          controlScale:Math.max(1,Math.min(this.environment.fontScale,67/51)),fontScale:this.environment.fontScale,
-          tint:this.rowStatusColor(binding.presentation),activityList:true,useHerdrTabName:this.model.directoryOwnerFor(binding.bound.value)?.useHerdrTabName ?? this.model.useHerdrTabName})
-      }.width('100%').backgroundColor(this.isRowSelected(binding) ? Colors.selection : this.displayedAgentStyle==='cards'?Colors.grouped:Colors.surface)
-       .borderRadius({topLeft:this.startsSurface(binding,groupId) && !groupId.includes('/project/') ? 26:0,topRight:this.startsSurface(binding,groupId) && !groupId.includes('/project/') ? 26:0,
-         bottomLeft:this.endsSurface(binding,groupId) && endOfSurface ? 26:0,bottomRight:this.endsSurface(binding,groupId) && endOfSurface ? 26:0})
-    }.margin({left:this.floatingStatusCards?0:4,right:this.floatingStatusCards?0:4}).accessibilityGroup(true)
-      .accessibilityText([binding.presentation.provider,this.rowStatus(binding.presentation),
-        this.rowTitle(binding),
+  @Builder activitySession(binding:BoundAgentRow,groupId:string,depth:number,hasDisclosure:boolean) {
+    Column() {
+      AgentDirectoryRowContent({agent:binding.presentation.activity!,display:this.displayedAgentStyle,hasFamilyControl:hasDisclosure,muted:binding.presentation.muted,
+        hideState:groupId.startsWith('state/') && groupId!=='state/muted',age:this.rowTime(binding.presentation),place:this.activityPlace(binding,groupId),
+        showsSource:!!binding.presentation.activitySource,sourceTitle:binding.presentation.activitySource ? tr(binding.presentation.activitySource) : '',
+        narrow:this.listWidth>0 && this.listWidth<296,leftInset:(groupId.includes('/project/') ? 36 : 20)+16*Math.max(depth,binding.presentation.indented ? 1 : 0),
+        controlScale:Math.max(1,Math.min(this.environment.fontScale,67/51)),fontScale:this.environment.fontScale,
+        tint:this.rowStatusColor(binding.presentation),activityList:true,active:this.active,nestedSession:binding.presentation.indented,renaming:!!(this.model.namingAgentKeys && this.model.namingAgentKeys.length > 0 && this.model.isAutoRenamingRow(binding.bound.value)),useHerdrTabName:this.model.directoryOwnerFor(binding.bound.value)?.useHerdrTabName ?? this.model.useHerdrTabName})
+    }.width('100%').accessibilityGroup(true)
+      .accessibilityText([binding.presentation.provider,this.rowStatus(binding.presentation),this.rowTitle(binding),binding.presentation.rootTitle,
         this.rowTime(binding.presentation),binding.presentation.recentContent,binding.presentation.activitySource ? tr(binding.presentation.activitySource) : '',
         this.activityPlace(binding,groupId),binding.presentation.activity?.model || '',binding.presentation.activity?.todoTitle || ''].filter((part:string)=>!!part).join(' · '))
-      .selectable(true).selected(this.isRowSelected(binding)).onClick(()=>this.openRow(binding.bound.value))
-      .onVisibleAreaChange([0,1],(visible:boolean,ratio:number)=>this.onVisible(binding.bound.value,visible ? ratio : 0))
-      .onDisAppear(()=>this.onVisible(binding.bound.value,0)).bindContextMenu(this.rowMenu(binding),ResponseType.LongPress)
+      .onClick(()=>this.openRow(binding.bound.value)).bindContextMenu(this.rowMenu(binding),ResponseType.LongPress)
       .id('agent.'+binding.bound.value.group+'.'+binding.bound.value.manager+'.'+binding.bound.value.machine+'.'+binding.bound.value.id)
+  }
+
+  @Builder activityRow(binding:BoundAgentRow,groupId:string,endOfSurface:boolean,depth:number=0,underProject:boolean=false) {
+    ListItem() {
+      Column() {
+        if (binding.presentation.familySummary || binding.presentation.rootTitle || binding.presentation.subagents > 0) {
+          AgentFamilyLine({ workspace:this.workspace, row:binding.bound.value,
+            preferTab:this.model.directoryOwnerFor(binding.bound.value)?.useHerdrTabName ?? this.model.useHerdrTabName,
+            inset:(groupId.includes('/project/') ? 36 : 20) + 16*Math.max(depth,binding.presentation.indented ? 1 : 0),
+            expandable:groupId!=='state/needs' || this.workspace.groupingMode==='state',open:() => this.openRow(binding.bound.value),
+            accessoryTime:this.displayedAgentStyle==='avatar' ? this.rowTime(binding.presentation) : '',
+            content:(shown:boolean) => { this.activitySession(binding,groupId,depth,shown) } })
+        } else {
+          this.activitySession(binding,groupId,depth,false)
+        }
+      }.width('100%').backgroundColor(this.isRowSelected(binding) ? Colors.selection : this.displayedAgentStyle==='cards'?Colors.grouped:Colors.surface)
+       .borderRadius({topLeft:!underProject && this.startsSurface(binding,groupId) && !groupId.includes('/project/') ? 26:0,topRight:!underProject && this.startsSurface(binding,groupId) && !groupId.includes('/project/') ? 26:0,
+         bottomLeft:this.endsSurface(binding,groupId) && endOfSurface ? 26:0,bottomRight:this.endsSurface(binding,groupId) && endOfSurface ? 26:0})
+    }.margin({left:this.floatingStatusCards && !underProject ? 0 : 4,right:this.floatingStatusCards && !underProject ? 0 : 4}).selectable(true).selected(this.isRowSelected(binding))
+      .onVisibleAreaChange([0,1],(visible:boolean,ratio:number)=>this.onVisible(binding.bound.value,visible ? ratio : 0))
+      .onDisAppear(()=>this.onVisible(binding.bound.value,0))
   }
 
   @Builder taskRow(row:ResourceRow,depth:number) {
@@ -1051,7 +1190,7 @@ export struct AgentListPage {
     return presentation.subagents > 0 && !presentation.familySummary ? tr('agent_subagents_running').replace('{count}', String(presentation.subagents)) : '';
   }
 
-  @Builder agentRow(binding: BoundAgentRow, groupId: string, depth:number=0) {
+  @Builder agentRow(binding: BoundAgentRow, groupId: string, depth:number=0,underProject:boolean=false,endOfSurface:boolean=true) {
     ListItem() {
       Column() {
         Row({ space: 12 }) {
@@ -1063,12 +1202,12 @@ export struct AgentListPage {
                 Image($r('app.media.project_agent_claude')).width(18).height(18).objectFit(ImageFit.Contain)
               } else if (binding.presentation.provider) {
                 Text(binding.presentation.provider.slice(0, 1).toUpperCase()).fontSize('16vp').fontWeight(binding.presentation.status === 'unread' && !binding.presentation.muted ? FontWeight.Bold : FontWeight.Medium).fontColor(Colors.ink)
-              } else SymbolGlyph(Symbols.agent).fontSize('18vp').fontColor([this.rowStatusColor(binding.presentation)])
-            }.width(32).height(32).backgroundColor(Colors.control).borderRadius(9).opacity(binding.presentation.muted ? Tokens.mutedOpacity : 1)
+              } else SymbolGlyph(Symbols.agent).fontSize('17vp').fontColor([this.rowStatusColor(binding.presentation)])
+            }.width(36).height(36).backgroundColor(Colors.subtle).borderRadius(Tokens.radiusCapsule).opacity(binding.presentation.muted ? Tokens.mutedOpacity : 1)
             if (binding.presentation.tone === 'needs_you' && this.active && !this.environment.reduceMotion) {
               NeedsYouPulseDot({ dotSize: 10, tint: Colors.needs, surface: Colors.surface, bordered: true }).offset({ x: 3, y: 3 })
-            } else if (binding.presentation.tone === 'working' && this.active && !this.environment.reduceMotion) {
-              WorkingArcSpinner({ diameter: 16, tint: Colors.working, surface: Colors.surface, showCoreDot: true }).offset({ x: 4, y: 4 })
+            } else if (binding.presentation.tone === 'working') {
+              SessionWorkingDot({ diameter: 14, tint: Colors.working, surface: Colors.surface, active: this.active }).offset({ x: 4, y: 4 })
             } else if (binding.presentation.tone) {
               AgentStateMark({ tone: binding.presentation.tone })
             }
@@ -1087,18 +1226,18 @@ export struct AgentListPage {
                   .maxLines(this.narrowRow() ? 4 : this.look.density === 'compact' ? 1 : 2).textOverflow({ overflow: TextOverflow.Ellipsis })
                 if (!this.narrowRow() && binding.presentation.status === 'needs_you') {
                   Text(tr('needs_you')).fontSize(11).maxFontScale(Tokens.interfaceScaleFor(11)).fontWeight(FontWeight.Medium).fontColor(Colors.needs)
-                    .padding({ left: 6, right: 6, top: 2, bottom: 2 }).backgroundColor(Colors.selection).borderRadius(6).maxLines(1)
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 }).backgroundColor(Colors.selection).borderRadius(Tokens.radiusBadge).maxLines(1)
                 }
               }.width('100%').alignItems(VerticalAlign.Top)
             } else if (!this.narrowRow() && binding.presentation.status === 'needs_you') {
               Text(tr('needs_you')).fontSize(11).maxFontScale(Tokens.interfaceScaleFor(11)).fontWeight(FontWeight.Medium).fontColor(Colors.needs)
-                .padding({ left: 6, right: 6, top: 2, bottom: 2 }).backgroundColor(Colors.selection).borderRadius(6).maxLines(1)
+                .padding({ left: 6, right: 6, top: 2, bottom: 2 }).backgroundColor(Colors.selection).borderRadius(Tokens.radiusBadge).maxLines(1)
             }
           if (binding.presentation.rootTitle) {
             Row({space:Tokens.fine}) {
               if (binding.presentation.relativeKind === 'subtask') ToolGlyph({name:'agent', glyphSize:Tokens.meta, ink:Colors.teal})
-              Text(tr(binding.presentation.relativeKind === 'side' ? 'relation_side' : 'relation_task') +
-                (binding.presentation.indented ? '' : ' · ' + tr('relation_root') + ' · ' + binding.presentation.rootTitle))
+              Text(tr('agent_family_owner').replace('{kind}',tr(binding.presentation.relativeKind === 'side' ? 'relation_side' : 'relation_task'))
+                .replace('{parent}',binding.presentation.rootTitle))
                 .fontSize(Tokens.caption).fontColor(Colors.secondary).layoutWeight(1).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis})
             }.width('100%')
           }
@@ -1108,22 +1247,16 @@ export struct AgentListPage {
               Text(this.rowTime(binding.presentation)).fontSize(13).maxFontScale(Tokens.interfaceScaleFor(13)).fontColor(Colors.secondary)
             }
           }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-          if (!this.rail) SymbolGlyph(Symbols.expand).fontSize('12vp').fontColor([Colors.tertiary])
+          if (!this.rail && binding.presentation.familySummary) {
+            Column() {
+              FamilyDisclosureButton({ label:tr(binding.presentation.familyKind), count:binding.presentation.familyCount, summary:binding.presentation.familySummary, expanded:this.workspace.familyExpanded(binding.bound.value),
+                identity:binding.bound.value.key(), owner:this.rowTitle(binding), toggle:() => this.toggleFamilyRow(binding.bound.value) })
+            }.constraintSize({maxWidth:'36%'})
+          } else if (!this.rail) SymbolGlyph(Symbols.expand).fontSize('12vp').fontColor([Colors.tertiary])
         }.width('100%').alignItems(VerticalAlign.Center).justifyContent(this.rail ? FlexAlign.Center : FlexAlign.Start)
           .padding({ left: this.rail ? 5 : binding.presentation.indented ? 13 + Tokens.section : 13, right: this.rail ? 5 : 11,
             top: this.look.density === 'compact' ? 7 : 10, bottom: this.look.density === 'compact' ? 7 : 10 })
-      if (!this.rail && binding.presentation.familySummary) {
-        Button({type:ButtonType.Normal,buttonStyle:ButtonStyleMode.TEXTUAL}) {
-          Row({space:Tokens.fine}) {
-            if (binding.presentation.familyHasTasks) ToolGlyph({name:'agent', glyphSize:Tokens.meta, ink:Colors.teal})
-            Text(binding.presentation.familySummary).fontSize(Tokens.caption).fontColor(Colors.secondary)
-            SymbolGlyph(binding.presentation.familyExpanded ? Symbols.up : Symbols.down).fontSize(Tokens.caption).fontColor([Colors.secondary])
-          }
-        }.alignSelf(ItemAlign.Start).margin({left:Tokens.page + Tokens.avatar}).padding({left:Tokens.gap,right:Tokens.gap})
-          .constraintSize({minHeight:Tokens.touch}).backgroundColor(Color.Transparent)
-          .accessibilityText(binding.presentation.familySummary + ' ' + tr(binding.presentation.familyExpanded ? 'agent_collapse' : 'agent_expand'))
-          .onClick(() => this.toggleFamilyRow(binding.bound.value)).id('agents.family.' + binding.bound.value.key())
-      }
+
         if (!this.endsSurface(binding,groupId) && !this.rail) Divider().strokeWidth(0.5).color(Colors.divider).margin({ left: 57 })
       }.width('100%')
     }.accessibilityGroup(true).accessibilityText(this.rowSpoken(binding))
@@ -1131,22 +1264,22 @@ export struct AgentListPage {
       .backgroundColor(this.isRowSelected(binding) ? Colors.selection : Colors.surface)
       .border({
         width: {
-          top: this.startsSurface(binding, groupId) ? PhoneStyle.surfaceEdgeWidth(0.5) : 0,
-          bottom: this.endsSurface(binding, groupId) ? PhoneStyle.surfaceEdgeWidth(0.5) : 0,
+          top: !underProject && this.startsSurface(binding, groupId) ? PhoneStyle.surfaceEdgeWidth(0.5) : 0,
+          bottom: endOfSurface && this.endsSurface(binding, groupId) ? PhoneStyle.surfaceEdgeWidth(0.5) : 0,
           left: PhoneStyle.surfaceEdgeWidth(0.5),
           right: PhoneStyle.surfaceEdgeWidth(0.5)
         },
         color: PhoneStyle.cardBorder(this.environment.dark),
         radius: {
-          topLeft: this.startsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0,
-          topRight: this.startsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0,
-          bottomLeft: this.endsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0,
-          bottomRight: this.endsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0
+          topLeft: !underProject && this.startsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0,
+          topRight: !underProject && this.startsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0,
+          bottomLeft: endOfSurface && this.endsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0,
+          bottomRight: endOfSurface && this.endsSurface(binding, groupId) ? PhoneStyle.cardRadius : 0
         }
       })
-      .borderRadius({ topLeft: this.startsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0, topRight: this.startsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0,
-        bottomLeft: this.endsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0, bottomRight: this.endsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0 })
-      .shadow(this.endsSurface(binding, groupId) ? PhoneStyle.cardElevation(this.environment.dark) : { radius: 0, color: Color.Transparent })
+      .borderRadius({ topLeft: !underProject && this.startsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0, topRight: !underProject && this.startsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0,
+        bottomLeft: endOfSurface && this.endsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0, bottomRight: endOfSurface && this.endsSurface(binding,groupId) ? PhoneStyle.cardRadius : 0 })
+      .shadow(endOfSurface && this.endsSurface(binding, groupId) ? PhoneStyle.cardElevation(this.environment.dark) : { radius: 0, color: Color.Transparent })
       .onClick(() => this.openRow(binding.bound.value))
       .onVisibleAreaChange([0, 1], (visible: boolean, ratio: number) => this.reportVisible(binding.bound.value, groupId === NEEDS_GROUP ? NEEDS_GROUP : 'list', visible ? ratio : 0))
       .onDisAppear(() => this.reportVisible(binding.bound.value, groupId === NEEDS_GROUP ? NEEDS_GROUP : 'list', 0))
@@ -1170,6 +1303,9 @@ export struct AgentListPage {
   }
 
   private rowTitle(binding: BoundAgentRow): string {
+    if (this.model.namingAgentKeys && this.model.namingAgentKeys.length > 0 && this.model.isAutoRenamingRow(binding.bound.value)) {
+      return tr('agent_renaming');
+    }
     const preferTab = this.model.directoryOwnerFor(binding.bound.value)?.useHerdrTabName ?? this.model.useHerdrTabName;
     if (preferTab && binding.presentation.herdrTabName) {
       return binding.presentation.herdrTabName;
@@ -1315,7 +1451,9 @@ export struct AgentListPage {
   @Computed get shownQuickFilters(): string[] {
     const counts = this.workspace.filterCounts;
     const known = this.workspace.quickCountsKnown();
-    return QUICK_FILTERS.filter((key: string) => !known || key === 'all' || key === this.workspace.quickFilter || Wire.number(counts,key)>0);
+    // A core can return only the two pane-source counts. A missing status still has a usable filter.
+    return QUICK_FILTERS.filter((key: string) => !known || key === 'all' || key === this.workspace.quickFilter ||
+      typeof counts[key] !== 'number' || Wire.number(counts,key) > 0);
   }
   private quickHeight(): number { return PhoneStyle.formSize(44,57.7,this.environment.fontScale); }
   private setSearchEditing(editing:boolean): void {
@@ -1398,14 +1536,9 @@ export struct AgentListPage {
   private revealQuickFilter(key: string): void {
     const index = this.shownQuickFilters.indexOf(key);
     if (index < 0) return;
-    try {
-      const targetX = Math.max(0, index * 72 - 48);
-      this.quickScroller.scrollTo({
-        xOffset: targetX,
-        yOffset: 0,
-        animation: this.environment.reduceMotion ? false : { duration: MotionTokens.stateMs, curve: Curve.EaseOut }
-      });
-    } catch (_) {}
+    const chip = this.quickScroller.getItemRect(index);
+    if (chip.width > 0 && chip.x >= 0 && chip.x + chip.width <= this.quickViewportWidth) return;
+    this.quickScroller.scrollToIndex(index, !this.environment.reduceMotion, ScrollAlign.AUTO);
   }
 
   private confirmMarkAllSeen(): void {
@@ -1458,9 +1591,9 @@ export struct AgentListPage {
       .width('100%')
       .padding(0)
       .backgroundColor(Colors.surface)
-      .border({ width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.cardBorder(this.environment.dark), radius: this.compactRoot && !this.rail ? 22 : 13 })
+      .border({ width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.cardBorder(this.environment.dark), radius: this.compactRoot && !this.rail ? Tokens.radiusPanel : Tokens.radiusCard })
       .shadow(PhoneStyle.cardElevation(this.environment.dark))
-      .borderRadius(this.compactRoot && !this.rail ? 22 : 13)
+      .borderRadius(this.compactRoot && !this.rail ? Tokens.radiusPanel : Tokens.radiusCard)
       .enabled(!this.workspace.busy)
       .accessibilityText(tr('agent_mark_all_seen') + ' · ' + String(this.workspace.unreadToMark().length))
       .onClick(() => this.confirmMarkAllSeen())
@@ -1483,63 +1616,50 @@ export struct AgentListPage {
         else this.searchControl()
       }
       Row({ space: this.compactRoot ? 0 : 6 }) {
-        Stack({ alignContent: Alignment.End }) {
-          Scroll(this.quickScroller) {
-            Row({ space: 4 }) {
-              ForEach(this.shownQuickFilters, (key: string) => {
-                Button({ type: ButtonType.Capsule }) {
-                  Row({space:4}) {
-                    if (key !== 'all' && key !== 'feishu' && key !== 'terminal') Circle().width(5).height(5)
-                      .fill(key === 'needsYou' ? Colors.needs : key === 'unread' ? Colors.unread : key === 'working' ? Colors.working : Colors.secondary)
-                    Text(tr(QUICK_LABELS[key])).fontSize(Tokens.interfaceFontVp(15,this.environment.fontScale))
-                      .fontWeight(this.workspace.quickFilter === key ? FontWeight.Bold : FontWeight.Normal)
-                      .fontColor(this.workspace.quickFilter === key ? Colors.link : Colors.ink).maxLines(1)
-                    if (key !== 'all' && this.workspace.filterCounts[key] !== undefined) Text(String(Wire.number(this.workspace.filterCounts,key)))
-                      .fontSize(Tokens.interfaceFontVp(15,this.environment.fontScale)).fontWeight(FontWeight.Medium).fontColor(Colors.secondary)
-                  }.padding({left:8,right:8,top:4,bottom:4}).borderRadius(40)
-                    .backgroundColor(this.compactRoot && this.workspace.quickFilter === key ? Colors.selection : Color.Transparent)
-                    .animation(Motion.state(this.environment.reduceMotion))
+        List({ scroller: this.quickScroller, space: Tokens.spaceXs }) {
+          ForEach(this.shownQuickFilters, (key: string) => {
+            ListItem() {
+              Button({ type: ButtonType.Capsule, stateEffect: false }) {
+                Row({ space: Tokens.spaceXs }) {
+                  if (key !== 'all' && key !== 'feishu' && key !== 'terminal') Circle().width(5).height(5)
+                    .fill(key === 'needsYou' ? Colors.needs : key === 'unread' ? Colors.unread : key === 'working' ? Colors.working : Colors.secondary)
+                  Text(tr(QUICK_LABELS[key])).fontSize(Tokens.interfaceFontVp(15,this.environment.fontScale))
+                    .fontWeight(FontWeight.Medium).fontColor(this.workspace.quickFilter === key ? Colors.link : Colors.ink).maxLines(1)
+                  if (key !== 'all' && typeof this.workspace.filterCounts[key] === 'number') Text(String(Wire.number(this.workspace.filterCounts,key)))
+                    .fontSize(Tokens.interfaceFontVp(15,this.environment.fontScale)).fontWeight(FontWeight.Medium).fontFeature('tnum 1')
+                    .fontColor(this.workspace.quickFilter === key ? Colors.link : Colors.secondary)
                 }
-                  .height(this.quickHeight()).constraintSize({minWidth:this.quickHeight()}).padding(0)
-                  .backgroundColor(this.compactRoot ? Color.Transparent : this.workspace.quickFilter === key ? Colors.selection : Colors.control)
-                  .animation(Motion.state(this.environment.reduceMotion))
-                  .accessibilityText(tr(QUICK_LABELS[key]))
-                  .accessibilityDescription(key !== 'all' && this.workspace.filterCounts[key] !== undefined ? String(Wire.number(this.workspace.filterCounts,key)) : '')
-                  .accessibilitySelected(this.workspace.quickFilter === key)
-                  .responseRegion({x:0,y:0,width:'100%',height:this.quickHeight()})
-                  .onClick(() => {
-                    Haptics.tap();
-                    Motion.run(this.getUIContext(), Motion.state(this.environment.reduceMotion), () => {
-                      this.workspace.setQuickFilter(key);
-                    });
-                    this.revealQuickFilter(key);
-                  }).id('agents.quick.' + key)
-              }, (key: string) => key)
-            }.padding({left:4,right:18})
-          }.width('100%').height(this.quickHeight()).align(Alignment.Start).scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off)
-            .id('agents.quick')
-          Row()
-            .width(24)
-            .height(this.quickHeight())
-            .linearGradient({
-              direction: GradientDirection.Right,
-              colors: this.compactRoot ? [
-                [this.environment.dark ? '#001C1C1E' : '#00FFFFFF', 0],
-                [this.environment.dark ? '#FF1C1C1E' : '#FFFFFFFF', 1]
-              ] : [
-                [this.environment.dark ? '#00000000' : '#00F2F2F7', 0],
-                [this.environment.dark ? '#FF000000' : '#FFF2F2F7', 1]
-              ]
-            })
-            .hitTestBehavior(HitTestMode.None)
-            .accessibilityLevel('no')
-        }.layoutWeight(1).height(this.quickHeight())
+                .backgroundColor(this.workspace.quickFilter === key ? Colors.selection : this.compactRoot ? Colors.surface : Colors.control)
+                .animation(this.workspace.quickFilter === key ? Motion.press(this.environment.reduceMotion) : undefined)
+                .borderRadius(Tokens.capsule)
+                .padding({ left: Tokens.spaceS, right: Tokens.spaceS, top: Tokens.spaceXs, bottom: Tokens.spaceXs })
+                .constraintSize({ minWidth: this.compactRoot ? 0 : this.quickHeight(), minHeight: this.compactRoot ? 0 : this.quickHeight() })
+              }
+              .height(this.quickHeight()).constraintSize({minWidth:this.quickHeight()}).padding(0).backgroundColor(Color.Transparent)
+              .accessibilityText(tr(QUICK_LABELS[key]))
+              .accessibilityDescription(key !== 'all' && typeof this.workspace.filterCounts[key] === 'number' ? String(Wire.number(this.workspace.filterCounts,key)) : '')
+              .accessibilitySelected(this.workspace.quickFilter === key)
+              .responseRegion({x:0,y:0,width:'100%',height:this.quickHeight()})
+              .onClick(() => {
+                Haptics.tap();
+                this.workspace.setQuickFilter(key);
+                this.revealQuickFilter(key);
+              }).id('agents.quick.' + key)
+            }
+          }, (key: string) => key)
+        }
+        .listDirection(Axis.Horizontal).alignListItem(ListItemAlign.Center).scrollBar(BarState.Off)
+        .contentStartOffset(Tokens.spaceXs).contentEndOffset(Tokens.spaceS)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(Tokens.spaceS) }).edgeEffect(EdgeEffect.None)
+        .layoutWeight(1).height(this.quickHeight())
+        .onSizeChange((_:SizeOptions,size:SizeOptions) => { this.quickViewportWidth = Number(size.width); })
+        .id('agents.quick')
         if (this.compactRoot) Divider().vertical(true).strokeWidth(0.5).height(22*this.quickHeight()/44).color(Colors.divider)
         this.filterControl()
-      }.width('100%').height(this.quickHeight()).borderRadius(this.compactRoot ? 44 : 0).clip(this.compactRoot)
+      }.width('100%').height(this.quickHeight()).borderRadius(this.compactRoot ? Tokens.radiusCapsule : 0).clip(this.compactRoot)
         .backgroundColor(this.compactRoot ? Colors.surface : Color.Transparent)
         .shadow(this.compactRoot ? PhoneStyle.cardElevation(this.environment.dark) : { radius: 0, color: Color.Transparent })
-        .outlineWidth(this.compactRoot ? 0.5 : 0).outlineColor(Colors.divider).outlineRadius(44)
+        .outlineWidth(this.compactRoot ? 0.5 : 0).outlineColor(Colors.divider).outlineRadius(Tokens.radiusCapsule)
       if (this.workspace.machineFilter) {
         Button({ type: ButtonType.Capsule }) {
           Row({ space: 5 }) {
@@ -1586,17 +1706,17 @@ export struct AgentListPage {
           .width(40)
           .height(40)
           .backgroundColor(this.isRowSelected(binding) ? Colors.selection : Colors.surface)
-          .borderRadius(20)
+          .borderRadius(Tokens.radiusCapsule)
           .border({
             width: this.isRowSelected(binding) ? 2 : PhoneStyle.surfaceEdgeWidth(0.5),
             color: this.isRowSelected(binding) ? Colors.link : Colors.divider,
-            radius: 20
+            radius: Tokens.radiusCapsule
           })
           .shadow(PhoneStyle.cardElevation(this.environment.dark))
           if (binding.presentation.status === 'needs_you') {
             NeedsYouPulseDot({ dotSize: 9, tint: Colors.needs, surface: Colors.grouped, bordered: true }).offset({ x: 3, y: 3 })
           } else if (binding.presentation.status === 'working') {
-            WorkingArcSpinner({ diameter: 14, tint: Colors.working, surface: Colors.grouped, showCoreDot: true }).offset({ x: 3, y: 3 })
+            SessionWorkingDot({ diameter: 13, tint: Colors.working, surface: Colors.grouped, active: this.active }).offset({ x: 3, y: 3 })
           } else if (binding.presentation.status === 'unread' || binding.presentation.status === 'done') {
             Circle().width(10).height(10).fill(Colors.unread)
               .stroke(Colors.grouped).strokeWidth(1.8)
@@ -1621,6 +1741,100 @@ export struct AgentListPage {
     .padding({ top: 3, bottom: 3 })
     .onVisibleAreaChange([0, 1], (visible: boolean, ratio: number) => this.onVisible(binding.bound.value, visible ? ratio : 0))
     .onDisAppear(() => this.onVisible(binding.bound.value, 0))
+  }
+
+  private hasGroupOverflow(group: BoundAgentGroup): boolean {
+    return group.value.presentation !== 'app-parent' && !group.value.folded &&
+      (group.value.capped || group.value.totalRowCount > group.value.rows.length);
+  }
+
+  @Computed get quietSpaceGroups(): BoundAgentGroup[] {
+    return this.groupBindings.filter((group: BoundAgentGroup) => group.value.parent === 'quiet');
+  }
+
+  @Computed get spaceListLines(): SpaceListLine[] {
+    const lines: SpaceListLine[] = [], next = new Map<string, SpaceListLine>();
+    const append = (kind: string, group: BoundAgentGroup, row?: BoundAgentRow): void => {
+      const key = row ? row.key : kind + '/' + group.key;
+      const old = this.spaceLineCache.get(key);
+      const line = old && old.group === group && old.row === row ? old : new SpaceListLine(kind,key,group,row);
+      next.set(key,line); lines.push(line);
+    };
+    const quiet = this.quietSpaceGroups;
+    const groups = this.groupBindings.filter((group: BoundAgentGroup) => group.value.parent !== 'quiet').concat(quiet);
+    for (const group of groups) {
+      if (group === quiet[0]) append('quiet',group);
+      append('header',group);
+      for (const row of this.displayRows(group)) append('session',group,row);
+      if (this.hasGroupOverflow(group)) append('more',group);
+    }
+    this.spaceLineCache = next;
+    return lines;
+  }
+
+  @Builder quietProject(group: BoundAgentGroup, first: boolean, last: boolean) {
+    ListItem() {
+      Column() {
+        if (!first) Divider().strokeWidth(0.5).color(Colors.divider).margin({left:48,right:Tokens.page})
+        Button({type:ButtonType.Normal}) {
+          Row({space:Tokens.inset}) {
+            SymbolGlyph(Symbols.folder).fontSize('16vp').fontColor([Colors.secondary])
+            Text(this.groupTitle(group.value)).fontSize(16).maxFontScale(Tokens.interfaceScaleFor(16))
+              .fontColor(Colors.ink).fontWeight(FontWeight.Medium).maxLines(2)
+              .textOverflow({overflow:TextOverflow.Ellipsis}).layoutWeight(1).textAlign(TextAlign.Start)
+            Text(String(group.value.totalRowCount)).fontSize(Tokens.toolLabel)
+              .maxFontScale(Tokens.interfaceScaleFor(13)).fontColor(Colors.secondary)
+            SymbolGlyph(group.value.folded ? Symbols.expand : Symbols.down).fontSize('11vp').fontColor([Colors.tertiary])
+          }.width('100%').constraintSize({minHeight:Tokens.touch}).padding({left:Tokens.page,right:Tokens.page,top:4,bottom:4})
+        }.width('100%').padding(0).backgroundColor(Color.Transparent)
+          .accessibilityText(this.groupTitle(group.value) + ' · ' + group.value.totalRowCount + ' · ' + tr(group.value.folded ? 'agent_expand' : 'agent_collapse'))
+          .onClick(() => this.toggleGroup(group.value.id)).id('agents.group.toggle.' + group.value.id)
+      }.width('100%').backgroundColor(Colors.surface)
+        .borderRadius({topLeft:first ? PhoneStyle.cardRadius : 0,topRight:first ? PhoneStyle.cardRadius : 0,
+          bottomLeft:last && !group.rows.length && !this.hasGroupOverflow(group) ? PhoneStyle.cardRadius : 0,
+          bottomRight:last && !group.rows.length && !this.hasGroupOverflow(group) ? PhoneStyle.cardRadius : 0})
+    }.margin({left:4,right:4}).id('agents.group.' + group.value.id)
+  }
+
+  @Builder groupOverflow(binding: BoundAgentGroup, quiet: boolean = false, lastQuiet: boolean = false) {
+    ListItem() {
+      Button() {
+        Row({ space: Tokens.gap }) {
+          Text(binding.value.capped ? (binding.value.rows.length === binding.value.totalRowCount ? tr('agent_collapse') :
+            tr('agent_show_all_count').replace('{count}',String(binding.value.totalRowCount))) :
+            String(binding.value.totalRowCount-binding.value.rows.length)+' '+tr('agent_group_more_idle'))
+            .fontSize(Tokens.meta).maxFontScale(Tokens.interfaceScaleFor(Tokens.meta)).fontColor(Colors.link).layoutWeight(1)
+          SymbolGlyph(Symbols.down).fontSize(Tokens.symbolFont).fontColor([Colors.link])
+        }.width('100%').padding(Tokens.page).constraintSize({ minHeight: Tokens.touch })
+      }.type(ButtonType.Normal).buttonStyle(ButtonStyleMode.TEXTUAL)
+          .backgroundColor(quiet ? Colors.surface : Color.Transparent).width('100%')
+          .borderRadius({bottomLeft:lastQuiet ? PhoneStyle.cardRadius : 0,bottomRight:lastQuiet ? PhoneStyle.cardRadius : 0})
+        .onClick(() => this.toggleIdle(binding.value.id)).id('agents.idle.expand.' + binding.value.id)
+    }.margin({left:quiet ? 4 : 0,right:quiet ? 4 : 0})
+  }
+
+  @Builder spaceListItem(line: SpaceListLine) {
+    if (line.kind === 'quiet') {
+      ListItem() {
+        Text(tr('agent_group_quiet_spaces')).fontSize(Tokens.toolLabel).maxFontScale(Tokens.interfaceScaleFor(13))
+          .fontWeight(FontWeight.Medium).fontColor(Colors.secondary)
+          .padding({left:Tokens.page,right:Tokens.page,top:Tokens.section,bottom:Tokens.gap})
+          .width('100%').textAlign(TextAlign.Start).id('agents.quiet.heading')
+      }
+    } else if (line.kind === 'header') {
+      if (line.group.value.parent === 'quiet') {
+        this.quietProject(line.group,line.group === this.quietSpaceGroups[0],
+          line.group === this.quietSpaceGroups[this.quietSpaceGroups.length-1])
+      } else {
+        ListItem() { this.groupHeader(line.group) }.id('agents.group.' + line.group.value.id)
+      }
+    } else if (line.kind === 'session') {
+      this.groupRow(line.row!,line.group.value.id,line.group.value.parent !== 'quiet' ||
+        (line.group === this.quietSpaceGroups[this.quietSpaceGroups.length-1] && !this.hasGroupOverflow(line.group)),
+        line.group.value.parent === 'quiet')
+    } else {
+      this.groupOverflow(line.group,line.group.value.parent === 'quiet',line.group === this.quietSpaceGroups[this.quietSpaceGroups.length-1])
+    }
   }
 
   @Builder resultList() {
@@ -1648,25 +1862,17 @@ export struct AgentListPage {
         } else if ((this.workspace.loading || this.workspace.awaitingSource()) && !this.workspace.hasRows()) ListItem() { LoadingProgress().height(Tokens.touch).width(Tokens.touch).padding(Tokens.page) }
         if (!this.externalSearchControls && shouldShowPersonalAgentsHeading(this.workspace.quickFilter, this.workspace.search, this.personalAgentCount)) this.personalAgentsHeadingRow()
         if (this.workspace.quickFilter === 'unread' && this.workspace.unreadToMark().length > 0) this.markAllSeenRow()
-        ForEach(this.groupBindings, (binding: BoundAgentGroup) => {
+        if (this.workspace.groupingMode === 'space') {
+          Repeat<SpaceListLine>(this.spaceListLines).each((entry: RepeatItem<SpaceListLine>) => {
+            this.spaceListItem(entry.item)
+          }).key((line: SpaceListLine) => line.key).virtualScroll({totalCount:this.spaceListLines.length,reusable:false})
+        } else ForEach(this.groupBindings, (binding: BoundAgentGroup) => {
             ListItemGroup({ header: () => this.groupHeader(binding) }) {
-              ForEach(this.displayRows(binding), (rowBinding: BoundAgentRow) => this.groupRow(rowBinding, binding.value.id,
-                binding.value.presentation !== 'app-project' || binding.value.lastProject), (rowBinding: BoundAgentRow) =>
-                rowBinding.key)
+              Repeat<BoundAgentRow>(this.displayRows(binding)).each((entry: RepeatItem<BoundAgentRow>) => {
+                this.groupRow(entry.item, binding.value.id, binding.value.presentation !== 'app-project' || binding.value.lastProject)
+              }).key((row: BoundAgentRow) => row.key).virtualScroll({totalCount:this.displayRows(binding).length,reusable:false})
             }.id('agents.group.' + binding.value.id)
-            if (binding.value.presentation !== 'app-parent' && !binding.value.folded &&
-                (binding.value.capped || binding.value.totalRowCount > binding.value.rows.length)) ListItem() {
-              Button() {
-                Row({ space: Tokens.gap }) {
-                  Text(binding.value.capped ? (binding.value.rows.length === binding.value.totalRowCount ? tr('agent_collapse') :
-                    tr('agent_show_all_count').replace('{count}',String(binding.value.totalRowCount))) :
-                    String(binding.value.totalRowCount-binding.value.rows.length)+' '+tr('agent_group_more_idle'))
-                    .fontSize(Tokens.meta).maxFontScale(Tokens.interfaceScaleFor(Tokens.meta)).fontColor(Colors.link).layoutWeight(1)
-                  SymbolGlyph(Symbols.down).fontSize(Tokens.symbolFont).fontColor([Colors.link])
-                }.width('100%').padding(Tokens.page).constraintSize({ minHeight: Tokens.touch })
-              }.type(ButtonType.Normal).buttonStyle(ButtonStyleMode.TEXTUAL).backgroundColor(Color.Transparent).width('100%')
-                .onClick(() => this.toggleIdle(binding.value.id)).id('agents.idle.expand.' + binding.value.id)
-            }
+            if (this.hasGroupOverflow(binding)) this.groupOverflow(binding)
           }, (binding: BoundAgentGroup) => binding.key)
         if (this.workspace.groupingMode === 'repo') {
           AgentRepositoryRows({model:this.model,workspace:this.workspace,catalog:this.projectCatalog,rows:this.workspace.unpinnedRows,
@@ -1682,7 +1888,9 @@ export struct AgentListPage {
         } else if (!this.workspace.hasRows() && !this.workspace.loading && !this.workspace.awaitingSource()) ListItem() {
           Text(tr(this.workspace.search ? 'no_results' : 'empty')).fontSize(Tokens.meta).maxFontScale(Tokens.interfaceScaleFor(Tokens.meta)).padding(Tokens.page).width('100%')
         }.id('agents.empty')
-      }.width('100%').height('100%').onAreaChange((_:Area,area:Area)=>{this.listWidth=Number(area.width);}).padding({ left: this.floatingStatusCards ? 0 : 12, right: this.floatingStatusCards ? 0 : 12, bottom: Tokens.listTail }).backgroundColor(Colors.grouped)
+      }.cachedCount(2).width('100%').height('100%').onSizeChange((_:SizeOptions,size:SizeOptions)=>{this.listWidth=Number(size.width);}).padding({ left: this.floatingStatusCards ? 0 : 12, right: this.floatingStatusCards ? 0 : 12, bottom: Tokens.listTail }).backgroundColor(Colors.grouped)
+        .onScrollStart(() => { this.listMoving = true; })
+        .onScrollStop(() => this.finishListScroll())
         .onTouch((event: TouchEvent) => this.trackPull(event)).id('agents.list.'+this.workspace.groupingMode)
     }
   }

@@ -47,7 +47,7 @@ registerHooks({
 });
 
 const { SessionArchive } = await import('../entry/src/main/ets/models/SessionArchive.ets');
-const { AgentWorkspace } = await import('../entry/src/main/ets/models/AgentWorkspace.ets');
+const { AgentWorkspace, coreRowId } = await import('../entry/src/main/ets/models/AgentWorkspace.ets');
 const { ResourceRow, Wire } = await import('../entry/src/main/ets/models/Wire.ets');
 
 function agent(id, fields = {}) {
@@ -541,11 +541,14 @@ test('All Hubs retains a deliberately chosen foreign machine across reloads and 
   await workspace.open(home.client);
   assert.deepEqual(workspace.visibleRows().map((row) => row.group).sort(), ['home', 'work']);
   const selected = workspace.machineIdentity(work.client.machines[0]);
-  await workspace.setMachineFilter(selected);
+  await workspace.setMachineFilter(selected,'Notebook');
   assert.deepEqual(workspace.visibleRows().map((row) => row.group), ['work']);
   await new Promise((resolve) => setTimeout(resolve, 240));
   const restored = new AgentWorkspace();
   await restored.open(home.client);
+  assert.equal(restored.machineFilterName,'Notebook');
+  restored.rememberMachineName(workspace.machineIdentity(home.client.machines[0]), 'Different computer');
+  assert.equal(restored.machineFilterName,'Notebook');
   assert.equal(restored.currentHubOnly, false);
   assert.equal(restored.machineFilter, selected);
   assert.deepEqual(restored.visibleRows().map((row) => row.group), ['work']);
@@ -965,7 +968,7 @@ test('a Projects search uses one decision snapshot for its query count, grouped 
   assert.equal(page.searchCards,last,'an owner change or a closed page releases its snapshot subscription');
 });
 
-test('related chats fold by actual parent and open directly during local search or Needs You',async()=>{
+test('filters and child-only searches keep the main session and open the matching child underneath it',async()=>{
   const main=agent('main',{state:'idle'}), side=agent('side',{title:'Branch discussion',parent_agent_id:'main',state:'needs_you'}),
     codex=agent('delegate',{title:'Review snapshots',parent_session_id:'side',root_session_id:'main',is_subagent:true}),
     orphan=agent('orphan',{title:'Branch discussion',parent_agent_id:'elsewhere'}),
@@ -978,11 +981,46 @@ test('related chats fold by actual parent and open directly during local search 
   workspace.toggleFamily(main);
   assert.deepEqual(new Set(ids().slice(ids().indexOf('main')+1,ids().indexOf('main')+3)),new Set(['side','delegate']));
   workspace.toggleFamily(main); assert.ok(!ids().includes('side'));
-  workspace.setQuickFilter('needsYou');assert.deepEqual(ids(),['side']);
-  workspace.setQuickFilter('all');workspace.setSearch('snapshots');assert.deepEqual(ids(),['delegate']);
-  workspace.setSearch('byte length');assert.deepEqual(ids(),['review@local']);
-  const child=workspace.visibleRows()[0]; assert.equal(child.data().read_only,true); assert.equal(workspace.relations.root(child).id,'review');
+  workspace.setQuickFilter('needsYou');assert.deepEqual(ids(),['main']);
+  workspace.setQuickFilter('all');workspace.setSearch('snapshots');assert.deepEqual(ids(),['main']);
+  workspace.toggleFamily(main);assert.deepEqual(ids(),['main','delegate']);
+  workspace.setSearch('byte length');assert.deepEqual(ids(),['review']);
+  workspace.toggleFamily(embedded);assert.deepEqual(ids(),['review','review@local']);
+  const child=workspace.visibleRows()[1]; assert.equal(child.data().read_only,true); assert.equal(workspace.relations.root(child).id,'review');
 });
+test('active children stay under one parent as their status, activity timestamps and arrival order change', async () => {
+  const parent = agent('parent', {state:'idle', status:'done', space_name:'Parent project'});
+  const child = (id, started, state='working', updated=started) => agent(id, {
+    parent_session_id:'parent', state, status:state, space_name:'Child metadata',
+    created_at:'2026-11-11T10:00:'+started+'Z', updated_at:'2026-11-11T10:01:'+updated+'Z'
+  });
+  const {workspace,client} = await opened({sessions:[child('second','02'),parent,child('first','01')]});
+  const ids = () => workspace.visibleRows().map(r => r.id);
+  workspace.setQuickFilter('working');
+  assert.deepEqual(ids(), ['parent']);
+  assert.equal(workspace.filterCounts.working,1,'two working children produce one matching family');
+  workspace.toggleFamily(parent);
+  assert.deepEqual(ids(), ['parent','first','second']);
+  client.sessions = [child('second','02','working','59'),child('new','00'),child('first','01','unread','50'),parent];
+  workspace.update(client);
+  assert.deepEqual(ids(), ['parent','first','second','new'], 'existing rows keep position, a newly reported child appends');
+  assert.deepEqual([workspace.filterCounts.working,workspace.filterCounts.unread],[1,1]);
+  assert.equal(workspace.visibleRows()[1].state,'unread');
+  for (let tick=0; tick<6; tick++) {
+    const later=String(30+tick);
+    const siblings=[child('first','01','unread',later),child('second','02','working',later),child('new','00','working',later)];
+    client.sessions=tick%2 ? [parent,...siblings] : [...siblings.reverse(),parent];
+    workspace.update(client);
+    assert.deepEqual(ids(), ['parent','first','second','new']);
+  }
+  workspace.setQuickFilter('unread');
+  assert.deepEqual(ids(), ['parent','first','second','new']);
+  assert.deepEqual(workspace.unreadShownRows.map(row => row.id), ['first'], 'the unread inventory retains the matching child');
+  workspace.toggleFamily(parent);
+  workspace.setGroupingMode('space');
+  assert.deepEqual(workspace.groups.flatMap(g=>g.memberIds), [coreRowId(parent)]);
+});
+
 test('relations isolate machines, Hubs and managers and keep cycles and unrelated forks independent',async()=>{
   const {SessionRelations}=await import('../entry/src/main/ets/models/SessionRelations.ets');
   const rows=[agent('root'),agent('foreign',{parent_session_id:'root',machine_id:'other'}),agent('otherOwner',{parent_session_id:'root',manager:'different'}),
@@ -992,6 +1030,16 @@ test('relations isolate machines, Hubs and managers and keep cycles and unrelate
   const graph=new SessionRelations(rows);
   assert.deepEqual(graph.children(rows[0]).map(r=>r.id),['waiting']);
   for(const r of rows.slice(1,7)) assert.equal(graph.root(r),undefined);
+});
+test('a legacy managerless family resolves the same scoped key as the native filter', async () => {
+  const root = agent('root',{manager:'',state:'idle'}), leaf = agent('leaf',{manager:'',parent_session_id:'root'});
+  root.group = leaf.group = 'team';
+  assert.equal(coreRowId(leaf),'team|m1/leaf');
+  const {workspace} = await opened({sessions:[root,leaf]});
+  workspace.setQuickFilter('working');
+  assert.deepEqual(workspace.visibleRows().map(row=>row.id),['root']);
+  workspace.toggleFamily(root);
+  assert.deepEqual(workspace.visibleRows().map(row=>row.id),['root','leaf']);
 });
 
 test('Claude workflow transcripts are searchable, read-only and deduplicated against ordinary agents and full sessions', async () => {
@@ -1004,13 +1052,16 @@ test('Claude workflow transcripts are searchable, read-only and deduplicated aga
       {id:'other', session_id:'elsewhere@other', label:'Unrelated record'}
     ]}]
   });
-  const full = agent('main@full', {parent_session_id:'main', title:'Registered child'});
+  const full = agent('main@full', {title:'Registered child'});
   const {workspace} = await opened({sessions:[parent, full]});
   const children = workspace.relations.children(parent);
   assert.deepEqual(children.map(row => row.id).sort(), ['main@full','main@regular','main@review']);
   assert.equal(children.find(row => row.id === full.id), full);
+  assert.equal(workspace.relations.root(full), parent, 'the confirmed parent roster supplies a missing backlink on a full row');
   workspace.setSearch('Review schema');
-  const [review] = workspace.visibleRows();
+  assert.deepEqual(workspace.visibleRows().map(row => row.id), ['main']);
+  workspace.toggleFamily(parent);
+  const [,review] = workspace.visibleRows();
   assert.equal(review.id, 'main@review');
   assert.equal(review.state, 'working');
   assert.equal(review.data().read_only, true);
@@ -1031,7 +1082,7 @@ test('offline search results retain their real state and respect machine, quick 
   workspace.setSearch('Find offline transcript');
   for (const grouping of ['state','machine','space']) {
     workspace.setGroupingMode(grouping);
-    assert.deepEqual(workspace.visibleRows().map(row => [row.id,row.state]), [['side','offline']]);
+    assert.deepEqual(workspace.visibleRows().map(row => [row.id,row.state]), [['main','working'],['side','offline']]);
     workspace.selectRow(side);
     assert.equal(workspace.isSelected(side), true);
   }
@@ -1151,8 +1202,8 @@ test('a folded side chat that needs you puts its parent in Needs you, the header
   workspace.toggleFamily(main);
   assert.deepEqual(workspace.displayRows(needs).map((row) => row.id), ['main'], 'an opened family does not open inside Needs you');
   workspace.setQuickFilter('needsYou');
-  assert.equal(workspace.familyState(main), 'idle', 'without folding the child is its own row');
-  assert.deepEqual(workspace.groups[0].rows.map((row) => row.id), ['side']);
+  assert.equal(workspace.familyState(main), 'needs_you');
+  assert.deepEqual(workspace.groups[0].rows.map((row) => row.id), ['main']);
 });
 
 test('Interrupt is offered on a running or waiting turn its source can stop, and posts the existing route', async () => {

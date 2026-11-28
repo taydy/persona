@@ -3,6 +3,9 @@ export interface AgentListRow {
   id: string;
   raw: Record<string, Object>;
   source: Object;
+  /** Scoped directory ID of the owning top-level row. Explicitly pinned children keep their own entry. */
+  familyRoot?: string;
+  familyState?: string;
 }
 export interface AgentListPreferences {
   pinsSpaces: string[];
@@ -49,6 +52,8 @@ export interface CoreAgentListProjection {
   groups: CoreAgentListGroup[];
   unread_shown: string[];
   filtered?: string[];
+  /** Actual sessions matched before their parent is added as display context. */
+  matchedMembers?: string[];
   /** The query and machine matches before a phone quick filter is applied. */
   queryMatches?: string[];
   unpinned?: string[];

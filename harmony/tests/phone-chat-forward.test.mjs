@@ -1,3 +1,4 @@
+import { registerSnapshotTaskpool } from './support/session-snapshot-taskpool.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {registerHooks,stripTypeScriptTypes} from 'node:module';
@@ -23,6 +24,7 @@ registerHooks({resolve(spec,ctx,next){
  if(url.endsWith('.ets'))return {format:'module',source:stripTypeScriptTypes(readFileSync(new URL(url),'utf8').replace(/@ObservedV2\s*/g,'').replace(/@Trace\s+/g,''),{mode:'transform'}),shortCircuit:true};
  return next(url,ctx);
 }});
+registerSnapshotTaskpool();
 const {PhoneChatForward}=await import('../entry/src/main/ets/models/PhoneChatForward.ets');
 const {ChatMessage,ResourceRow}=await import('../entry/src/main/ets/models/Wire.ets');
 const {ChatDraftStore}=await import('../entry/src/main/ets/models/ChatDraftStore.ets');

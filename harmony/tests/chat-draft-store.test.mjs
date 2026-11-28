@@ -1,12 +1,33 @@
+import { registerSnapshotTaskpool } from './support/session-snapshot-taskpool.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {registerHooks,stripTypeScriptTypes} from 'node:module';
 import {readFileSync} from 'node:fs';
 registerHooks({resolve(s,c,n){if(s==='../core/SessionSnapshot'||c.parentURL?.endsWith('/SessionSnapshot.ts')&&s==='./TranscriptCache')return{url:new URL(s+'.ts',c.parentURL).href,shortCircuit:true};if(c.parentURL?.endsWith('/ChatDraftStore.ets')&&s==='./Wire')return{url:new URL('./Wire.ets',c.parentURL).href,shortCircuit:true};return n(s,c);},load(u,c,n){if(u.endsWith('.ets'))return{format:'module',shortCircuit:true,source:stripTypeScriptTypes(readFileSync(new URL(u),'utf8').replace(/@ObservedV2\s*/g,'').replace(/@Trace\s+/g,''))};return n(u,c);}});
+registerSnapshotTaskpool();
 const {ChatDraftStore,ChatDraft,ChatOutboxEntry}=await import('../entry/src/main/ets/models/ChatDraftStore.ets');
 function fixture(){const data=new Map();return{data,local:{revision(){return 0;},accepts(){return true;},async get(k){return data.get(k)||'';},async put(k,v){data.set(k,v);},async remove(k){data.delete(k);}}};}
 function draft(text,revision){const d=new ChatDraft();d.text=text;d.revision=revision;return d;}
 function entry(id,target='target'){const e=new ChatOutboxEntry();e.id=id;e.target=target;e.revision='draft:'+id;e.text='Synthetic message';e.at=Date.now();return e;}
+test('a Hub switch during background encoding discards the old snapshot and preserves the next write', async () => {
+  const { local, data } = fixture(), store = new ChatDraftStore(local);
+  const { ResourceRow } = await import('../entry/src/main/ets/models/Wire.ets');
+  const stale = new ResourceRow('old', 'First', 'session'), fresh = new ResourceRow('new', 'Second', 'session');
+  let current = true, markStarted;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  const first = store.saveSessionSnapshot('one', [stale], [], [], () => { markStarted(); return current; });
+  await started;
+  current = false;
+  await first;
+  assert.equal(data.has('snapshot:one'), false, 'the worker reply cannot restore the retired directory');
+  const second = store.saveSessionSnapshot('one', [fresh], [], [], () => true, 'sidebar');
+  fresh.title = 'Changed after capture';
+  const result = store.readSessionSnapshot('one');
+  await second;
+  const saved = JSON.parse(await result);
+  assert.equal(saved.sessions[0].title, 'Second');
+  assert.equal(saved.sidebarConfig, 'sidebar');
+});
 test('acknowledgement clears its captured draft after navigating away but preserves a newer identical draft',async()=>{
  const {local}=fixture(),a=new ChatDraftStore(local),b=new ChatDraftStore(local);await a.save('old',draft('Same words','first'));await a.save('other',draft('Other chat','other'));
  assert.equal(await b.acknowledge('old','first'),true);assert.equal((await a.read('old')).text,'');assert.equal((await b.read('other')).text,'Other chat');

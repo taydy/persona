@@ -145,3 +145,12 @@ export function runningSubagents(data: Payload): number {
   }
   return Math.max(count(data, 'running_subagents'), hubWorking);
 }
+
+export function agentFamilySummary(sides: number, tasks: number, needs: number, running: number, words: PreviewWords): string {
+  const parts: string[] = [];
+  if (sides) parts.push(words('relation_side_count').replace('{n}', String(sides)));
+  if (tasks) parts.push(words('relation_task_count').replace('{n}', String(tasks)));
+  if (needs) parts.push(words('relation_needs_count').replace('{n}', String(needs)));
+  if (running) parts.push(words('relation_running_count').replace('{n}', String(running)));
+  return parts.join(' · ');
+}

@@ -101,12 +101,12 @@ export class ComputerScreen {
     try {
       const owner: ClientModel = await parent.viewFor(row);
       if (!this.parentCurrent(attempt) || !owner.connected || owner.demo ||
-        (row.manager && owner.profile.manager !== row.manager)) {
+        (row.group && owner.profile.id !== row.group) || (row.manager && owner.profile.manager !== row.manager)) {
         this.fail(attempt, 'computer_screen_screen_unavailable');
         return;
       }
-      const machine: ResourceRow | undefined = owner.machines.find((candidate: ResourceRow) => candidate.id === row.id);
-      if (!machine || row.manager && machine.manager !== row.manager || !this.isMac(machine) || !this.machineCanConnect(machine)) {
+      const machine: ResourceRow | undefined = ResourceRow.ownedMachine(owner.machines, row.id, owner.profile.id, owner.profile.manager);
+      if (!machine || !this.isMac(machine) || !this.machineCanConnect(machine)) {
         this.fail(attempt, this.isMac(machine || row) ? 'computer_screen_screen_unavailable' : 'computer_screen_not_mac');
         return;
       }
@@ -604,8 +604,8 @@ export class ComputerScreen {
     try {
       if (owner.repo() !== repository) return false;
     } catch (_) { return false; }
-    const machine: ResourceRow | undefined = owner.machines.find((candidate: ResourceRow) => candidate.id === row.id);
-    return !!machine && (!row.manager || machine.manager === row.manager) &&
+    const machine: ResourceRow | undefined = ResourceRow.ownedMachine(owner.machines, row.id, owner.profile.id, owner.profile.manager);
+    return !!machine &&
       (machine.manager || owner.profile.manager) === this.machineManager &&
       Wire.text(machine.data(), 'machine_uid') === this.machineUID && this.machineCanConnect(machine);
   }

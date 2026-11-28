@@ -661,6 +661,46 @@ test('Claude keeps the latest command description across receipts, parallel call
   }
 });
 
+test('only the current Claude command heading times the whole turn', () => {
+  const start = Date.UTC(2026, 0, 1);
+  const at = seconds => new Date(start + seconds * 1000).toISOString();
+  const prompt = (id, seconds) => ({ id, seq:seconds + 1, ts:at(seconds), role:'user', kind:'text', text:'Check the sample' });
+  const call = (id, seconds) => ({ id, seq:seconds + 1, ts:at(seconds), role:'assistant', kind:'tool_use',
+    tool_name:'Bash', tool_use_id:id, tool_input:{ description:id } });
+  const receipt = (id, seconds, duration_ms) => ({ id:id + '-result', seq:seconds + 1, ts:at(seconds), kind:'tool_result',
+    tool_use_id:id, outcome:{ status:'ok', duration_ms } });
+  const note = (id, seconds) => ({ id, seq:seconds + 1, ts:at(seconds), kind:'text', role:'assistant', text:id, narration:true });
+  const headings = (items, agent = 'claude', live = true) => projectTranscriptRows(items, live, [], agent)
+    .filter(row => row.kind === 'work').map(row => activityHeading(row.work, t));
+  const first = [prompt('first', 0), call('Read configuration', 5)];
+  const next = [...first, receipt('Read configuration', 118, 113000), note('Checking results', 119), call('Run checks', 120)];
+  const [previous, current] = headings(next);
+  assert.equal(headings(first)[0].startedAt, start);
+  assert.deepEqual([previous.active, previous.startedAt, current.title], [0, 0, 'Run checks']);
+  assert.equal(recordedDuration(start + 122000 - current.startedAt), '2m 2s');
+  const [done] = tools(projectTranscriptRows(next, true, [], 'claude'));
+  assert.equal(workMetrics(done, t, recordedDuration), '1m 53s');
+
+  const parallel = [...first, note('Independent check', 119), call('Run checks', 120)];
+  assert.deepEqual(headings(parallel).map(h => h.startedAt), [start + 5000, start]);
+  assert.equal(headings(next, 'codex').at(-1).startedAt, start + 120000);
+  assert.equal(headings(next, 'claude', false).at(-1).startedAt, 0);
+  const end = { id:'end', seq:125, kind:'turn_duration', turn_duration:{ parent_uuid:'checked', duration_ms:123500 } };
+  const finished = [...next, receipt('Run checks', 123, 3000), end];
+  assert.ok(headings(finished).every(h => h.active === 0 && h.startedAt === 0));
+  assert.equal(headings([...finished, prompt('next', 180), call('Read again', 186)]).at(-1).startedAt, start + 180000);
+
+  const queued = { ...prompt('addition', 90), queued:true };
+  assert.equal(headings([...first, queued, call('Continue checks', 120)]).at(-1).startedAt, start);
+  assert.equal(headings([...finished, { ...queued, seq:181, ts:at(180) }, call('New checks', 186)]).at(-1).startedAt, start + 180000);
+  const wake = { id:'wake', seq:151, ts:at(150), kind:'notice', role:'system', wake:true, text:'Task completed' };
+  assert.equal(headings([...first, wake, call('Review result', 155)]).at(-1).startedAt, start + 150000);
+  for (const partial of [next.slice(2), [queued, next.at(-1)], [{ ...first[0], ts:'invalid' }, ...next.slice(1)]]) {
+    const heading = headings(partial).at(-1);
+    assert.deepEqual([heading.title, heading.active, heading.startedAt], ['Run checks', 1, 0]);
+  }
+});
+
 test('Claude next-step history retains the chosen reply after its question, including on reload', () => {
   const q={id:'q',seq:1,kind:'text',role:'user',text:'Review'};
   const use={id:'w',seq:2,kind:'tool_use',role:'assistant',tool_use_id:'w',tool_name:'mcp__ccd_turn__wrap_up',

@@ -20,10 +20,34 @@ registerHooks({
   }
 });
 const { ProjectAgent, ProjectCatalog, ProjectWorktree, ProjectBrowserState, projectDirectory } = await import('../entry/src/main/ets/models/ProjectCatalog.ets');
-const { projectOutline, projectHosts, projectSearchAgents, worktreeSpaceCards } = await import('../entry/src/main/ets/models/ProjectOutline.ets');
+const { expandProjectSessions, ProjectLine, projectOutline, projectHosts, projectSearchAgents, worktreeSpaceCards } = await import('../entry/src/main/ets/models/ProjectOutline.ets');
 const { ResourceRow } = await import('../entry/src/main/ets/models/Wire.ets');
 const { SessionSpace, sessionSpace, worktreeForSessionSpace } = await import('../entry/src/main/ets/models/SessionSpace.ets');
 const { AgentSessionInfo,agentHeaderWords,sessionInfoPath } = await import('../entry/src/main/ets/models/AgentSessionInfo.ets');
+
+test('repository families expand only beneath a visible parent and keep stable child row identities', () => {
+  const agent = id => {
+    const data = { session_id: id, machine_id: 'sample', title: id };
+    return new ProjectAgent(ResourceRow.from(data, 'session'), data);
+  };
+  const parent = agent('parent'), child = agent('child'), other = agent('other');
+  const project = {}, tree = {};
+  const outline = () => [parent, other].map(row => {
+    const line = new ProjectLine('session', row.row.key(), project, 2, tree, row);
+    line.first = line.last = true;
+    return line;
+  });
+  const base = outline();
+  const opened = expandProjectSessions(base, row => row === parent ? [child] : []);
+  assert.deepEqual(opened.map(line => line.agent.row.id), ['parent', 'child', 'other']);
+  assert.equal(opened[1].tree, tree);
+  assert.equal(opened[1].level, 3);
+  assert.equal(opened[1].key, 'session/' + child.row.key());
+  assert.deepEqual(opened.map(line => line.last), [false, true, true]);
+  assert.equal(base[0].last, true, 'opening cannot change the cached parent used after collapse');
+  assert.equal(opened[2], base[1], 'unaffected rows preserve identity');
+  assert.deepEqual(expandProjectSessions(base, () => []), base);
+});
 
 test('legacy sessions keep their native brand mark without inventing a runtime or overriding an explicit provider', () => {
   for (const [fields, mark, runtime] of [

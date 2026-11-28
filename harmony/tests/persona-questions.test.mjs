@@ -1,3 +1,4 @@
+import { registerSnapshotTaskpool } from './support/session-snapshot-taskpool.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerHooks, stripTypeScriptTypes } from 'node:module';
@@ -15,7 +16,7 @@ registerHooks({
     if (specifier === '../core/SessionSnapshot' || context.parentURL?.endsWith('/SessionSnapshot.ts') && specifier === './TranscriptCache') return {url: new URL(specifier + '.ts', context.parentURL).href, shortCircuit: true};
     if (specifier === '@kit.ArkTS') return { url: 'persona-question-test:arkts', shortCircuit: true };
     if (context.parentURL?.endsWith('/ClientModel.ets')) {
-      if (['./Wire', './InteractionDecision', './ChatDraftStore', '../core/MessageImageGallery', '../core/Domain', '../core/AgentEvents', '../core/ConversationPlan', '../core/BackgroundActivity', '../core/ChatSendFeedback', '../core/DictationLanguage', './AgentAttention', './SessionArchive', './SessionRelations', '../core/WorkPresentation', '../core/HubModules', '../core/XiaoYiActions'].includes(specifier)) {
+      if (['./Wire', './InteractionDecision', './ChatDraftStore', '../core/MessageImageGallery', '../core/Domain', '../core/AgentEvents', '../core/ConversationPlan', '../core/BackgroundActivity', '../core/ChatSendFeedback', '../core/DictationLanguage', './AgentAttention', './SessionArchive', './SessionRelations', '../core/WorkPresentation', '../core/HubModules', '../core/XiaoYiActions', '../core/NextSuggestions'].includes(specifier)) {
         const base = new URL(specifier, context.parentURL);
         return { url: base.href + (existsSync(new URL(base.href + '.ts')) ? '.ts' : '.ets'), shortCircuit: true };
       }
@@ -83,6 +84,7 @@ registerHooks({
   }
 });
 
+registerSnapshotTaskpool();
 const { ClientModel } = await import('../entry/src/main/ets/models/ClientModel.ets');
 const { Decision, HubProfile, ResourceRow } = await import('../entry/src/main/ets/models/Wire.ets');
 

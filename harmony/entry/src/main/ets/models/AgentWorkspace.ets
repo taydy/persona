@@ -96,7 +96,9 @@ function rowSpaceKey(row: ResourceRow, space?: string): string {
   return name ? rowMachine(row) + '/' + name : '';
 }
 export function coreRowId(row: ResourceRow): string {
-  return (row.group ? row.group + '|' : '') + (row.manager ? row.manager + '|' : '') + rowMachine(row) + '|' + rowSession(row);
+  const scope = row.group ? row.group + '|' : '';
+  const machine = rowMachine(row), session = rowSession(row);
+  return scope + (row.manager ? row.manager + '|' + machine + '|' + session : machine + '/' + session);
 }
 function stringsFrom(value: Record<string, Object>, key: string, optional: boolean = false): string[] {
   if (!Wire.has(value, key) && optional) return [];
@@ -128,6 +130,7 @@ export class AgentWorkspace {
   @Trace filterCounts:Record<string,Object> = {};
   @Trace groupingMode: string = 'state';
   @Trace machineFilter: string = '';
+  @Trace machineFilterName: string = '';
   @Trace currentHubOnly: boolean = false;
   @Trace search: string = '';
   @Trace history: boolean = false;
@@ -156,22 +159,28 @@ export class AgentWorkspace {
   revokeRowActions(): void { this.actionEpoch++; this.busy = false; }
   private supervisorQueue: AgentDecisionQueue | undefined;
   private hidSupervisorRows: boolean = false;
-  relations: SessionRelations = new SessionRelations([]);
-  private expandedFamilies = new Set<string>();
-  /** The core's unread rows under the current filter (`unread_shown`), what Mark All as Seen marks. */
-  foldFamilies(): boolean { return this.quickFilter === 'all' && !this.search.trim(); }
-  foldedChildren(row: ResourceRow, graph: SessionRelations = this.relations): ResourceRow[] {
-    return graph.children(row).filter(child => !this.isPinned(child));
+  @Trace relations: SessionRelations = new SessionRelations([]);
+  @Trace expandedFamilies: Set<string> = new Set<string>();
+  @Trace private searchFamilyHits: Set<string> | undefined = undefined;
+  foldedChildren(row: ResourceRow): ResourceRow[] {
+    const hits = this.searchFamilyHits;
+    const matchChildren = !!hits && !hits.has(coreRowId(row));
+    return this.relations.children(row).filter(child => !this.isPinned(child) && (!matchChildren || hits!.has(coreRowId(child))));
   }
   familyExpanded(row: ResourceRow): boolean { return this.expandedFamilies.has(row.key()); }
+  hasExpandedFamilies(): boolean { return this.expandedFamilies.size > 0; }
+  expandedChildren(row: ResourceRow): ResourceRow[] {
+    return this.familyExpanded(row) ? this.foldedChildren(row) : [];
+  }
   toggleFamily(row: ResourceRow): void {
-    if (!this.foldFamilies() || !this.foldedChildren(row).length) return;
-    if (!this.expandedFamilies.delete(row.key())) this.expandedFamilies.add(row.key());
-    this.groups = this.groups.slice();
+    if (!this.foldedChildren(row).length) return;
+    const next = new Set(this.expandedFamilies);
+    if (!next.delete(row.key())) next.add(row.key());
+    this.expandedFamilies = next;
   }
   /** A group's rows with each opened family under its parent; Needs you lists parents only, so no child shows twice. */
   displayRows(group: AgentWorkspaceGroup): ResourceRow[] {
-    if ((group.id === NEEDS_GROUP && this.groupingMode !== 'state') || !this.foldFamilies() || !this.expandedFamilies.size) return group.rows;
+    if ((group.id === NEEDS_GROUP && this.groupingMode !== 'state') || !this.hasExpandedFamilies()) return group.rows;
     const rows: ResourceRow[] = [];
     for (const row of group.rows) {
       rows.push(row);
@@ -266,13 +275,13 @@ export class AgentWorkspace {
     this.client = client; this.scope = client.scope(); this.owner = client.profile.manager;
     this.viewScope = JSON.stringify([this.scope, this.owner]);
     this.openingView = true; this.loading = true; this.busy = false; this.error = '';
-    this.expandedFamilies.clear(); this.relations = new SessionRelations([]);
+    this.expandedFamilies = new Set<string>(); this.searchFamilyHits = undefined; this.relations = new SessionRelations([]);
     this.externalSelection = undefined; this.groups = []; this.sourceRows = []; this.latestSourceRows = []; this.projectRows = undefined; this.historyRows = []; this.historyLoaded = false; this.frozenGroups = undefined;
     this.supervisorQueue = undefined; this.hidSupervisorRows = false;
     this.quickFilter = 'all'; this.filterCounts = {}; this.unpinnedRows = []; this.unreadShownRows = []; this.filterKept = [];
     this.preferredGrouping = this.defaultGrouping; this.groupingMode = this.defaultGrouping;
     this.supportsTodos = false; this.supportsDirections = false;
-    this.machineFilter = ''; this.search = ''; this.history = false; this.selectedKey = '';
+    this.machineFilter = ''; this.machineFilterName = ''; this.search = ''; this.history = false; this.selectedKey = '';
     this.readingDetail = false; this.freezeSuppressed = false;
     this.preferences = new Map<string, AgentPreferences>(); this.pinsSpaces = []; this.pinsSessions = []; this.mutesSpaces = []; this.mutesSessions = []; this.mutesAllowed = [];
     try {
@@ -286,7 +295,8 @@ export class AgentWorkspace {
       this.preferredGrouping = AGENT_GROUPINGS.includes(storedGrouping) ? storedGrouping : this.defaultGrouping;
       this.groupingMode = this.resolvedGrouping();
       const savedMachine = Wire.text(saved, 'machine');
-      this.machineFilter = this.machineForShownHub(savedMachine); this.search = Wire.text(saved, 'search');
+      this.machineFilter = this.machineForShownHub(savedMachine);
+      this.machineFilterName = this.machineFilter ? Wire.text(saved, 'machine_name') : ''; this.search = Wire.text(saved, 'search');
       this.history = Wire.bool(saved, 'history');
       if (this.history && client.connected && !this.historySupported()) this.history = false;
       this.selectedKey = Wire.text(saved, 'selected');
@@ -313,7 +323,7 @@ export class AgentWorkspace {
   }
 
   hide(): void {
-    this.expandedFamilies.clear(); this.relations = new SessionRelations([]);
+    this.expandedFamilies = new Set<string>(); this.searchFamilyHits = undefined; this.relations = new SessionRelations([]);
     this.supervisorQueue = undefined; this.hidSupervisorRows = false;
     this.projectRows = undefined;
     this.filterCounts = {}; this.unpinnedRows = []; this.unreadShownRows = []; this.filterKept = [];
@@ -356,8 +366,7 @@ export class AgentWorkspace {
   setReadingDetail(value: boolean): void {
     if (value === this.readingDetail) return;
     if (value) {
-      if (this.readingDetail) return;
-      this.heldSession = ''; this.rebuild();
+      if (this.heldSession) { this.heldSession = ''; this.rebuild(); }
       this.readingDetail = true;
       this.freezeSuppressed = false;
       if (this.sourceReady() || this.groups.length > 0) {
@@ -448,8 +457,19 @@ export class AgentWorkspace {
     this.rebuild(); this.refreezeAfterFilter(); this.saveViewLater();
   }
 
-  async setMachineFilter(value: string): Promise<void> {
-    this.releaseFreeze(); this.filterKept = []; this.machineFilter = this.machineForShownHub(value); this.rebuild(); this.saveViewLater();
+  rememberMachineName(identity: string, name: string): void {
+    if (!identity || identity !== this.machineFilter || !name || name === identity || name === this.machineFilterName) return;
+    this.machineFilterName = name;
+    this.saveViewLater();
+  }
+
+  async setMachineFilter(value: string, name: string = ''): Promise<void> {
+    this.releaseFreeze(); this.filterKept = [];
+    const key = this.machineForShownHub(value);
+    if (key !== this.machineFilter) this.machineFilterName = '';
+    this.machineFilter = key;
+    if (key && name) this.machineFilterName = name;
+    this.rebuild(); this.saveViewLater();
     if (this.history) {
       const client = this.client;
       if (client) await this.loadHistory(client, this.revision, true);
@@ -480,6 +500,7 @@ export class AgentWorkspace {
     this.hubModeLoaded = true; this.currentHubOnly = value; this.releaseFreeze(); this.filterKept = [];
     this.historyRequest++; this.historyRows = []; this.historyLoaded = false; this.loading = false;
     this.machineFilter = this.machineForShownHub(this.machineFilter);
+    if (!this.machineFilter) this.machineFilterName = '';
     if (this.history && !this.historySupported()) this.history = false;
     this.latestSourceRows = this.history ? [] : this.rowsForClient(client);
     this.rebuild(); this.saveViewLater();
@@ -514,9 +535,11 @@ export class AgentWorkspace {
   selectExternal(row: ResourceRow): void { this.externalSelection = row; if (this.client) this.syncSelected(this.client); }
 
   selectRow(row: ResourceRow): void {
-    if (row.kind !== 'session' || !this.groups.some((group: AgentWorkspaceGroup) =>
-      this.displayRows(group).some((item: ResourceRow) => rowKey(item) === rowKey(row)))) return;
-    this.externalSelection = row; this.selectedKey = rowKey(row);
+    if (row.kind !== 'session') return;
+    const key = rowKey(row);
+    if (!this.groups.some((group: AgentWorkspaceGroup) =>
+      this.displayRows(group).some((item: ResourceRow) => item === row || rowKey(item) === key))) return;
+    this.externalSelection = row; this.selectedKey = key;
     this.heldSession = row.state === 'unread' ? (row.group ? row.group + '|' : '') + (row.manager ? row.manager + '|' : '') +
       rowMachine(row) + '|' + rowSession(row) : '';
     this.saveViewLater();
@@ -688,7 +711,7 @@ export class AgentWorkspace {
 
   /**
    * What Mark All as Seen marks under the Unread filter (iOS `markSeen(unreadShown)`): the core's unread rows the filter
-   * lists, folded groups included, so the chip empties. Families are open under a quick filter, so each child is its own row.
+   * lists, including unread children even when the owner has its disclosure closed.
    */
   unreadToMark(): ResourceRow[] {
     if (this.quickFilter !== 'unread') return [];
@@ -986,8 +1009,11 @@ export class AgentWorkspace {
 
   private rowsForClient(client: ClientModel | undefined): ResourceRow[] {
     if (!client) return [];
-    return (this.projectRows || (client.directoryReady ? client.directorySessions : client.sessions)).filter((row: ResourceRow) => row.kind === 'session' && this.includesHub(row.group) &&
-      !Wire.bool(row.data(), 'archived') && !Wire.bool(row.data(), 'assistant'));
+    return (this.projectRows || (client.directoryReady ? client.directorySessions : client.sessions)).filter((row: ResourceRow) => {
+      if (row.kind !== 'session' || !this.includesHub(row.group)) return false;
+      const data = row.data();
+      return !Wire.bool(data, 'archived') && !Wire.bool(data, 'assistant');
+    });
   }
 
   syncSelected(client: ClientModel): void {
@@ -1030,7 +1056,9 @@ export class AgentWorkspace {
     const visible = (id:string):boolean => !ids.has(id);
     const quick = this.quickFilter === 'needsYou';
     const affected = matches.filter((id:string) => ids.has(id)).length;
-    this.filterCounts['needsYou'] = Math.max(0,Wire.number(this.filterCounts,'needsYou') - affected);
+    if (typeof this.filterCounts['needsYou'] === 'number') {
+      this.filterCounts['needsYou'] = Math.max(0, Wire.number(this.filterCounts,'needsYou') - affected);
+    }
     if (quick) this.unpinnedRows = this.unpinnedRows.filter((row:ResourceRow) => visible(coreRowId(row)));
     this.groups = this.groups.filter((group:AgentWorkspaceGroup):boolean => {
       if (!quick && group.id !== 'state/needs') return true;
@@ -1063,8 +1091,9 @@ export class AgentWorkspace {
     let unpinned: string[];
     let matches: string[];
     let unreadIds: string[];
+    let matchedMembers: string[] | undefined;
     try {
-      const relations = sessionRelations(this.latestSourceRows, unavailableSessionSources(this.client?.directoryOwners() || []));
+      const relations = sessionRelations(this.latestSourceRows, unavailableSessionSources(this.client?.directoryOwners() || []), this.relations);
       relations.rows.forEach(row => byId.set(coreRowId(row), row));
       const input = this.makeListInput(relations);
       const projection = this.adapter.project(input);
@@ -1072,8 +1101,10 @@ export class AgentWorkspace {
       groups = phoneAgentGroups(input,projection);
       unpinned = projection.unpinned || [];
       unreadIds = projection.unread_shown || [];
+      matchedMembers = projection.matchedMembers;
+      this.searchFamilyHits = this.search.trim() && matchedMembers ? new Set<string>(matchedMembers) : undefined;
       this.filterCounts = projection.filter_counts || {};
-      counts = projection.filter_counts || projection.counts || {};
+      counts = projection.counts || {};
       // The core matches the query (including machine and quick filters) before it hides
       // offline rows from its ordinary groups. Offer those readable matches once.
       if (this.search.trim() && projection.filtered) {
@@ -1099,14 +1130,17 @@ export class AgentWorkspace {
     });
     if (this.quickFilter !== 'all' && !this.readingDetail) {
       const nextKept = new Set<string>(this.filterKept.filter((id: string) => byId.has(id)));
-      groups.forEach((group) => group.rows.forEach((id: string) => { if (byId.has(id)) nextKept.add(id); }));
+      if (matchedMembers) matchedMembers.forEach((id: string) => nextKept.add(id));
+      else groups.forEach((group) => group.rows.forEach((id: string) => { if (byId.has(id)) nextKept.add(id); }));
       this.filterKept = Array.from(nextKept);
     } else if (this.quickFilter === 'all' && this.filterKept.length) {
       this.filterKept = [];
     }
     const needs = this.needsGroup(groups, byId);
     const nextCounts: Record<string, number> = {};
-    ['needsYou', 'unread', 'working', 'backgroundWaiting'].forEach((key: string) => nextCounts[key] = Wire.number(counts, key));
+    ['needsYou', 'unread', 'working', 'backgroundWaiting'].forEach((key: string) => {
+      nextCounts[key] = Wire.number(this.filterCounts, key, Wire.number(counts, key));
+    });
     if (needs) nextCounts['needsYou'] = needs.rows.length;
     if (JSON.stringify(nextCounts) !== JSON.stringify(this.counts)) this.counts = nextCounts;
     if (this.readingDetail && !this.freezeSuppressed && this.frozenGroups) {
@@ -1155,7 +1189,9 @@ export class AgentWorkspace {
     decisions:AgentDecisionQueue): void {
     if (this.standaloneView || !this.isBoundTo(root)) return;
     this.projectRows=rows; this.search=query; this.quickFilter=quick; this.supervisorQueue=decisions;
-    this.machineFilter=this.machineForShownHub(machine);
+    const filter = this.machineForShownHub(machine);
+    if (filter !== this.machineFilter) this.machineFilterName = '';
+    this.machineFilter = filter;
     this.preferredGrouping=AGENT_GROUPINGS.includes(grouping) ? grouping : this.defaultGrouping;
     this.groupingMode=this.resolvedGrouping();
     this.latestSourceRows=this.rowsForClient(root);
@@ -1187,8 +1223,7 @@ export class AgentWorkspace {
 
   /** The state a row shows in the list: a folded family shows its children's too (protocol "Folded state"). */
   familyState(row: ResourceRow, relations: SessionRelations = this.relations): string {
-    if (!this.foldFamilies()) return row.state;
-    const children = this.foldedChildren(row, relations);
+    const children = relations.children(row).filter(child => !this.isPinned(child));
     if (!children.length) return row.state;
     if (children.some(child => child.state === 'needs_you')) return 'needs_you';
     const quiet = ['idle', 'offline', 'unknown'].includes(row.state);
@@ -1228,14 +1263,14 @@ export class AgentWorkspace {
   }
 
   private makeListInput(relations: SessionRelations = this.relations): AgentListInput {
-    const fold = this.foldFamilies();
-    const displayed = fold ? relations.rows.filter(row => !relations.root(row) || this.isPinned(row)) : relations.rows;
-    const rows: AgentListRow[] = displayed.map((row: ResourceRow): AgentListRow => {
+    const rows: AgentListRow[] = relations.rows.map((row: ResourceRow): AgentListRow => {
       const raw = row.data();
       raw['machine_id'] = rowMachine(row); raw['session_id'] = rowSession(row); raw['title'] = row.title;
       raw['cwd'] = row.path; raw['state'] = row.state; raw['manager'] = row.manager; raw['app_hub_group'] = row.group;
-      if (fold) raw['state'] = this.familyState(row, relations);
-      return {id: coreRowId(row), raw, source: row};
+      const root = relations.root(row);
+      const state = this.familyState(row, relations);
+      return {id: coreRowId(row), raw, source: row, familyRoot: root && !this.isPinned(row) ? coreRowId(root) : undefined,
+        familyState: state === row.state ? undefined : state};
     });
     return {rows, includeSourceFilters:true, history: this.history, grouping: this.groupingMode, quick: this.quickFilter,
       machineFilter: this.machineFilter, query: this.search, reading: this.readingDetail,
@@ -1289,9 +1324,9 @@ export class AgentWorkspace {
       this.persistTimer = -1;
       if (!client || !this.loadCurrent(client, revision) || this.viewScope !== viewScope) return;
       const values: Object[] = [this.quickFilter, this.preferredGrouping, this.machineFilter, this.search, this.history, this.selectedKey,
-        this.folded, this.expandedIdle, this.expandedQuiet];
+        this.folded, this.expandedIdle, this.expandedQuiet, this.machineFilter ? this.machineFilterName : ''];
       client.saveView('agent-workspace', JSON.stringify(Wire.payload(['quick', 'grouping', 'machine', 'search', 'history', 'selected',
-        'folded', 'expanded_idle', 'expanded_quiet'], values)))
+        'folded', 'expanded_idle', 'expanded_quiet', 'machine_name'], values)))
         .catch(() => undefined);
     }, 180);
   }

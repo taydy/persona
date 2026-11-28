@@ -8,7 +8,7 @@ import { tr } from '../design/Strings';
 import { deduplicateAgentPlace } from '../core/FoldPosture';
 import { nativeEnvironment } from '../platform/NativeEnvironment';
 import { ProjectAgentPlaceLine } from './ProjectAgentPlaceLine';
-import { NeedsYouPulseDot, WorkingArcSpinner } from './StatusMotionMarks';
+import { NeedsYouPulseDot, SessionWorkingDot, WorkingArcSpinner } from './StatusMotionMarks';
 
 @ComponentV2
 export struct AgentDirectoryRowContent {
@@ -29,10 +29,15 @@ export struct AgentDirectoryRowContent {
   @Param controlScale: number = 1;
   @Param fontScale: number = 1;
   @Param tint: ResourceColor = Colors.secondary;
+  @Param hasFamilyControl: boolean = false;
+  @Param nestedSession: boolean = false;
+  @Param active: boolean = true;
   @Param activityList: boolean = false;
   @Param useHerdrTabName: boolean = false;
+  @Param renaming: boolean = false;
 
   private displayTitle(): string {
+    if (this.renaming) return tr('agent_renaming');
     return ((this.useHerdrTabName && this.agent.herdrTabName) ? this.agent.herdrTabName : this.agent.row.title) || tr('agent_untitled');
   }
 
@@ -45,8 +50,8 @@ export struct AgentDirectoryRowContent {
         else if (agent.runtime) Text(agent.runtime.slice(0,1).toUpperCase()).fontSize('16vp').fontWeight(FontWeight.Medium).fontColor(Colors.ink)
         else SymbolGlyph(Symbols.agent).fontSize('17vp').fontColor([Colors.secondary])
       }.width(36*this.controlScale).height(36*this.controlScale).backgroundColor(Colors.subtle).borderRadius(18*this.controlScale)
-      if (this.activityList && agent.state==='working' && agent.rank!==4)
-        WorkingArcSpinner({diameter:17,tint:this.tint,surface:Colors.surface,showCoreDot:true}).offset({x:4.75,y:4.75})
+      if (this.activityList && !this.muted && agent.state==='working' && agent.rank!==4)
+        SessionWorkingDot({diameter:14,tint:this.tint,surface:Colors.surface,active:this.active}).offset({x:3,y:3})
       else if (this.activityList && agent.state==='working' && agent.rank===4)
         SymbolGlyph($r('sys.symbol.clock')).fontSize('17vp').fontColor([this.tint]).backgroundColor(Colors.surface).borderRadius(9)
       else if (agent.state==='needs_you' && !this.muted)
@@ -80,7 +85,7 @@ export struct AgentDirectoryRowContent {
     Text(this.displayTitle()).fontSize(17).maxFontScale(Tokens.interfaceScaleFor(17))
       .lineHeight(this.previewRow ? PhoneStyle.settingsExampleLineHeight(20,27.67,this.fontScale) : undefined)
       .letterSpacing(this.previewRow ? '-0.25vp' : undefined)
-      .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis})
+      .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(this.hasFamilyControl ? 2 : 1).textOverflow({overflow:TextOverflow.Ellipsis})
   }
   @Builder agentTitleAndTime() {
     Column({space:4}){
@@ -93,7 +98,7 @@ export struct AgentDirectoryRowContent {
           this.stamp()
         }.width('100%')
       }
-    }.width('100%').alignItems(HorizontalAlign.Start).onAreaChange((_:Area,now:Area)=>{
+    }.width('100%').alignItems(HorizontalAlign.Start).onSizeChange((_:SizeOptions,now:SizeOptions)=>{
       const width=Number(now.width);
       if(Number.isFinite(width)&&width>0&&Math.abs(width-this.titleRoom)>.25)this.titleRoom=width;
     })
@@ -105,7 +110,8 @@ export struct AgentDirectoryRowContent {
     Row({space:12}) {
       this.agentMark(this.agent)
       Column({space:2}) {
-        if(this.activityList){this.agentTitleAndTime()}
+        if(this.activityList && this.hasFamilyControl){this.avatarTitle()}
+        else if(this.activityList){this.agentTitleAndTime()}
         else Flex({wrap:FlexWrap.Wrap,alignItems:ItemAlign.Baseline,space:{main:LengthMetrics.vp(8),cross:LengthMetrics.vp(4)}}) {
           Text(this.displayTitle()).fontSize(17).maxFontScale(Tokens.interfaceScaleFor(17))
             .fontWeight(this.agent.state === 'unread' ? FontWeight.Bold : 600).fontColor(Colors.ink)
@@ -124,7 +130,7 @@ export struct AgentDirectoryRowContent {
           todoTitle:this.agent.todoTitle,sessionId:this.agent.row.id,starter:this.starter,fontScale:this.fontScale})
       }.alignItems(HorizontalAlign.Start).layoutWeight(1)
     }.width('100%').alignItems(VerticalAlign.Top).constraintSize({minHeight:56}).padding({
-      left:this.previewRow?0:this.leftInset,right:this.previewRow?0:20,top:this.previewRow?4:15,bottom:this.previewRow?4:15
+      left:this.previewRow?0:this.leftInset,right:this.previewRow?0:20,top:this.previewRow?4:this.nestedSession?4:15,bottom:this.previewRow?4:15
     })
   }
   @Builder tinyBrand() {
@@ -148,7 +154,8 @@ export struct AgentDirectoryRowContent {
     if(!this.hideState && !this.muted && this.agent.state!=='unknown')
       Stack(){
         if(this.agent.state==='working' && this.agent.rank!==4){
-          WorkingArcSpinner({diameter:14*this.controlScale,tint:this.tint,surface:Color.Transparent,showCoreDot:true})
+          if (this.activityList) SessionWorkingDot({diameter:12*this.controlScale,tint:this.tint,active:this.active})
+          else WorkingArcSpinner({diameter:12*this.controlScale,tint:this.tint,surface:Color.Transparent})
         }else if(this.agent.rank===4){
           SymbolGlyph($r('sys.symbol.clock')).fontSize(String(14*this.controlScale)+'vp').fontColor([this.tint])
         }else if(this.agent.state==='needs_you'){
@@ -166,7 +173,7 @@ export struct AgentDirectoryRowContent {
       Row({space:4}){
         this.tinyBrand()
         Text(this.displayTitle()).fontSize(17).maxFontScale(Tokens.interfaceScaleFor(17)).fontColor(Colors.ink)
-          .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis}).layoutWeight(1)
+          .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(this.hasFamilyControl ? 2 : 1).textOverflow({overflow:TextOverflow.Ellipsis}).layoutWeight(1)
       }.flexGrow(1).constraintSize({minWidth:'42%',maxWidth:'100%'})
       this.stamp()
     }.width('100%')
@@ -203,7 +210,7 @@ export struct AgentDirectoryRowContent {
             todoTitle:this.agent.todoTitle,sessionId:this.agent.row.id,starter:this.starter,fontScale:this.fontScale})
         }.width('100%')
       }.width('100%').alignItems(HorizontalAlign.Start).padding({left:16,right:12,top:8,bottom:8})
-        .onAreaChange((_old:Area,now:Area)=>{const h=Number(now.height);if(Number.isFinite(h)&&Math.abs(h-this.measuredCardHeight)>.25)this.measuredCardHeight=h;})
+        .onSizeChange((_old:SizeOptions,now:SizeOptions)=>{const h=Number(now.height);if(Number.isFinite(h)&&Math.abs(h-this.measuredCardHeight)>.25)this.measuredCardHeight=h;})
       if(this.measuredCardHeight>16 && !this.hideState && !this.muted && this.agent.state!=='unknown')
         Row().width(4*this.controlScale).height(this.measuredCardHeight-16).backgroundColor(this.tint).borderRadius(3).position({x:4,y:8})
     }.width('100%').borderRadius(14)

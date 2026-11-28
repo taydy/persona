@@ -1,3 +1,4 @@
+import { registerSnapshotTaskpool } from './support/session-snapshot-taskpool.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
@@ -42,7 +43,7 @@ registerHooks({
         './ChatDraftStore', './HubRepository', './MutationStore', './Compatibility',
         './InteractionDecision', '../core/ClientLocale', '../core/WorkPresentation', '../core/Domain', '../core/HubModules',
         '../core/ScopePolicy', '../core/StorageOwnership', '../core/MessageContent',
-        '../core/SessionSnapshot', '../core/HubAccess', '../core/TranscriptCache', '../core/XiaoYiActions', '../core/MessageImageGallery', '../core/ConversationPlan', '../core/AgentEvents'
+        '../core/SessionSnapshot', '../core/HubAccess', '../core/TranscriptCache', '../core/XiaoYiActions', '../core/MessageImageGallery', '../core/ConversationPlan', '../core/AgentEvents', '../core/NextSuggestions'
       ].includes(specifier)) {
         const base = new URL(specifier, context.parentURL);
         return { url: base.href + (existsSync(new URL(base.href + '.ts')) ? '.ts' : '.ets'), shortCircuit: true };
@@ -180,6 +181,7 @@ registerHooks({
   }
 });
 
+registerSnapshotTaskpool();
 const { NativeLiveView } = await import('../entry/src/main/ets/platform/NativeLiveView.ets');
 const {
   decodeInteractionDecision,

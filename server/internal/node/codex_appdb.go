@@ -41,6 +41,7 @@ type codexAppThread struct {
 	Title          string `json:"title"`
 	Cwd            string `json:"cwd"`
 	Source         string `json:"source"`
+	Originator     string `json:"originator"`
 	UpdatedAtMs    int64  `json:"updatedAtMs"`
 	AttachedParent string `json:"attachedParent"`
 	Paginated      bool   `json:"-"`
@@ -197,14 +198,14 @@ func readCodexAppThreads(ctx context.Context, db string, ids []string) (map[stri
 		byID = rows
 	}
 	migrated, err := readCodexThreads(ctx, db, `archived = 0 AND (
-		(originator IN ('Codex Desktop', 'codex_work_desktop') AND source != '' AND source != 'exec')
+		(originator IN ('Codex Desktop', 'codex_work_desktop', 'codex-tui') AND source != '' AND source != 'exec')
 		OR (originator = 'persona' AND source = 'vscode')
 	)`)
 	if err == nil {
 		for id, t := range migrated {
 			// Subagent metadata is needed for parent folding and guardian suppression. Other inferred sources are not
-			// desktop conversations; explicit sidebar IDs above remain authoritative for legacy rows.
-			if strings.TrimSpace(t.Source) != "vscode" && !t.origin().sub {
+			// desktop or terminal conversations; explicit sidebar IDs remain authoritative for legacy rows.
+			if t.Originator != "codex-tui" && strings.TrimSpace(t.Source) != "cli" && strings.TrimSpace(t.Source) != "vscode" && !t.origin().sub {
 				continue
 			}
 			if _, ok := byID[id]; !ok {
@@ -235,15 +236,14 @@ func readCodexThreads(ctx context.Context, db, where string) (map[string]codexAp
 		hideCodexSQLiteWindow(cmd)
 		return cmd.Output()
 	}
-	out, err := query(settings + attached)
-	if err != nil && cctx.Err() == nil { // a schema from before desktop side chats: model and effort without the attachment
-		out, err = query(settings)
-	}
-	if err != nil && cctx.Err() == nil {
-		out, err = query(attached)
-	}
-	if err != nil && cctx.Err() == nil { // a schema without those columns: the rest as before
-		out, err = query("")
+	const origin = ", COALESCE(originator, '') AS originator"
+	var out []byte
+	// Desktop builds added settings, origin and side-chat ownership in different schema versions.
+	for _, columns := range []string{settings + origin + attached, settings + origin, settings + attached, origin + attached, origin, settings, attached, ""} {
+		out, err = query(columns)
+		if err == nil || cctx.Err() != nil {
+			break
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -257,6 +257,7 @@ func readCodexThreads(ctx context.Context, db, where string) (map[string]codexAp
 		return nil, err
 	}
 	for _, r := range rows {
+		r.includeRunning = r.Originator == "codex-tui" || strings.TrimSpace(r.Source) == "cli"
 		byID[r.ID] = r
 	}
 	return byID, nil

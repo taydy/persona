@@ -38,7 +38,7 @@ import (
 // toolNames are the tools only assistant conversations get; their descriptions and schemas are in prompts/mcp
 // (docs/assistant/prompts.md).
 var toolNames = []string{"resource_status", "ask_user", "ask_user_withdraw", "notify_user", "supervision_finish", "schedule_followup", "schedule_routine", "schedule_state_set", "delete_routine", "list_followups",
-	"cancel_followup", "list_places", "save_place", "machines_list", "machine_redeploy", "agents_list", "agent_read", "agent_send", "agent_switch", "agents_switch", "agent_interrupt", "agent_start", "agent_supervise", "agent_transfer", "agent_archive", "agent_unarchive", "agent_autoname", "agent_autoname_receipt", "interaction_answer", "ask_escalate", "inbox_suggest", "inbox_draft",
+	"cancel_followup", "list_places", "save_place", "machines_list", "machine_redeploy", "agents_list", "agent_read", "agent_send", "agent_modes", "agent_switch", "agents_switch", "agent_interrupt", "agent_start", "agent_supervise", "agent_transfer", "agent_archive", "agent_unarchive", "agent_autoname", "agent_autoname_receipt", "interaction_answer", "ask_escalate", "inbox_suggest", "inbox_draft",
 	"inbox_folders", "inbox_move", "inbox_post", "message_send", "kb_search", "kb_list", "kb_get", "kb_update", "kb_history_plan", "kb_history_status", "kb_history_stop", "kb_history_resume", "persona_settings", "secret_run", "skill_import",
 	"model_profiles_list", "model_profile_get", "model_profile_switch", "model_profile_rollback", "model_profile_capture",
 	"model_profile_deactivate", "model_profile_clear", "model_probe", "launcher_import",
@@ -455,6 +455,10 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 			return "", fmt.Errorf("arguments: %w", err)
 		}
 		a.Task = givenTask(a.RawTask)
+		var review resumeReview
+		if a.Resume && self != "" && s.ensureTodosLoaded(ctx) == nil {
+			review = beginResumeReview(self)
+		}
 		space := s.agentCallerSpace(ctx, machine, self)
 		am, c, err := s.findAgentInSpace(ctx, a.Machine, a.SessionID, &space)
 		if err != nil {
@@ -508,7 +512,7 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 				}
 				resumeTodo = todo.ID
 			}
-			if err := s.resumeAllowed(ctx, self, am, c, resume, a.Task); err != nil {
+			if err := s.resumeAllowed(ctx, self, am, c, resume, a.Task, review); err != nil {
 				if resumeTodo != "" {
 					s.rollbackResumeTodo(context.WithoutCancel(ctx), resumeTodo, am.ID, c.SessionID)
 				}
@@ -538,20 +542,20 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		if err := s.ensureTodosLoaded(ctx); err != nil {
 			return "", err
 		}
-		inboxTodo, onTask := s.openTodoOfAgent(am.ID, c.SessionID)
-		mayLink := a.Task != nil || onTask && othersTask(c, inboxTodo, self) == nil
-		if handoff != nil {
-			inboxTodo, mayLink = s.todoNow(handoff.origin)
-		}
-		if !exitText(a.Text) && mayLink {
-			if err := s.planInboxSource(ctx, machine, self, &source); err != nil {
+		var inboxTodo Todo
+		if source.InboxItem != "" {
+			var onTask bool
+			inboxTodo, onTask = s.openTodoOfAgent(am.ID, c.SessionID)
+			mayLink := a.Task != nil || onTask && othersTask(c, inboxTodo, self) == nil
+			if handoff != nil {
+				inboxTodo, mayLink = s.todoNow(handoff.origin)
+			}
+			if exitText(a.Text) || !mayLink {
+				return "", fmt.Errorf("inbox_item requires work on your own open task; nothing was sent")
+			}
+			if err := s.planExistingTaskInbox(ctx, machine, self, &source, inboxTodo); err != nil {
 				return "", err
 			}
-			if err := s.checkExistingTaskInbox(self, source, inboxTodo); err != nil {
-				return "", err
-			}
-		} else if source.InboxItem != "" {
-			return "", fmt.Errorf("inbox_item requires work on your own open task; nothing was sent")
 		}
 		summary := agentLabel(c) + " · " + am.Name + "\n\n" + a.Text
 		if resume != "" { // the phone says it resumes the agent, and why
@@ -561,7 +565,18 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		if a.Task != nil {
 			words = strings.Join(append([]string{a.Task.Title, a.Text}, a.Task.DoneWhen...), "\n\n")
 		}
-		if ok, outcome, err := s.confirmOutbound(ctx, machine, self, name, words, summary, args); err != nil {
+		// Bind approval to the resolved address, even when the caller used a prefix or machine alias.
+		var proposal map[string]json.RawMessage
+		if err := json.Unmarshal(args, &proposal); err != nil {
+			return "", err
+		}
+		proposal["machine"], _ = json.Marshal(am.ID)
+		proposal["session_id"], _ = json.Marshal(c.SessionID)
+		approvalInput, err := json.Marshal(proposal)
+		if err != nil {
+			return "", err
+		}
+		if ok, outcome, err := s.confirmOutbound(ctx, machine, self, name, words, summary, approvalInput); err != nil {
 			if resumeTodo != "" {
 				s.rollbackResumeTodo(context.WithoutCancel(ctx), resumeTodo, am.ID, c.SessionID)
 			}
@@ -572,19 +587,31 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 			}
 			return outboundNotDone(outcome, "The user declined on the phone: nothing was sent to that agent.", "nothing was sent to that agent"), nil
 		}
+		// Approval may have waited while the target moved to another privacy space or runtime.
+		am, c, err = s.findAgentInSpace(ctx, am.ID, c.SessionID, &space)
+		if err != nil {
+			return "", err
+		}
+		if c.Assistant || c.SourceKind != "" && (c.Capabilities == nil || !c.Capabilities.Send) && !stoppedAgent(c) {
+			return "", errors.New("the Agent changed while permission was pending; nothing was sent")
+		}
 		if err := s.externalSessionRefusal(ctx, self, am, c); err != nil {
 			return "", err
 		}
-		if err := s.checkExistingTaskInbox(self, source, inboxTodo); err != nil {
-			return "", fmt.Errorf("%w; nothing was sent", err)
+		if source.InboxItem != "" {
+			if err := s.checkExistingTaskInbox(self, source, inboxTodo); err != nil {
+				return "", fmt.Errorf("%w; nothing was sent", err)
+			}
 		}
 		var task *handedTask
 		if a.Task != nil {
 			if task, err = s.handTask(ctx, self, am, c, *a.Task, a.Text); err != nil {
 				return "", err
 			}
-			if err := s.checkExistingTaskInbox(self, source, task.todo); err != nil {
-				return "", task.sendFailed(ctx, s, fmt.Errorf("%w; nothing was sent", err))
+			if source.InboxItem != "" {
+				if err := s.checkExistingTaskInbox(self, source, task.todo); err != nil {
+					return "", task.sendFailed(ctx, s, fmt.Errorf("%w; nothing was sent", err))
+				}
 			}
 		}
 		persistInbox := func(ctx context.Context, result string) (string, error) {
@@ -648,6 +675,7 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 			params["client_msg_id"] = inputID
 		}
 		finish := func(sendCtx context.Context, receipt string) (string, error) {
+			s.clearSpawnedDone(am.ID, c.SessionID)
 			receipt, err := persistInbox(sendCtx, receipt)
 			if err != nil {
 				return receipt, err
@@ -747,6 +775,8 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 			return "", task.sendFailed(sctx, s, err)
 		}
 		return finish(sctx, fmt.Sprintf("Resumed %s on %s (same session, directory and launcher) and sent.", agentLabel(c), am.Name)+handed.said()+task.sent(sctx, s, a.Text))
+	case "agent_modes": // adjusts a running agent's model, effort, or permission mode (agent_modes.go, #17863)
+		return s.toolAgentModes(ctx, machine, self, args)
 	case "agent_switch": // moves a running agent to another launcher and goes on with it (agent_switch.go, #5973)
 		return s.toolAgentSwitch(ctx, machine, self, args)
 	case "agents_switch": // moves many running agents to another launcher at once (agents_switch.go, #6008)
@@ -1459,10 +1489,19 @@ func (s *Service) toolAskUser(ctx context.Context, machine, sessionID string, ar
 			Options     []proto.QuestionOption `json:"options"`
 		} `json:"questions"`
 		// Wait false: the card goes up and the tool returns at once (ask_later.go). Unset is true.
-		Wait *bool `json:"wait"`
+		Wait          *bool  `json:"wait"`
+		DecisionScope string `json:"decision_scope"`
+		WhyOwner      string `json:"why_owner"`
+		OwnerAction   string `json:"owner_action"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil || len(a.Questions) == 0 {
 		return "", fmt.Errorf("questions are required")
+	}
+	if a.WhyOwner != "" && !slices.Contains(whyOwners, a.WhyOwner) {
+		return "", fmt.Errorf("why_owner is one of %s", strings.Join(whyOwners, ", "))
+	}
+	if a.OwnerAction != "" && !slices.Contains([]string{"personal_unlock", "login", "second_factor", "experience_check", "spending"}, a.OwnerAction) {
+		return "", errors.New("owner_action must name a personal unlock, login, second factor, experience check or spending")
 	}
 	var da askDeadlineArgs
 	if err := json.Unmarshal(args, &da); err != nil {
@@ -1472,6 +1511,15 @@ func (s *Service) toolAskUser(ctx context.Context, machine, sessionID string, ar
 	deadline, err := readAskDeadline(da, now)
 	if err != nil {
 		return "", err
+	}
+	if a.DecisionScope != "" && a.DecisionScope != "internal" && a.DecisionScope != "owner" {
+		return "", errors.New("decision_scope must be internal or owner")
+	}
+	if a.WhyOwner == "" && a.OwnerAction == "" && a.DecisionScope != "internal" {
+		return "", errors.New("say decision_scope=internal for execution questions, or supply why_owner/owner_action for an owner decision; personal unlocks must use owner_action=personal_unlock, never provide a private key")
+	}
+	if a.DecisionScope == "internal" && (a.WhyOwner != "" || a.OwnerAction != "") {
+		return "", errors.New("an owner reason or personal action cannot be labelled internal")
 	}
 	expires := now.Add(askUserWait)
 	if !deadline.At.IsZero() {
@@ -1504,13 +1552,18 @@ func (s *Service) toolAskUser(ctx context.Context, machine, sessionID string, ar
 			Recommend: askRecommend(da, i, q.Options)})
 	}
 	keepAskDecision(&ix, da, deadline)
+	if !deadline.At.IsZero() && deadline.Reversible && (a.OwnerAction != "" || a.WhyOwner == whyVisible || a.WhyOwner == whyIrreversible) {
+		return "", errors.New("personal actions, outward writes, spending and irreversible decisions cannot take a default")
+	}
 	markRecommended(s.lang(ctx), s.location(ctx), ix.Questions, deadline)
 	// Answers come back keyed by question text: two questions with the same text would lose one answer.
 	if proto.HasDuplicateQuestionText(ix.Questions) {
 		return "", i18n.Err("hub-hub.duplicate_question")
 	}
-	if err := s.promoteSupervision(sessionID); err != nil {
-		return "", err
+	if questionOwnerSource(ix) != "" {
+		if err := s.promoteSupervision(sessionID); err != nil {
+			return "", err
+		}
 	}
 	if a.Wait != nil && !*a.Wait {
 		return s.askLaterStart(ctx, ix)
@@ -1530,7 +1583,13 @@ func (s *Service) toolAskUser(ctx context.Context, machine, sessionID string, ar
 		return "", err
 	}
 	if r.Cancel {
+		if questionOwnerSource(ix) == "" {
+			return "The internal question was cancelled. Nothing was authorized.", nil
+		}
 		return prompts.RenderQuestionCancelled(), nil
+	}
+	if s.askExpiredResolution(ix, r) && questionOwnerSource(ix) == "" {
+		return "The internal question expired without a supervisor answer. Nothing was authorized; ask again if still needed.", nil
 	}
 	if s.askExpiredResolution(ix, r) { // nobody answered in time: it waits as a to-do (ask_todo.go)
 		t, err := s.askExpired(context.WithoutCancel(ctx), ix)
@@ -1540,10 +1599,17 @@ func (s *Service) toolAskUser(ctx context.Context, machine, sessionID string, ar
 		s.logf("ask_user %s: expired, and no to-do could be made: %v", ix.ID, err)
 	}
 	if r.Dismiss || len(r.Answers) == 0 {
+		if questionOwnerSource(ix) == "" {
+			return "The internal question ended without a supervisor answer. Nothing was authorized; ask again if still needed.", nil
+		}
 		return "The user did not answer (dismissed or timed out). Don't go ahead with what you asked about; say what is waiting for them.", nil
 	}
 	var b strings.Builder
-	b.WriteString("The user answered:\n")
+	if r.AnsweredBy == proto.AnsweredByAssistant {
+		b.WriteString("The designated supervisor answered as the assistant:\n")
+	} else {
+		b.WriteString("The user answered:\n")
+	}
 	for _, q := range a.Questions {
 		if ans, ok := r.Answers[q.Question]; ok {
 			fmt.Fprintf(&b, "- %s → %s\n", q.Question, ans)

@@ -32,6 +32,7 @@ interface RelationData {
   folded: string;
   kind: RelationKind;
   visible: boolean;
+  started: number;
   agents: ResourceRow[];
 }
 
@@ -44,11 +45,14 @@ function read(row: ResourceRow): RelationData {
   const raw = row.data(), id = row.session || row.id;
   const side = Wire.text(raw, 'parent_agent_id');
   const worker = Wire.text(raw, 'folded_as') === 'worker';
+  const started = raw['created_at'] || raw['started_at'];
+  const stamp = typeof started === 'number' ? started : typeof started === 'string' ? Date.parse(started) : NaN;
   const record: RelationData = {
     parent: side || Wire.text(raw, 'parent_session_id') || Wire.text(raw, 'asking_parent_session_id'),
     root: Wire.text(raw, 'root_session_id'), folded: worker ? '' : Wire.text(raw, 'folded_under'),
     kind: side || Wire.text(raw, 'folded_as') === 'side' ? 'side' : 'subtask',
-    visible: !Wire.bool(raw, 'hidden_by_directory') && !Wire.bool(raw, 'deleted'), agents: []
+    visible: !Wire.bool(raw, 'hidden_by_directory') && !Wire.bool(raw, 'deleted'),
+    started: Number.isFinite(stamp) ? stamp : Number.MAX_SAFE_INTEGER, agents: []
   };
   if (record.visible) {
     const archived = Wire.bool(raw, 'archived');
@@ -64,9 +68,10 @@ function read(row: ResourceRow): RelationData {
       const asking = Wire.text(agent, 'state') === 'needs_you';
       const caps: Record<string,Object> = {'read':true};
       const data: Record<string,Object> = {
-        'session_id':sid, 'machine_id':row.machine, 'manager':row.manager, 'cwd':row.path, 'agent':Wire.text(raw, 'agent', 'claude'),
+        'session_id':sid, 'machine_id':row.machine, 'manager':row.manager, 'cwd':row.path, 'agent':Wire.text(raw, 'agent') || Wire.text(raw, 'agent_type') || Wire.text(raw, 'launcher') || 'claude',
         'title':Wire.text(agent, 'description') || Wire.text(agent, 'label') || Wire.text(agent, 'type') || agentId,
         'last_text':Wire.text(agent, 'last_text'), 'updated_at':Wire.text(agent, 'updated_at'), 'model':Wire.text(agent, 'model'),
+        'created_at': agent['created_at'] || agent['started_at'] || '',
         'state':archived || stale ? 'offline' : asking ? 'needs_you' : running ? 'working' : 'idle',
         'status':archived || stale ? 'offline' : running ? 'working' : status || 'done', 'archived':archived,
         'parent_session_id':id, 'is_subagent':true, 'source_kind':'subagent_transcript', 'read_only':true, 'capabilities':caps
@@ -85,7 +90,7 @@ export class SessionRelations {
   private byId = new Map<string,ResourceRow>();
   private roots = new Map<string,ResourceRow>();
   private members = new Map<string,ResourceRow[]>();
-  constructor(rows: ResourceRow[], unavailable: string[] = []) {
+  constructor(rows: ResourceRow[], unavailable: string[] = [], previous?: SessionRelations) {
     const offline = new Set(unavailable);
     const effective = (row: ResourceRow): ResourceRow => {
       if (!offline.size || row.state === 'offline') return row;
@@ -97,10 +102,13 @@ export class SessionRelations {
       if (row.machine && row.kind === 'session' && read(row).visible) this.byId.set(sessionKey(row), row);
     }
     // Prefer full directory rows, then ordinary agents, then agents reported only by a workflow.
+    const reportedParents = new Map<string, ResourceRow>();
     for (const row of rows) {
-      if (!this.byId.has(sessionKey(row))) continue;
+      const owner = this.byId.get(sessionKey(row));
+      if (!owner) continue;
       for (const agent of read(row).agents) {
         const key = sessionKey(agent);
+        reportedParents.set(key, owner);
         if (this.byId.has(key)) continue;
         const child = effective(agent);
         this.byId.set(key, child); this.rows.push(child);
@@ -123,6 +131,7 @@ export class SessionRelations {
           if (id && id !== self) parent = this.byId.get(sessionKey(node, id));
           if (parent) break;
         }
+        if (!meta.parent && !meta.folded && !meta.root) parent = reportedParents.get(key);
         if (!parent) break;
         node = parent;
       }
@@ -135,6 +144,16 @@ export class SessionRelations {
       const rootKey = sessionKey(root), list = this.members.get(rootKey) || [];
       list.push(row); this.members.set(rootKey, list);
     });
+    this.members.forEach((children: ResourceRow[], key: string) => {
+      if (children.length < 2) return;
+      const positions = new Map<string,number>();
+      previous?.members.get(key)?.forEach((child: ResourceRow, index: number) => positions.set(child.session || child.id, index));
+      children.sort((a: ResourceRow, b: ResourceRow): number => {
+        const left = a.session || a.id, right = b.session || b.id;
+        const order = (positions.get(left) ?? Number.MAX_SAFE_INTEGER) - (positions.get(right) ?? Number.MAX_SAFE_INTEGER);
+        return order || read(a).started - read(b).started || (left < right ? -1 : left > right ? 1 : 0);
+      });
+    });
   }
   find(row: ResourceRow): ResourceRow | undefined { return this.byId.get(sessionKey(row)); }
   root(row: ResourceRow): ResourceRow | undefined { return this.roots.get(sessionKey(row)); }
@@ -144,10 +163,10 @@ export class SessionRelations {
 
 interface DirectorySnapshot { availability: string; graph: SessionRelations }
 const directories = new WeakMap<ResourceRow[], DirectorySnapshot>();
-export function sessionRelations(rows: ResourceRow[], unavailable: string[] = []): SessionRelations {
+export function sessionRelations(rows: ResourceRow[], unavailable: string[] = [], previous?: SessionRelations): SessionRelations {
   const availability = JSON.stringify(unavailable), snapshot = directories.get(rows);
   if (snapshot && snapshot.availability === availability) return snapshot.graph;
-  const graph = new SessionRelations(rows, unavailable);
+  const graph = new SessionRelations(rows, unavailable, previous);
   directories.set(rows, {availability, graph});
   return graph;
 }

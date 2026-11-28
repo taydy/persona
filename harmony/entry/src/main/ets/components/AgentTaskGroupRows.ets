@@ -110,7 +110,12 @@ export struct AgentTaskGroupRows {
           }.id('agents.group.empty.' + this.section.key)
         }
         Repeat<AgentTaskLine>(this.section.lines).each((entry: RepeatItem<AgentTaskLine>) => {
-          if (entry.item.kind === 'session') this.rowContent(entry.item.row,entry.item.depth)
+          if (entry.item.kind === 'session') {
+            this.rowContent(entry.item.row,entry.item.depth)
+            ForEach(this.workspace.expandedChildren(entry.item.row), (child: ResourceRow) => {
+              this.rowContent(child,entry.item.depth + 1)
+            }, (child: ResourceRow) => child.key())
+          }
           else this.taskOrTree(entry.item)
         }).key((line: AgentTaskLine) => line.kind + line.row.key())
       }
