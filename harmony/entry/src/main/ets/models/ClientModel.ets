@@ -1709,7 +1709,8 @@ export class ClientModel {
   private projectMessages(items: readonly TranscriptItem[], running: boolean): ChatMessage[] {
     const target = this.target();
     const messages = projectTranscriptRows(items, running || !!this.transcript?.liveActive, this.transcript?.liveTools, Wire.text(this.sessionRow().data(), 'agent'),
-      (action: string): string => tr('next_step_' + action)).map((row): ChatMessage => {
+      (action: string): string => tr('next_step_' + action),
+      (): number => this.connected ? this.transcript?.turnStartedBefore(items[0]?.seq ?? 0) ?? 0 : 0).map((row): ChatMessage => {
       if (row.kind === 'work') {
         const summary = new ChatMessage(row.id, 'work');
         summary.work = row.work; summary.turnChanges = turnChangesFromWork(row.work); summary.ownerTarget = target;

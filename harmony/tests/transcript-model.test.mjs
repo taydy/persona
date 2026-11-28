@@ -40,6 +40,7 @@ registerHooks({
 });
 
 const {TranscriptModel} = await import('../entry/src/main/ets/models/TranscriptModel.ets');
+const {projectTranscriptRows} = await import('../entry/src/main/ets/core/Domain.ts');
 
 function fixture() {
   const calls = [];
@@ -91,12 +92,12 @@ function historyPage(history, sequences, hasMore = false) {
   };
 }
 
-function historyFixture(call) {
+function historyFixture(call, toolsChanged = () => {}) {
   const visible = [], snapshots = [], errors = [];
   const model = new TranscriptModel({machine:'machine-one', session:'session-one'},
     {call, transport:{send(){}}},
     {async get(){return '';}, async put(_key, value){snapshots.push(JSON.parse(value));}},
-    'history-test', (items, hasMore, ready) => visible.push({items, hasMore, ready}), error => errors.push(error.message));
+    'history-test', (items, hasMore, ready) => visible.push({items, hasMore, ready}), error => errors.push(error.message), () => {}, toolsChanged);
   return {model, visible, snapshots, errors};
 }
 
@@ -373,6 +374,46 @@ test('a warmed previous page stays invisible and is shared by simultaneous reads
   release(historyPage('abc',[10,11]));await Promise.all([a,b]);
   assert.deepEqual(visible.at(-1).items.map(i=>i.seq),[10,11,40,41]);
 });
+test('a live Claude command recovers its turn clock from the prefetched page without moving the transcript', async () => {
+  const ts = '2026-01-01T00:00:00Z';
+  const prompt = { id:'q', seq:1, ts, kind:'text', role:'user', text:'Check the sample' };
+  const fold = { id:'fold:work', seq:2, kind:'fold', fold:{ tools:32, items:79, through_seq:80 } };
+  const current = { id:'check', seq:81, ts:'2026-01-01T00:02:00Z', kind:'tool_use', tool_name:'Bash',
+    tool_use_id:'check', tool_input:{ description:'Check the result' } };
+  const tail = { history:'h', has_more:true, to_seq:81, items:[current] };
+  const end = { id:'end', seq:80, kind:'turn_duration', turn_duration:{ duration_ms:95000 } };
+  for (const [previous, expected] of [
+    [{ history:'h', items:[prompt, fold] }, Date.parse(ts)],
+    [{ history:'other', items:[prompt, fold] }, 0],
+    [{ history:'h', items:[prompt, end] }, 0],
+  ]) {
+    let resolve, reads = 0, updates = 0;
+    const {model,visible} = historyFixture(async path => {
+      if (!path.includes('before_seq=')) return tail;
+      reads++;
+      return new Promise(done => { resolve = done; });
+    }, () => { updates++; });
+    await model.open();
+    const page = visible.at(-1).items;
+    const start = () => projectTranscriptRows(page, true, [], 'claude', undefined,
+      () => model.turnStartedBefore(page[0].seq)).at(-1).work.liveTurnStartedAt;
+    model.prefetchOlder(81);
+    assert.equal(start(), 0);
+    assert.equal(start(), 0);
+    const release = model.holdHistoryRendering();
+    resolve(previous);
+    await new Promise(done => setImmediate(done));
+    assert.equal(updates, 0);
+    release();
+    assert.equal(updates, expected ? 1 : 0);
+    assert.equal(start(), expected);
+    assert.equal(visible.at(-1).items, page);
+    assert.equal(model.reducer.firstSeq, 81);
+    assert.equal(reads, 1);
+    model.close();
+  }
+});
+
 test('failed speculative history is retried on demand without displaying an error before a tap',async()=>{
   let calls=0;const {model,errors}=historyFixture(async path=>{
     if(!path.includes('before_seq='))return historyPage('h',[3],true);
@@ -380,7 +421,7 @@ test('failed speculative history is retried on demand without displaying an erro
     return historyPage('h',[1,2]);
   });
   await model.open();model.prefetchOlder(3);await new Promise(r=>setImmediate(r));
-  model.prefetchOlder(3);assert.equal(calls,1);assert.deepEqual(errors,[]);
+  model.prefetchOlder(3);assert.equal(model.turnStartedBefore(3),0);assert.equal(calls,1);assert.deepEqual(errors,[]);
   await model.older();assert.equal(calls,2);assert.equal(model.reducer.firstSeq,1);
 });
 

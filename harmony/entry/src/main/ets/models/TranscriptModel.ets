@@ -1,7 +1,7 @@
 import { decisionSourceItem } from './InteractionHistory';
 import type { LiveToolCall } from '../core/Domain';
 import type { TranscriptItem, TranscriptBatch, TranscriptAction, TranscriptSnapshot } from '../core/Domain';
-import { TranscriptReducer, TranscriptSync, transcriptExchanges } from '../core/Domain';
+import { TranscriptReducer, TranscriptSync, currentTurnStartedAt, transcriptExchanges } from '../core/Domain';
 import { ConversationPlanReplay, samePlanSummary } from '../core/ConversationPlan';
 import type { ConversationPlan } from '../core/ConversationPlan';
 import { HubRepository, segment } from './HubRepository';
@@ -45,6 +45,7 @@ interface OlderPage {
   owner: TranscriptSync;
   before: number;
   request: Promise<Record<string, Object>>;
+  turnStartedAt?: number;
 }
 
 // A visible conversation owns its subscription, paging and continuity state.
@@ -123,6 +124,9 @@ export class TranscriptModel {
   private replaceLiveTools(frame: ToolActivityFrame, paneThinking: boolean, paneCompacting: boolean = false): void {
     if (paneThinking === this.paneThinking && paneCompacting === this.paneCompacting && frame.same(this.toolActivity)) return;
     this.toolActivity = frame; this.paneThinking = paneThinking; this.paneCompacting = paneCompacting;
+    this.notifyToolDisplay();
+  }
+  private notifyToolDisplay(): void {
     if (this.historyReaders > 0) this.pendingTools = true;
     else this.toolsChanged();
   }
@@ -331,6 +335,25 @@ export class TranscriptModel {
     this.bufferedOlder = page;
     page.request.catch(() => { if (this.bufferedOlder === page) this.bufferedOlder = undefined; });
     return page;
+  }
+  /** Read the opening from the same folded page the timeline prefetches, without inserting rows into the list. */
+  turnStartedBefore(before: number): number {
+    if (!this.active || !this.historyKey || before <= 0 || before !== this.reducer.firstSeq || this.reducer.hasMore !== true) return 0;
+    this.prefetchOlder(before);
+    const page = this.bufferedOlder;
+    if (!page || page.owner !== this.sync || page.before !== before) return 0;
+    if (page.turnStartedAt === undefined) {
+      page.turnStartedAt = 0;
+      page.request.then((data: Record<string, Object>): void => {
+        if (!this.currentRead(page.owner) || this.bufferedOlder !== page || this.reducer.firstSeq !== before ||
+          Wire.text(data, 'history') !== this.historyKey) return;
+        const items = this.batch(data).items;
+        if (!items.length || items[items.length - 1].seq >= before) return;
+        page.turnStartedAt = currentTurnStartedAt(transcriptExchanges(items));
+        if (page.turnStartedAt > 0) this.notifyToolDisplay();
+      }).catch(() => {});
+    }
+    return page.turnStartedAt;
   }
   prefetchOlder(before: number): void {
     if (!this.active || before <= 0 || this.warmedBefore === before || this.reducer.hasMore !== true) return;
