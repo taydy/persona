@@ -42,7 +42,7 @@ registerHooks({
         './ChatDraftStore', './HubRepository', './MutationStore', './Compatibility',
         './InteractionDecision', '../core/ClientLocale', '../core/WorkPresentation', '../core/Domain', '../core/HubModules',
         '../core/ScopePolicy', '../core/StorageOwnership', '../core/MessageContent',
-        '../core/SessionSnapshot', '../core/HubAccess', '../core/TranscriptCache', '../core/XiaoYiActions', '../core/MessageImageGallery', '../core/ConversationPlan', '../core/AgentEvents'
+        '../core/SessionSnapshot', '../core/HubAccess', '../core/TranscriptCache', '../core/XiaoYiActions', '../core/MessageImageGallery', '../core/ConversationPlan', '../core/AgentEvents', '../core/NextSuggestions'
       ].includes(specifier)) {
         const base = new URL(specifier, context.parentURL);
         return { url: base.href + (existsSync(new URL(base.href + '.ts')) ? '.ts' : '.ets'), shortCircuit: true };
