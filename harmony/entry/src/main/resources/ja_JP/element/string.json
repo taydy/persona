@@ -10075,6 +10075,18 @@
     {
       "name": "workspace_pair_action",
       "value": "再ペアリング"
+    },
+    {
+      "name": "machine_admin_remove",
+      "value": "Hub 管理画面で削除…"
+    },
+    {
+      "name": "machine_admin_unavailable",
+      "value": "Hub 管理画面を開けませんでした。"
+    },
+    {
+      "name": "machine_admin_root",
+      "value": "Hub の直接アドレスで管理画面を開き、このコンピュータを削除してください。"
     }
   ]
 }

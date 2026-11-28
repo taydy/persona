@@ -255,6 +255,7 @@ export struct SettingsPage {
     }
     const current=():boolean => this.mounted && this.active && revision===this.machineRevision &&
       owner===this.model && owner.owns(generation,scope) && routeKey===(this.initialMachine?.key() || '');
+    this.management.loading = true;
     let refreshFailed=false;
     try { await owner.refreshDirectory(); } catch (_) { refreshFailed=true; }
     if (!current()) return;
@@ -282,6 +283,7 @@ export struct SettingsPage {
       await this.management.load('machines', owner);
       if (!this.mounted || !this.active || revision !== this.machineRevision || !this.model.owns(generation, scope)) return;
       this.management.selectedId = row.id;
+      if (!this.machineRow() && !this.management.error) this.management.error = 'admin_machine_unavailable';
     } catch (_) { if (this.mounted && this.active && revision === this.machineRevision && this.model.owns(generation, scope)) this.management.error = 'offline'; }
     finally { if (revision === this.machineRevision) this.management.loading = false; }
   }
@@ -388,9 +390,19 @@ export struct SettingsPage {
     }
   }
   private machineRow(): ManagementRow | undefined {
-    return this.management.rows.find((item: ManagementRow) => item.id === this.management.selectedId);
+    const id = this.machineChoice?.id || this.initialMachine?.id || this.management.selectedId;
+    return this.management.rows.find((item: ManagementRow) => item.id === id && item.id === this.management.selectedId);
   }
-  @Computed get selectedPlatform(): MachinePlatform { return machinePlatform(this.machineRow()?.raw || {}); }
+  // While the management API resolves, the route already identifies the computer. Only
+  // the verified management row can enable actions, even if two hubs reuse the same ID.
+  @Computed get machineIdentity(): Record<string, Object> {
+    return this.machineRow()?.raw || this.initialMachine?.data() || {};
+  }
+  @Computed get selectedPlatform(): MachinePlatform { return machinePlatform(this.machineIdentity); }
+  @Computed get machinePending(): boolean {
+    return Wire.text(this.machineIdentity, 'trust') === 'pending' || Wire.bool(this.machineIdentity, 'pending_confirm') ||
+      Wire.bool(this.machineIdentity, 'pending');
+  }
   private screenMachine(): ResourceRow | undefined {
     const selected = this.machineRow();
     if (!selected || !this.machineOwner) return undefined;
@@ -407,8 +419,19 @@ export struct SettingsPage {
   }
   private canOpenScreen(): boolean {
     const row = this.screenMachine(); if (!this.mounted || !this.active || !row || !this.machineOwner?.connected || this.model.demo || this.management.loading) return false;
-    const data = row.data(), os = Wire.text(data, 'os', Wire.text(Wire.object(data, 'system'), 'os'));
-    return ['', 'mac', 'darwin'].includes(os) && Wire.bool(data, 'online') && !Wire.bool(data, 'pending') && !Wire.bool(data, 'pending_confirm') && ['', 'confirmed', 'personal', 'work'].includes(Wire.text(data, 'trust'));
+    return row.supportsScreen();
+  }
+  private async openMachineAdmin(): Promise<void> {
+    const owner = this.machineOwner, row = this.screenMachine(), context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (!context || !this.mounted || !this.active || !owner || owner.demo || !row || this.machinePending || this.management.loading) return;
+    const base = owner.profile.baseUrl;
+    if (!/^https?:\/\/[^/?#@\s]+\/?$/i.test(base)) { this.management.error = 'machine_admin_root'; return; }
+    const revision = this.machineRevision;
+    try { await context.openLink(base.replace(/\/$/, '') + '/admin/machines'); }
+    catch (_) {
+      if (this.mounted && this.active && this.machineOwner === owner && revision === this.machineRevision)
+        this.management.error = 'machine_admin_unavailable';
+    }
   }
   private rowEnabled(row: ManagementRow): boolean { return Wire.bool(row.raw, 'enabled'); }
   private canPairComputer(): boolean { return this.mounted && this.active && !!this.machineOwner?.connected && !this.management.loading && (!this.machineDirectoryKey || !!this.screenMachine()); }
@@ -792,29 +815,65 @@ export struct SettingsPage {
     }.padding(Tokens.page).width('100%')
   }
 
+  @Builder machineIdentityCard() {
+    Row({ space: Tokens.inset }) {
+      DeviceMark({ family: this.selectedPlatform.family, fallback: Symbols.machine })
+        .id('machines.os.' + (this.selectedPlatform.family || 'unknown'))
+      Column({ space: Tokens.fine }) {
+        Text(this.machineRow()?.title || this.initialMachine?.title || this.initialMachine?.id || tr('machine'))
+          .fontSize(Tokens.title).fontWeight(FontWeight.Bold).fontColor(Colors.ink)
+          .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.selectedPlatform.detail) Text(this.selectedPlatform.detail).fontSize(Tokens.meta).fontColor(Colors.secondary)
+        Text(tr(this.machinePending ? 'machine_pending' : Wire.bool(this.machineIdentity, 'online') ? 'machine_status_online' : 'offline'))
+          .fontSize(Tokens.meta).fontWeight(FontWeight.Medium)
+          .fontColor(this.machinePending ? Colors.working : Wire.bool(this.machineIdentity, 'online') ? Colors.positive : Colors.secondary)
+        if (Wire.text(this.machineIdentity, 'error') || !Wire.bool(this.machineIdentity, 'online') && Wire.text(this.machineIdentity, 'state'))
+          Text(Wire.text(this.machineIdentity, 'error') || Wire.text(this.machineIdentity, 'state')).fontSize(Tokens.meta).fontColor(Colors.secondary)
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+    }.width('100%').padding(Tokens.page).alignItems(VerticalAlign.Center)
+      .backgroundColor(Colors.card(true)).borderRadius(PhoneStyle.cardRadius)
+      .border({ width: PhoneStyle.surfaceEdgeWidth(0.5), color: PhoneStyle.cardBorder(nativeEnvironment.dark), radius: PhoneStyle.cardRadius })
+      .accessibilityGroup(true).id('machines.identity')
+  }
+
   @Builder machinesPage() {
     Column() {
-      List() {
-        if ((this.machineOwner || this.model).features.includes('machines_add')) ListItem() { Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('add_computer')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('add_computer', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('add_computer')).bindTips(tr('add_computer')).enabled(this.canPairComputer()).onClick(() => this.addComputerOpen = true) }.padding({ left: Tokens.page, right: Tokens.page })
-        if (this.machineOptions().length > 0) ListItem() {
-          Select(this.selectOptions(this.machineOptions().map((row: ResourceRow) => this.machineLabel(row)))).attributeModifier(SelectStyles.inline)
-            .selected(Math.max(0, this.machineOptions().findIndex((row: ResourceRow) => row.key() === this.machineDirectoryKey)))
-            .value(this.machineOptions().find((row: ResourceRow) => row.key() === this.machineDirectoryKey) ? this.machineLabel(this.machineOptions().find((row: ResourceRow) => row.key() === this.machineDirectoryKey) as ResourceRow) : tr('machine'))
-            .onSelect((index: number) => { const row = this.machineOptions()[index]; if (row) this.chooseMachine(row); }).enabled(!this.management.loading && !this.addComputerOpen).width('100%')
-        }.padding({ left: Tokens.page, right: Tokens.page })
-        if (this.machineRow()) {
-          ListItem() {
-            Row({ space: Tokens.inset }) {
-              DeviceMark({ family: this.selectedPlatform.family, fallback: Symbols.machine })
-                .id('machines.os.' + (this.selectedPlatform.family || 'unknown'))
-              Column({ space: Tokens.fine }) {
-                Text(tr('platform')).fontSize(Tokens.body).fontColor(Colors.ink)
-                if (this.selectedPlatform.detail) Text(this.selectedPlatform.detail).fontSize(Tokens.meta).fontColor(Colors.secondary)
-              }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-            }.width('100%').padding(Tokens.page)
+      List({ space: Tokens.inset }) {
+        if (!this.initialMachine?.id) {
+          if ((this.machineOwner || this.model).features.includes('machines_add')) ListItem() {
+            Button(tr('add_computer')).attributeModifier(ButtonStyles.secondary).width('100%')
+              .enabled(this.canPairComputer()).onClick(() => this.addComputerOpen = true).id('machines.add')
           }
-          ListItem() { ComposeListItemV2({ contentItemV2: new ContentItemV2({ primaryText: tr('status'),
-            secondaryText: Wire.text(this.machineRow()?.raw || {}, 'error', Wire.text(this.machineRow()?.raw || {}, 'state', tr(Wire.bool(this.machineRow()?.raw || {}, 'online') ? 'online' : 'offline'))) }) }) }
+          if (this.machineOptions().length > 0) ListItem() {
+            Select(this.selectOptions(this.machineOptions().map((row: ResourceRow) => this.machineLabel(row)))).attributeModifier(SelectStyles.inline)
+              .selected(Math.max(0, this.machineOptions().findIndex((row: ResourceRow) => row.key() === this.machineDirectoryKey)))
+              .value(this.machineChoice ? this.machineLabel(this.machineChoice) : tr('machine'))
+              .onSelect((index: number) => { const row = this.machineOptions()[index]; if (row) this.chooseMachine(row); })
+              .enabled(!this.management.loading && !this.addComputerOpen).width('100%').id('machines.picker')
+          }
+        }
+        if (this.machineRow() || this.initialMachine?.id && !this.management.error) ListItem() { this.machineIdentityCard() }
+        if (this.machineRow()) {
+          if (this.machinePending) {
+            ListItem() {
+              Row({ space: Tokens.gap }) {
+                Button(tr('reject')).attributeModifier(ButtonStyles.secondary).fontColor(Colors.danger).layoutWeight(1)
+                  .enabled(Wire.text(this.machineIdentity, 'trust') === 'pending' && !!this.screenMachine() && !this.management.loading && !this.management.saving)
+                  .onClick(() => { const row = this.machineRow(); if (row) this.confirmMachine(row, false); })
+                Button(tr('confirm_computer')).attributeModifier(ButtonStyles.primary).layoutWeight(1)
+                  .enabled(Wire.text(this.machineIdentity, 'trust') === 'pending' && !!this.screenMachine() && !this.management.loading && !this.management.saving)
+                  .onClick(() => { const row = this.machineRow(); if (row) this.confirmMachine(row, true); }).id('machines.confirm')
+              }.width('100%')
+            }
+          } else {
+            if (this.canOpenScreen()) ListItem() {
+              Button(tr('computer_screen_open')).attributeModifier(ButtonStyles.secondary).width('100%')
+                .onClick(() => {
+                  const row = this.screenMachine();
+                  if (row && this.canOpenScreen()) this.onComputer(row);
+                }).id('machines.screen')
+            }
+          }
           if (this.machineOwner && this.management.canRenameMachine(this.machineOwner, this.machineRow()!)) {
             if (this.namingCurrent()) {
               ListItem() {
@@ -826,11 +885,11 @@ export struct SettingsPage {
                     Button(tr('cancel')).attributeModifier(ButtonStyles.secondary).enabled(!this.management.saving).onClick(() => this.namingMachine = '')
                     Button(tr('save')).attributeModifier(ButtonStyles.primary).enabled(!this.management.saving).onClick(() => this.saveMachineName()).id('machines.rename.save')
                   }
-                }.width('100%').alignItems(HorizontalAlign.Start).padding(Tokens.page)
+                }.width('100%').alignItems(HorizontalAlign.Start).padding(Tokens.page).backgroundColor(Colors.card(true)).borderRadius(PhoneStyle.cardRadius)
               }
             } else {
               ListItem() {
-                Button(tr('machine_rename'), { buttonStyle: ButtonStyleMode.TEXTUAL }).maxFontScale(Tokens.interfaceFontMaxScale).fontColor(Colors.link)
+                Button(tr('machine_rename')).attributeModifier(ButtonStyles.secondary)
                   .width('100%').id('machines.rename').onClick(() => {
                     this.nameDraft = this.machineRow()?.title || this.machineRow()?.id || '';
                     this.namingOwner = this.machineOwner; this.namingGeneration = this.machineOwner?.connectionGeneration() ?? -1;
@@ -839,10 +898,9 @@ export struct SettingsPage {
               }
             }
           }
-          ListItem() { Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('computer_screen_open')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('computer_screen_open', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('computer_screen_open')).bindTips(tr('computer_screen_open')).enabled(this.canOpenScreen()).onClick(() => { const row = this.screenMachine(); if (row && this.canOpenScreen()) this.onComputer(row); }).id('machines.screen') }.padding({ left: Tokens.page, right: Tokens.page })
-          if (Wire.text(this.machineRow()?.raw || {}, 'trust') === 'pending') {
-            ListItem() { Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('confirm_computer')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('confirm_computer', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('confirm_computer')).bindTips(tr('confirm_computer')).enabled(!!this.screenMachine() && !this.management.loading).onClick(() => this.confirmMachine(this.machineRow() as ManagementRow, true)) }
-            ListItem() { Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('reject')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('reject', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('reject')).bindTips(tr('reject')).enabled(!!this.screenMachine() && !this.management.loading).onClick(() => this.confirmMachine(this.machineRow() as ManagementRow, false)) }
+          if (this.machineOwner && !this.machineOwner.demo && !this.machinePending && Wire.text(this.machineIdentity, 'kind') !== 'hub') ListItem() {
+            Button(tr('machine_admin_remove')).attributeModifier(ButtonStyles.quiet).fontColor(Colors.danger)
+              .width('100%').onClick(() => this.openMachineAdmin()).id('machines.remove.admin')
           }
         }
         if (this.machineOwner && this.pairingOwnerScope === this.machineOwner.scope() && this.management.pairing['pair_url']) {
@@ -853,10 +911,21 @@ export struct SettingsPage {
           if (this.canRenew()) ListItem() { Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('new_pairing_code')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('new_pairing_code', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('new_pairing_code')).bindTips(tr('new_pairing_code')).onClick(() => this.management.renewPairing(this.machineOwner || this.model)) }
           if (Wire.text(this.management.pairing, 'command')) ListItem() { Text(Wire.text(this.management.pairing, 'command')).copyOption(CopyOptions.LocalDevice).padding(Tokens.page) }
         }
-        if (!this.management.rows.length && !this.management.loading) ListItem() { Text(tr('no_computer')).padding(Tokens.page) }
-        if (this.management.error) ListItem() { Text(trError(this.management.error)).fontColor($r('app.color.persona_danger')).padding(Tokens.inset) }
-      }.width('100%').layoutWeight(1)
-    }.width('100%').height('100%')
+        if (!this.machineRow() && !this.management.error) {
+          if (this.management.loading) {
+            ListItem() {
+              Row({ space: Tokens.gap }) {
+                LoadingProgress().width(20).height(20)
+                Text(tr('loading')).fontSize(Tokens.meta).fontColor(Colors.secondary)
+              }.width('100%').justifyContent(FlexAlign.Center).padding(Tokens.page).id('machines.detail.loading')
+            }
+          } else if (!this.management.rows.length || this.initialMachine?.id) {
+            ListItem() { Text(tr(this.initialMachine?.id ? 'admin_machine_unavailable' : 'no_computer')).padding(Tokens.page) }
+          }
+        }
+        if (this.management.error) ListItem() { Text(trError(this.management.error)).fontColor(Colors.danger).padding(Tokens.inset) }
+      }.width('100%').layoutWeight(1).padding({ left: Tokens.page, right: Tokens.page, top: Tokens.inset, bottom: Tokens.section })
+    }.width('100%').height('100%').backgroundColor(Colors.listGroup(true))
       .bindSheet($$this.addComputerOpen, this.computerForm(), { title: { title: tr('add_computer') }, height: SheetSize.MEDIUM, showClose: true })
   }
 

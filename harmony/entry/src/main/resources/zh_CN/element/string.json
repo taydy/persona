@@ -10075,6 +10075,18 @@
     {
       "name": "workspace_pair_action",
       "value": "重新配对"
+    },
+    {
+      "name": "machine_admin_remove",
+      "value": "前往 Hub 管理页移除…"
+    },
+    {
+      "name": "machine_admin_unavailable",
+      "value": "无法打开 Hub 管理页。"
+    },
+    {
+      "name": "machine_admin_root",
+      "value": "请在 Hub 的直连地址打开管理页，移除这台电脑。"
     }
   ]
 }

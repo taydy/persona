@@ -9895,6 +9895,18 @@
     {
       "name": "workspace_pair_action",
       "value": "Pair Again"
+    },
+    {
+      "name": "machine_admin_remove",
+      "value": "Remove in Hub Admin…"
+    },
+    {
+      "name": "machine_admin_unavailable",
+      "value": "Could not open the Hub admin page."
+    },
+    {
+      "name": "machine_admin_root",
+      "value": "Open the admin page at the Hub’s direct address to remove this computer."
     }
   ]
 }

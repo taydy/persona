@@ -5,6 +5,7 @@ import { Colors } from '../design/Colors';
 import { PhoneStyle } from '../design/PhoneStyle';
 import { Motion } from '../design/Motion';
 import { PhoneOutlineIcon } from '../design/PhoneOutlineIcon';
+import { ButtonStyles } from '../design/Controls';
 import { Symbols } from '../design/Symbols';
 import { tr } from '../design/Strings';
 import { Tokens } from '../design/Tokens';
@@ -151,6 +152,7 @@ export struct MachineDirectory {
   @Param selected: ResourceRow | undefined = undefined;
   @Event onManage: () => void = () => {};
   @Event onMachine: (row: ResourceRow) => void = () => {};
+  @Event onComputer: (row: ResourceRow) => void = () => {};
   @Event onDetails: (row: ResourceRow) => void = () => {};
   @Event onSession: (row: ResourceRow) => void = () => {};
   @Local private readings: Map<string,MachineReading> = new Map();
@@ -326,7 +328,7 @@ export struct MachineDirectory {
     }
     const cores = Wire.number(c.system,'cores'), memory = Wire.number(c.system,'memory');
     return [name,cores ? tr('machine_cpu_cores').replace('{count}',String(cores)) : '',memory ? machineBytes(memory) : '']
-      .filter((v:string) => !!v).join(' · ') || Wire.text(c.raw,'hostname') || Wire.text(c.raw,'ssh_host') || c.row.id;
+      .filter((v:string) => !!v).join(' · ') || Wire.text(c.raw,'hostname') || Wire.text(c.raw,'ssh_host');
   }
   private osColor(c:ComputerCard): ResourceColor {
     if (!c.online) return Colors.secondary;
@@ -356,15 +358,21 @@ export struct MachineDirectory {
     }.padding({left:Tokens.spaceS,right:Tokens.spaceS,top:Tokens.spaceXs,bottom:Tokens.spaceXs}).borderRadius(Tokens.radiusCapsule)
       .backgroundColor(a.severity === 2 ? Colors.dangerWash : Colors.workingWash)
   }
+  private canViewScreen(row: ResourceRow): boolean {
+    const owner = this.model.directoryOwnerFor(row);
+    return this.active && !!this.selected && this.selected.key() === row.key() &&
+      !!owner && owner.connected && !owner.demo && row.supportsScreen();
+  }
   @Builder summary(c:ComputerCard, selected:boolean) {
     Column({space:Tokens.inset}) {
       Row({space:Tokens.inset}) {
         this.osMark(c)
         Column({space:2}) {
-          if (!selected) Text(c.row.title || c.row.id).fontSize(17).maxFontScale(Tokens.interfaceFontMaxScale).lineHeight(this.overviewTextHeight(20.33,27.67)).fontWeight(FontWeight.Bold).fontColor(Colors.ink).maxLines(1)
+          if (!selected) Text(c.row.title && c.row.title !== c.row.id ? c.row.title : tr('machine')).fontSize(17).maxFontScale(Tokens.interfaceFontMaxScale).lineHeight(this.overviewTextHeight(20.33,27.67)).fontWeight(FontWeight.Bold).fontColor(Colors.ink).maxLines(1)
           Text(this.hardware(c)).fontSize(12).maxFontScale(Tokens.interfaceScaleFor(12)).lineHeight(selected ? undefined : this.overviewTextHeight(14.33,21.67)).fontColor(Colors.secondary).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis})
-          if (selected && c.online && c.sample && Wire.has(c.sample.latest,'load'))
-            Text(tr('machine_load')+' '+formatMachineLoad(Wire.number(c.sample.latest,'load',-1),Wire.number(c.system,'cores'),tr('machine_load_per_core')))
+          if (selected && c.online && !c.pending)
+            Text(tr('machine_load')+' '+(c.sample && Wire.has(c.sample.latest,'load') ?
+              formatMachineLoad(Wire.number(c.sample.latest,'load',-1),Wire.number(c.system,'cores'),tr('machine_load_per_core')) : '—'))
               .fontSize(12).maxFontScale(Tokens.interfaceScaleFor(12)).fontColor(Colors.secondary).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis})
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
         Column({space:2}) {
@@ -818,6 +826,22 @@ export struct MachineDirectory {
       Text(value).fontSize(14).maxFontScale(Tokens.interfaceScaleFor(14)).fontColor(Colors.secondary).textAlign(TextAlign.End).layoutWeight(1)
     }.width('100%').constraintSize({minHeight:40})
   }
+  @Builder detailActions(c: ComputerCard) {
+    Flex({ wrap: FlexWrap.Wrap, space: { main: LengthMetrics.vp(Tokens.gap), cross: LengthMetrics.vp(Tokens.gap) } }) {
+      if (this.canViewScreen(c.row)) {
+        Button(tr('computer_screen_open')).attributeModifier(ButtonStyles.secondary)
+          .constraintSize({ minWidth: Tokens.minimumInput }).flexGrow(1)
+          .onClick(() => {
+            const row = c.row;
+            if (this.canViewScreen(row)) this.onComputer(row);
+          }).id('machines.screen')
+      }
+      Button(tr('phone_machine_manage')).attributeModifier(ButtonStyles.secondary)
+        .constraintSize({ minWidth: Tokens.minimumInput }).flexGrow(1)
+        .onClick(() => { if (this.active && this.selected?.key() === c.row.key()) { Haptics.tap(); this.onDetails(c.row); } })
+        .id('machines.management')
+    }.width('100%')
+  }
   @Builder systemCard(c:ComputerCard) {
     Column() {
       if (Wire.text(c.system,'name')) this.property('machine_os',Wire.text(c.system,'name'))
@@ -827,8 +851,6 @@ export struct MachineDirectory {
       if (Wire.text(c.raw,'hostname')) this.property('machine_hostname',Wire.text(c.raw,'hostname'))
       if (this.detailSample && Wire.number(this.detailSample.latest,'disk_total')) this.property('machine_disk',
         machineBytes(Wire.number(this.detailSample.latest,'disk_used',-1))+' / '+machineBytes(Wire.number(this.detailSample.latest,'disk_total')))
-      Button(tr('phone_machine_manage'),{buttonStyle:ButtonStyleMode.TEXTUAL}).maxFontScale(Tokens.interfaceFontMaxScale).fontColor(Colors.link).width('100%')
-        .onClick(() => { Haptics.tap(); this.onDetails(c.row); }).id('machines.management')
     }.width('100%').padding({left:14,right:14,top:4,bottom:4}).backgroundColor(Colors.card(this.selected !== undefined)).borderRadius(PhoneStyle.cardRadius)
       .border({width:PhoneStyle.surfaceEdgeWidth(0.5),color:PhoneStyle.cardBorder(nativeEnvironment.dark),radius:PhoneStyle.cardRadius})
       .shadow(PhoneStyle.cardElevation(nativeEnvironment.dark))
@@ -839,6 +861,7 @@ export struct MachineDirectory {
         if (this.selected) {
           if (this.cards.length) {
             ListItem() { this.summary(this.cards[0],true) }
+            ListItem() { this.detailActions(this.cards[0]) }
             ListItem() { this.section(tr('agent'),this.cards[0].online ? String(this.cards[0].agents.length) : '') }
             ListItem() { this.agentsCard(this.cards[0]) }
             ListItem() { this.section(tr('machine_monitor')) }
@@ -895,7 +918,7 @@ export struct MachineDirectory {
             .onClick(() => { Haptics.tap(); this.onManage(); }).id('machines.manage') }
         }
       }.width('100%').height('100%').padding({left:this.machineSidePadding(),right:this.machineSidePadding(),
-        top:this.selected ? PhoneStyle.detailListTop : PhoneStyle.formSize(20,16,nativeEnvironment.fontScale),bottom:24}).id('machines.list')
+        top:this.selected ? Tokens.inset : PhoneStyle.formSize(20,16,nativeEnvironment.fontScale),bottom:24}).id('machines.list')
     }.onRefreshing(() => {
       this.sync(true); this.refreshing=this.active && this.model.connected;
     }).width('100%').height('100%').backgroundColor(Colors.listGroup(this.selected !== undefined))

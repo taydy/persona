@@ -2,12 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {registerHooks,stripTypeScriptTypes} from 'node:module';
-registerHooks({load(url,context,next){if(url.endsWith('/Wire.ets'))return{format:'module',shortCircuit:true,source:stripTypeScriptTypes(readFileSync(new URL(url),'utf8').replace(/@ObservedV2\s*/g,'').replace(/@Trace\s+/g,''))};return next(url,context);}});
-const {ResourceRow}=await import('../entry/src/main/ets/models/Wire.ets');
+registerHooks({load(url,context,next){
+ if(url.endsWith('/Wire.ets'))return{format:'module',shortCircuit:true,source:stripTypeScriptTypes(readFileSync(new URL(url),'utf8').replace(/@ObservedV2\s*/g,'').replace(/@Trace\s+/g,''))};
+ return next(url,context);}});
+const { ResourceRow, Wire } = await import('../entry/src/main/ets/models/Wire.ets');
 const source=readFileSync(new URL('../entry/src/main/ets/components/SettingsPage.ets',import.meta.url),'utf8');
 function method(name){const start=source.search(new RegExp('^  private (?:async )?'+name+'\\(','m'));assert.ok(start>=0,name);const body=source.indexOf('{',start);let depth=1,quote='',escape=false,index=body+1;for(;index<source.length&&depth;index++){const c=source[index];if(quote){if(escape)escape=false;else if(c==='\\')escape=true;else if(c===quote)quote='';}else if(c==='"'||c==="'"||c==='`')quote=c;else if(c==='{')depth++;else if(c==='}')depth--;}return source.slice(start,index);}
-const methods=['chooseMachine','machineRow','screenMachine','canOpenScreen','clearMachineChoice','sameRoutedMachine','machineOptions','loadMachineDirectory'];
-const Page=new Function('Wire','ResourceRow','return '+stripTypeScriptTypes('class Page{'+methods.map(method).join('\n')+'}'))((await import('../entry/src/main/ets/models/Wire.ets')).Wire,ResourceRow);
+const methods=['chooseMachine','machineRow','screenMachine','canOpenScreen','clearMachineChoice','sameRoutedMachine','machineOptions','loadMachineDirectory','openMachineAdmin'];
+const Page=new Function('Wire','ResourceRow','return '+stripTypeScriptTypes('class Page{'+methods.map(method).join('\n')+'}'))(Wire,ResourceRow);
 function deferred(){let resolve;return{promise:new Promise(r=>resolve=r),resolve:value=>resolve(value)};}
 function fixture(){const page=new Page(),calls=[];let generation=1;
  const machine=(group)=>{const row=ResourceRow.from({id:'same-mac',manager:'work',online:true,trust:'confirmed',os:'mac'},'machine');row.group=group;return row;};
@@ -58,4 +60,72 @@ test('the general machine manager remembers an explicit dropdown choice before t
     refreshDirectory:async()=>{}});
   page.page='machines';await page.loadMachineDirectory();await page.chooseMachine(f.b);await page.loadMachineDirectory();
   assert.equal(page.machineOwner,f.owners.b);assert.equal(page.machineDirectoryKey,f.b.key());
+});
+
+test('a routed detail never exposes actions for the first management row while its own row is resolving', async () => {
+  const f = fixture();
+  f.page.initialMachine = f.b;
+  const other = { id: 'other-machine', raw: { online: true } };
+  f.page.management.rows = [other];
+  f.page.management.selectedId = other.id;
+  assert.equal(f.page.machineRow(), undefined);
+  assert.equal(f.page.canOpenScreen(), false);
+
+  // A machine may disappear after the directory read but before the manager's response.
+  f.owners.b.machines = [];
+  await f.page.chooseMachine(f.b);
+  assert.equal(f.page.management.error, 'admin_machine_unavailable');
+  assert.equal(f.page.machineRow(), undefined);
+  assert.equal(f.page.screenMachine(), undefined);
+});
+
+test('a scoped detail shows loading while the directory is resolving instead of the empty list', async () => {
+  const f = fixture(), gate = deferred();
+  Object.assign(f.page.model, { profile: { id: 'hub-a', manager: 'work' }, directoryReady: true,
+    directoryMachines: [f.b], selected: f.b, refreshDirectory: () => gate.promise });
+  f.page.initialMachine = f.b;
+  const read = f.page.loadMachineDirectory();
+  assert.equal(f.page.management.loading, true);
+  assert.equal(f.page.canOpenScreen(), false);
+  gate.resolve();
+  await read;
+  assert.equal(f.page.management.loading, false);
+  assert.equal(f.page.screenMachine(), f.b);
+});
+
+test('removal opens the owning Hub admin page and leaves relayed addresses in the app', async () => {
+  const f = fixture(), links = [];
+  f.owners.b.profile = { id: 'hub-b', manager: 'work', baseUrl: 'https://example.invalid/' };
+  f.page.getUIContext = () => ({ getHostContext: () => ({ openLink: async url => links.push(url) }) });
+  await f.page.chooseMachine(f.b);
+  await f.page.openMachineAdmin();
+  assert.deepEqual(links, ['https://example.invalid/admin/machines']);
+
+  f.owners.b.profile.baseUrl = 'https://example.invalid/relay/sample';
+  await f.page.openMachineAdmin();
+  assert.equal(f.page.management.error, 'machine_admin_root');
+  assert.equal(links.length, 1);
+  f.owners.b.profile.baseUrl = 'https://example.invalid/';
+  f.page.active = false;
+  await f.page.openMachineAdmin();
+  assert.equal(links.length, 1);
+});
+
+test('a scoped online Mac exposes View Screen directly from its own machine detail', () => {
+  const ui = readFileSync(new URL('../entry/src/main/ets/components/MachineDirectory.ets', import.meta.url), 'utf8');
+  const matched = ui.match(/  private canViewScreen\(row: ResourceRow\): boolean \{[\s\S]*?\n  \}/);
+  assert.ok(matched);
+  const Detail = new Function('return ' + stripTypeScriptTypes('class Detail {' + matched[0] + '}'))();
+  const page = new Detail();
+  const row = ResourceRow.from({ id: 'test-machine', os: 'macOS', online: true, trust: 'confirmed' }, 'machine');
+  row.group = 'sample-hub'; row.manager = 'sample-manager';
+  const owner = { connected: true, demo: false };
+  Object.assign(page, { active: true, selected: row, model: { directoryOwnerFor: () => owner } });
+  assert.equal(page.canViewScreen(row), true);
+  const foreign = ResourceRow.from(row.data(), 'machine'); foreign.group = 'other-hub';
+  assert.equal(page.canViewScreen(foreign), false);
+  owner.connected = false; assert.equal(page.canViewScreen(row), false);
+  owner.connected = true; owner.demo = true; assert.equal(page.canViewScreen(row), false);
+  owner.demo = false; page.active = false; assert.equal(page.canViewScreen(row), false);
+  assert.match(ui, /Button\(tr\('computer_screen_open'\)\)[\s\S]*?this\.onComputer\(row\)[\s\S]*?id\('machines\.screen'\)/);
 });

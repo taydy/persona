@@ -2894,6 +2894,9 @@ struct Index {
     MachineDirectory({model:this.model,selected:selected,settingsScope:true,settingsHeading:!selected,
       active:this.phoneSettingsShown && this.phoneSettingsMachine === selected,
       onMachine:(row:ResourceRow) => this.enterPhoneSettingsMachine(row),
+      onComputer:(row:ResourceRow) => {
+        if (selected && row.key() === selected.key() && this.leavePhoneSettingsMachine('computer',selected)) this.openComputer(row);
+      },
       onDetails:(row:ResourceRow) => {
         if (selected && row.key() === selected.key() && this.leavePhoneSettingsMachine('machine_settings',selected))
           this.pushPlace('machine_settings',JSON.stringify(row));
@@ -4096,6 +4099,9 @@ struct Index {
           active:this.activeChild === this.childKey(name,param),
           onMachine:(row:ResourceRow) => this.pushPlace('machine_agents',JSON.stringify(row)),
           onDetails:(row:ResourceRow) => this.pushPlace('machine_settings',JSON.stringify(row)),
+          onComputer:(row:ResourceRow) => {
+            if (this.activeChild === this.childKey(name,param)) this.openComputer(row);
+          },
           onManage:() => this.pushPlace('machine_settings',''),
           onSession:(row:ResourceRow) => this.openFrom(name,param,row)})
       } else if (name === 'machine_settings') {

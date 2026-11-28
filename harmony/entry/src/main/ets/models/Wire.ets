@@ -109,6 +109,11 @@ export class ResourceRow {
   raw: string = '{}';
   constructor(id: string = '', title: string = '', kind: string = '') { this.id = id; this.title = title; this.kind = kind; }
   data(): Record<string, Object> { return Wire.parse(this.raw); }
+  // A per-manager roster may omit its own Hub or manager on each row.
+  static ownedMachine(rows: ResourceRow[], id: string, group: string, manager: string): ResourceRow | undefined {
+    return rows.find((row: ResourceRow) => row.id === id && row.kind === 'machine' &&
+      (!row.group || row.group === group) && (!row.manager || row.manager === manager));
+  }
   supportsScreen(): boolean {
     const data = this.data(), os = Wire.text(data, 'os', Wire.text(Wire.object(data, 'system'), 'os'));
     return this.kind === 'machine' && ['', 'mac', 'macos', 'darwin'].includes(os.toLowerCase()) && Wire.bool(data, 'online') &&
