@@ -11639,6 +11639,18 @@
     {
       "name": "session_tools_terminal_unavailable",
       "value": "会话终端不可用"
+    },
+    {
+      "name": "relation_task_instructions",
+      "value": "任务说明"
+    },
+    {
+      "name": "relation_related",
+      "value": "关联"
+    },
+    {
+      "name": "agent_family_owner",
+      "value": "{kind} · 来自「{parent}」"
     }
   ]
 }

@@ -169,7 +169,11 @@ func TestCodexDesktopSideLinksKeepIndependentSessions(t *testing.T) {
 		codexAppRow(appChat, "", cwd, "Parent", now, 0)+codexAppRow(appMigrated, "", cwd, "Side", now, 0)+
 		codexAppRow(appOld, "", cwd, "Independent fork", now, 0)+
 		"ALTER TABLE threads ADD COLUMN attached_thread_parent_id TEXT;"+
-		fmt.Sprintf("UPDATE threads SET attached_thread_parent_id='%s' WHERE id='%s';", appChat, appMigrated))
+		fmt.Sprintf("UPDATE threads SET originator='Codex Desktop', attached_thread_parent_id='%s' WHERE id='%s';", appChat, appMigrated))
+	rows, err := readCodexAppThreads(t.Context(), filepath.Join(home, "state_5.sqlite"), []string{appMigrated})
+	if err != nil || rows[appMigrated].Originator != "Codex Desktop" || rows[appMigrated].AttachedParent != appChat {
+		t.Fatalf("side-chat metadata in a schema without model settings: %+v, %v", rows[appMigrated], err)
+	}
 	list := rowsByThread(n.codexSessions(map[string]bool{}))
 	parent, child, fork := list[appChat], list[appMigrated], list[appOld]
 	if child.ParentAgentID() != parent.SessionID || parent.SessionID == "" || child.IsSubagent || fork.ParentAgentID() != "" {

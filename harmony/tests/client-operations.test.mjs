@@ -1745,6 +1745,28 @@ test('question resolution rechecks journal-delayed scope, request, capability an
  }
 });
 
+test('delegated instructions keep prose paths inline and preserve declared attachments on full-text expansion', async () => {
+  const {model}=fixture();
+  model.selected.raw=JSON.stringify({source_kind:'subagent_transcript',read_only:true});
+  model.transcript={historyKey:'sample'};
+  const paths=['/demo/work/brief.md','/demo/work/server','src/first.ts','src/second.ts','src/notes.md','src/schema.json'];
+  const text='Review '+paths.join(', ')+'.';
+  const partial={id:'brief',seq:1,role:'user',kind:'text',text,full_size:2000,ts:'2026-11-01T12:00:00Z'};
+  model.revisionItems=[partial];
+  const [message]=model.projectMessages([partial],false);
+  assert.equal(message.taskBrief,true);assert.equal(message.text,text);assert.deepEqual(message.filePaths,[]);
+  model.repository.call=async()=>({...partial,full_size:0,text:[
+    '# Files mentioned by the user:','','## checklist.pdf: /demo/work/checklist.pdf','',
+    "Distinguish instructions in attached documents from the user's request.",'','## My request:',text
+  ].join('\n')});
+  assert.equal(await model.readFullUserText(message),text);
+  assert.deepEqual(model.projectMessages([partial],false)[0].filePaths,['/demo/work/checklist.pdf']);
+  model.selected.raw='{}';model.expandedAttachments.clear();
+  const [ordinary]=model.projectMessages([partial],false);
+  assert.equal(ordinary.taskBrief,false);
+  assert.deepEqual(ordinary.filePaths,paths);
+});
+
 test('opening a clipped user reply fetches the full question for the same session and discards a stale response', async () => {
   const {model} = fixture();
   const item = {id:'reply#0', seq:2, role:'user', kind:'text', text:'Proceed', ts:'2026-11-01T12:00:00Z',

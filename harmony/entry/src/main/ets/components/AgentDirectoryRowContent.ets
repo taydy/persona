@@ -17,7 +17,6 @@ export struct AgentDirectoryRowContent {
   @Param previewRow:boolean=false;
   @Param muted:boolean=false;
   @Param hideState:boolean=false;
-  @Param active: boolean = true;
   @Local measuredCardHeight:number=0;
   @Local titleRoom:number=0;
   @Param age: string = '';
@@ -30,6 +29,9 @@ export struct AgentDirectoryRowContent {
   @Param controlScale: number = 1;
   @Param fontScale: number = 1;
   @Param tint: ResourceColor = Colors.secondary;
+  @Param hasFamilyControl: boolean = false;
+  @Param nestedSession: boolean = false;
+  @Param active: boolean = true;
   @Param activityList: boolean = false;
   @Param useHerdrTabName: boolean = false;
   @Param renaming: boolean = false;
@@ -83,7 +85,7 @@ export struct AgentDirectoryRowContent {
     Text(this.displayTitle()).fontSize(17).maxFontScale(Tokens.interfaceScaleFor(17))
       .lineHeight(this.previewRow ? PhoneStyle.settingsExampleLineHeight(20,27.67,this.fontScale) : undefined)
       .letterSpacing(this.previewRow ? '-0.25vp' : undefined)
-      .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis})
+      .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(this.hasFamilyControl ? 2 : 1).textOverflow({overflow:TextOverflow.Ellipsis})
   }
   @Builder agentTitleAndTime() {
     Column({space:4}){
@@ -108,7 +110,8 @@ export struct AgentDirectoryRowContent {
     Row({space:12}) {
       this.agentMark(this.agent)
       Column({space:2}) {
-        if(this.activityList){this.agentTitleAndTime()}
+        if(this.activityList && this.hasFamilyControl){this.avatarTitle()}
+        else if(this.activityList){this.agentTitleAndTime()}
         else Flex({wrap:FlexWrap.Wrap,alignItems:ItemAlign.Baseline,space:{main:LengthMetrics.vp(8),cross:LengthMetrics.vp(4)}}) {
           Text(this.displayTitle()).fontSize(17).maxFontScale(Tokens.interfaceScaleFor(17))
             .fontWeight(this.agent.state === 'unread' ? FontWeight.Bold : 600).fontColor(Colors.ink)
@@ -127,7 +130,7 @@ export struct AgentDirectoryRowContent {
           todoTitle:this.agent.todoTitle,sessionId:this.agent.row.id,starter:this.starter,fontScale:this.fontScale})
       }.alignItems(HorizontalAlign.Start).layoutWeight(1)
     }.width('100%').alignItems(VerticalAlign.Top).constraintSize({minHeight:56}).padding({
-      left:this.previewRow?0:this.leftInset,right:this.previewRow?0:20,top:this.previewRow?4:15,bottom:this.previewRow?4:15
+      left:this.previewRow?0:this.leftInset,right:this.previewRow?0:20,top:this.previewRow?4:this.nestedSession?4:15,bottom:this.previewRow?4:15
     })
   }
   @Builder tinyBrand() {
@@ -170,7 +173,7 @@ export struct AgentDirectoryRowContent {
       Row({space:4}){
         this.tinyBrand()
         Text(this.displayTitle()).fontSize(17).maxFontScale(Tokens.interfaceScaleFor(17)).fontColor(Colors.ink)
-          .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(1).textOverflow({overflow:TextOverflow.Ellipsis}).layoutWeight(1)
+          .fontWeight(this.agent.state==='unread'?FontWeight.Bold:600).maxLines(this.hasFamilyControl ? 2 : 1).textOverflow({overflow:TextOverflow.Ellipsis}).layoutWeight(1)
       }.flexGrow(1).constraintSize({minWidth:'42%',maxWidth:'100%'})
       this.stamp()
     }.width('100%')

@@ -14,9 +14,10 @@ import { ProjectSearchResult, projectQuickFilters, projectQuickLabels, projectSe
 import { machineAgents } from '../models/MachineDashboard';
 import { ProjectCatalog, PersonaProject, ProjectAgent, ProjectWorktree, ProjectBrowserState } from '../models/ProjectCatalog';
 import { ResourceRow, Wire } from '../models/Wire';
-import { ProjectLine, ProjectHost, projectOutline, projectHosts, projectSearchAgents, worktreeSpaceCards } from '../models/ProjectOutline';
+import { expandProjectSessions, ProjectLine, ProjectHost, projectOutline, projectHosts, projectSearchAgents, worktreeSpaceCards } from '../models/ProjectOutline';
 import { WorktreeActions, WorktreeChange } from '../models/WorktreeActions';
 import { WorktreeSheet } from './WorktreeSheet';
+import { AgentFamilyLine } from './AgentFamilyLine';
 import { AgentDirectoryRowContent } from './AgentDirectoryRowContent';
 import { deviceLook } from '../models/DeviceLook';
 import { nativeEnvironment } from '../platform/NativeEnvironment';
@@ -28,6 +29,7 @@ import { Haptics } from '../platform/Haptics';
 export struct ProjectsPage {
   @Require @Param model: ClientModel;
   @Require @Param catalog: ProjectCatalog;
+  @Param familyWorkspace: AgentWorkspace | undefined = undefined;
   @Param agentRepositories: PersonaProject[] | undefined = undefined;
   @Param agentFilterActive: boolean = false;
   @Param searchWorkspace: AgentWorkspace | undefined = undefined;
@@ -199,11 +201,18 @@ export struct ProjectsPage {
     if (!tree) return [];
     return worktreeSpaceCards(this.catalog.projects, tree);
   }
-  @Computed get lines(): ProjectLine[] {
+  @Computed get baseLines(): ProjectLine[] {
     return projectOutline(this.outlineProjects,this.outlineBrowser,this.page === 'project' ? this.target : '',
       this.page === 'machine_projects' ? this.target : '',this.page === 'projects' ? this.quick : '',(agent:ProjectAgent) => this.isMuted(agent.row),
       !!this.agentRepositories,this.agentFilterActive,
       this.page === 'projects' && this.searchMode && this.filteringText() ? this.queryResult.rows : undefined);
+  }
+  @Computed get lines(): ProjectLine[] {
+    const lines = this.baseLines;
+    const families = this.familyWorkspace;
+    if (!families?.hasExpandedFamilies()) return lines;
+    return expandProjectSessions(lines, (parent: ProjectAgent): ProjectAgent[] =>
+      families.expandedChildren(parent.row).map((row: ResourceRow) => new ProjectAgent(row, row.data())));
   }
   @Computed get tabRows(): Map<string, ProjectLine> {
     const result = new Map<string, ProjectLine>();
@@ -630,14 +639,22 @@ export struct ProjectsPage {
   private displayAgentTitle(agent: ProjectAgent): string {
     return (this.useHerdrTabFor(agent) && agent.herdrTabName ? agent.herdrTabName : agent.row.title) || tr('agent_untitled');
   }
-  @Builder agentCell(agent:ProjectAgent, treeKey:string, level:number, paneName:string = '', starter:boolean = false) {
+  private familyIndent(row: ResourceRow): number {
+    const family = this.familyWorkspace;
+    return family && family.relations.root(row) && !family.isPinned(row) ? Tokens.inset : 0;
+  }
+  private familyInset(line: ProjectLine): number {
+    const avatar = this.model.style !== 'beautiful' && deviceLook.agentDisplay === 'avatar';
+    return this.treeInset(line.level) + 6 + this.familyIndent(line.agent!.row) + (avatar ? 36 * this.outlineControlScale() + 12 : 16);
+  }
+  @Builder agentCell(agent:ProjectAgent, treeKey:string, level:number, paneName:string = '', starter:boolean = false, hasDisclosure:boolean = false) {
     Row() {
-      AgentDirectoryRowContent({agent:agent,display:this.agentRepositories?
+      AgentDirectoryRowContent({agent:agent,hasFamilyControl:hasDisclosure,display:this.agentRepositories?
         (deviceLook.agentDisplay==='list'?'list':this.model.style==='beautiful'?'beautiful':deviceLook.agentDisplay):'avatar',
-        activityList:!!this.agentRepositories,muted:this.agentRepositories?this.isMuted(agent.row):false, age:this.age(agent),
-        place:deduplicateAgentPlace(this.displayAgentTitle(agent), paneName || agent.tab), showsSource:!!(agent.tab || agent.runtime),
+        activityList:!!this.agentRepositories,nestedSession:this.familyIndent(agent.row)>0,muted:this.agentRepositories?this.isMuted(agent.row):false, age:this.age(agent),
+        place:deduplicateAgentPlace(this.displayAgentTitle(agent), paneName || agent.tab), showsSource:!!(agent.tab || agent.runtime) && agent.sourceKind!=='subagent_transcript',
         starter:starter,narrow:this.narrowOutline(),
-        leftInset:this.agentRepositories && deviceLook.agentDisplay==='list' ? PhoneStyle.inset+6+18*this.outlineControlScale()*Math.min(level,3) : this.treeInset(level)+6,
+        leftInset:this.familyIndent(agent.row) + (this.agentRepositories && deviceLook.agentDisplay==='list' ? PhoneStyle.inset+6+18*this.outlineControlScale()*Math.min(level,3) : this.treeInset(level)+6),
         controlScale:this.outlineControlScale(),
         fontScale:nativeEnvironment.fontScale,tint:this.tint(agent),useHerdrTabName:this.useHerdrTabFor(agent)})
     }.width('100%')
@@ -793,7 +810,12 @@ export struct ProjectsPage {
     else if (line.kind === 'project') Row() { this.headerLine(line) }.width('100%').bindContextMenu(this.projectMenu(line.project.key),ResponseType.LongPress)
     else if (line.kind === 'tree') this.treeLine(line)
     else if (line.kind === 'tab') this.tabLine(line.key)
-    else if (line.kind === 'session') this.agentCell(line.agent!,line.tree!.key,line.level,line.paneName,line.starter)
+    else if (line.kind === 'session' && this.familyWorkspace) {
+      AgentFamilyLine({ workspace:this.familyWorkspace, row:line.agent!.row, preferTab:this.useHerdrTabFor(line.agent!), inset:this.familyInset(line),
+        open:() => this.chooseAgent(line.agent!),
+        accessoryTime:this.model.style!=='beautiful' && deviceLook.agentDisplay==='avatar' ? this.age(line.agent!) : '',
+        content:(shown:boolean) => { this.agentCell(line.agent!,line.tree!.key,line.level,line.paneName,line.starter,shown) } })
+    } else if (line.kind === 'session') this.agentCell(line.agent!,line.tree!.key,line.level,line.paneName,line.starter)
     else this.subsidiaryLine(line)
   }
   private outlineItemNeedsDivider(entry: RepeatItem<ProjectLine>): boolean {

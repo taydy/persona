@@ -2683,6 +2683,20 @@ export struct Conversation {
     } catch (_) {}
   }
 
+  @Builder taskInstructions(entry: RepeatItem<ConversationLine>) {
+    Column({ space: Tokens.spaceS }) {
+      Text(tr('relation_task_instructions')).fontSize(Tokens.caption).fontWeight(FontWeight.Medium)
+        .fontColor(Colors.secondary).id('chat.task.instructions.'+entry.item.message!.itemId)
+      MarkdownText({ documents:this.documents, text:entry.item.message!.text, transcript:true, agentTranscript:true, ownMessage:true,
+        ownWidth:Math.max(1,Math.min(Tokens.readingMax,this.availableWidth - 2 * Tokens.page) - 2 * Tokens.inset),
+        messageId:entry.item.message!.id, clipped:entry.item.message!.userTextClipped, messageInk:Colors.ink,
+        readOriginal:() => this.model.readFullUserText(entry.item.message!), hold:(change: () => void) => this.holdWorkReading(change),
+        onBodyTap:() => this.toggleMessageTime(entry.item.message!), workspaceRoot:this.markdownWorkspace,
+        onOpenFile:(path: string) => this.onOpenFile(path), onLink:(address: string) => this.onLink(address) })
+    }.width('100%').constraintSize({ maxWidth: Tokens.readingMax }).alignItems(HorizontalAlign.Start)
+      .padding(Tokens.inset).backgroundColor(this.environment.dark ? Colors.surface : Colors.grouped)
+      .borderRadius(Tokens.card).id('chat.lift.source.'+entry.item.id)
+  }
   @Builder messageBody(entry: RepeatItem<ConversationLine>) {
     Column({ space: Tokens.gap }) {
       if (entry.item.message!.role === 'work' && entry.item.message!.running && !entry.item.message!.work) {
@@ -2724,6 +2738,7 @@ export struct Conversation {
         if (this.model.sentOtherSourceTitle(entry.item.message!))
           Text(this.model.sentOtherSourceTitle(entry.item.message!)).fontSize(Tokens.meta).fontColor($r('sys.color.font_secondary')).width('100%')
       }
+      if (entry.item.message!.taskBrief && entry.item.message!.text) this.taskInstructions(entry)
       if (entry.item.message!.role === 'user') {
         if (entry.item.message!.ownerTarget === this.model.target()) this.userImages(entry.item.message!, messageAttachmentImages(entry.item.message!, this.model.target()))
       } else if (entry.item.message!.ownerTarget === this.model.target()) {
@@ -2740,7 +2755,7 @@ export struct Conversation {
           Text(entry.item.message!.text).fontSize(Tokens.toolLabel).fontColor(Colors.activity)
             .lineHeight(Tokens.toolLeading).wordBreak(WordBreak.BREAK_WORD).layoutWeight(1)
         }.width('100%').alignItems(VerticalAlign.Center).padding({top:4,bottom:4}).id('chat.live.activity')
-      } else if (entry.item.message!.text && entry.item.message!.id !== this.issueEchoId) {
+      } else if (!entry.item.message!.taskBrief && entry.item.message!.text && entry.item.message!.id !== this.issueEchoId) {
         WithTheme({ colorMode: this.environment.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT, theme: nativeMessageTheme(this.look, this.model.style, entry.item.message!.role === 'user', this.environment.dark) }) {
         MessageSurface({ sourceId:'chat.lift.source.'+entry.item.id, agentTranscript:this.model.selected.kind === 'session', personaReply:entry.item.message!.role === 'assistant' && this.model.selected.kind === 'conversation', own: entry.item.message!.role === 'user', structured: entry.item.message!.role === 'user' && structuredBubble(entry.item.message!.text), text:entry.item.message!.text, maximum: entry.item.message!.role === 'user' ? this.messageMaximum(entry.item.message!) : Tokens.readingMax,
           timeHint:this.timeHint(entry.item.message!), onTime:() => this.toggleMessageTime(entry.item.message!) }) {
@@ -2785,7 +2800,7 @@ export struct Conversation {
       if (entry.item.message!.failed) Text(tr('failed')).fontColor($r('app.color.persona_danger')).fontSize(Tokens.meta)
       if (entry.item.message!.localOperation && this.model.canCheckLocalMessage(entry.item.message!.localOperation)) Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('checked')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('checked', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('checked')).bindTips(tr('checked')).onClick(() => this.confirmChecked(entry.item.message!.localOperation))
       if (entry.item.message!.localOperation && this.model.canRestoreMessage(entry.item.message!.localOperation)) Button({ type: ButtonType.Circle }) { SymbolGlyph(IconActions.symbol('restore_draft')).fontSize(Tokens.symbolFont).fontColor([IconActions.color('restore_draft', false)]) }.attributeModifier(ButtonStyles.icon).accessibilityText(tr('restore_draft')).bindTips(tr('restore_draft')).onClick(() => this.restoreDraft(entry.item.message!))
-    }.width('100%').alignItems(entry.item.message!.role === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
+    }.width('100%').alignItems(entry.item.message!.role === 'user' && !entry.item.message!.taskBrief ? HorizontalAlign.End : HorizontalAlign.Start)
       .padding({ left: Tokens.page, right: Tokens.page, top: entry.item.message!.work ? 0 : Tokens.fine, bottom: entry.item.message!.work ? 0 : Tokens.fine })
   }
   @Builder actionsMenu() {

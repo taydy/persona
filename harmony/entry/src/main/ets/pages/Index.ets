@@ -2964,7 +2964,7 @@ struct Index {
     AgentListPage({ projectCatalog:this.projectCatalog,
       onRepositoryOpen:(kind:string,key:string) => this.openAgentRepositoryRoute(kind,key),
       onRepositoryChanged:(tree:ProjectWorktree,change:WorktreeChange) => { this.worktreeChanged(tree,change,'agent_repositories',():boolean => this.model.section === 1 && this.agentWorkspace.groupingMode === 'repo' && (this.wide() || !this.stack.size())).catch((err:Error) => this.model.reportError(err)); },
-      onOpenTodo:(row:ResourceRow) => this.openLinkedResource(row), onSearchMode:(editing:boolean)=>{this.agentSearching=editing;}, compactRoot:!this.wide() && !this.rail(), model: this.model, workspace: this.agentWorkspace, retainWorkspace: true, active: this.model.section === 1, selectedRow: this.detailModel.selected, selectionVisible: this.chatSelectionShown('session'), rail: this.rail(), readingDetail: this.readingAgentDetail(),
+      onOpenTodo:(row:ResourceRow) => this.openLinkedResource(row), onSearchMode:(editing:boolean)=>{this.agentSearching=editing;}, compactRoot:!this.wide() && !this.rail(), model: this.model, workspace: this.agentWorkspace, retainWorkspace: true, active: this.model.section === 1 && (this.wide() || this.rail() || !this.phoneTop), selectedRow: this.detailModel.selected, selectionVisible: this.chatSelectionShown('session'), rail: this.rail(), readingDetail: this.readingAgentDetail(),
       onOpen: (row: ResourceRow) => this.openRow(row), onVisible: (row: ResourceRow, ratio: number) => {
         this.rowVisibility.set(this.model.scope() + row.key(), ratio); if (row.key() === this.detailModel.selected.key()) this.visibilityEpoch++;
       } })

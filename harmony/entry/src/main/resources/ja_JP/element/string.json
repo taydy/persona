@@ -11639,6 +11639,18 @@
     {
       "name": "session_tools_terminal_unavailable",
       "value": "ターミナルを利用できません"
+    },
+    {
+      "name": "relation_task_instructions",
+      "value": "タスクの指示"
+    },
+    {
+      "name": "relation_related",
+      "value": "関連"
+    },
+    {
+      "name": "agent_family_owner",
+      "value": "{kind} · 親の会話「{parent}」"
     }
   ]
 }

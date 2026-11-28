@@ -21,6 +21,25 @@ fn traecli_has_one_display_name_for_existing_identifiers() {
 }
 
 #[test]
+fn each_filter_counts_a_family_once_and_keeps_the_real_unread_id() {
+    let input: Input = serde_json::from_value(serde_json::json!({
+        "sessions": [
+            {"machine_id":"node","session_id":"first","state":"working"},
+            {"machine_id":"node","session_id":"second","state":"working"},
+            {"machine_id":"node","session_id":"third","state":"unread"}
+        ],
+        "machines":[], "pins":{}, "mutes":{},
+        "settings": {"grouping":"state","quick":"unread","inventory":true,"include_filter_counts":true,
+                     "filter_families":{"node/first":"node/parent","node/second":"node/parent","node/third":"node/parent"}}
+    }))
+    .unwrap();
+    let projection = serde_json::to_value(persona_core::sort::project(&input)).unwrap();
+    assert_eq!(projection["filter_counts"]["working"], 1);
+    assert_eq!(projection["filter_counts"]["unread"], 1);
+    assert_eq!(projection["unread_shown"], serde_json::json!(["node/third"]));
+}
+
+#[test]
 fn quick_filter_counts_match_a_single_muted_session_without_changing_summary_counts() {
     for (state, status) in [("working", "working"), ("unread", "done")] {
         let mut input: Input = serde_json::from_value(serde_json::json!({

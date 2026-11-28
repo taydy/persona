@@ -45,13 +45,20 @@ export struct AgentRepositoryRows {
     return JSON.stringify([this.workspace.search,this.workspace.quickFilter,this.workspace.machineFilter,this.workspace.currentHubOnly]);
   }
 
+  private admitsSession(row: ResourceRow): boolean {
+    const parent = this.workspace.relations.root(row);
+    return this.rows.some(candidate => candidate.key() === row.key()) ||
+      !!parent && this.rows.some(candidate => candidate.key() === parent.key()) &&
+      this.workspace.expandedChildren(parent).some(child => child.key() === row.key());
+  }
+
   @Builder repositoryList() {
-    ProjectsPage({ model:this.model, catalog:this.catalog, page:'agent_repositories', agentRepositories:this.visible,
+    ProjectsPage({ model:this.model, catalog:this.catalog, page:'agent_repositories', agentRepositories:this.visible, familyWorkspace:this.workspace,
       agentFilterActive:this.workspace.quickFilter !== 'all' || !!this.workspace.search.trim(),
-      agentActions:(row:ResourceRow,spaceName:string)=>{if(this.rows.some((r:ResourceRow)=>r.key()===row.key()))this.rowActions(row,spaceName);},
+      agentActions:(row:ResourceRow,spaceName:string)=>{if(this.admitsSession(row))this.rowActions(row,spaceName);},
       isMuted:(row:ResourceRow):boolean => this.workspace.isMuted(row),
       onSession:(row:ResourceRow) => {
-        if (this.rows.some((current:ResourceRow) => current.key() === row.key())) this.onOpen(row);
+        if (this.admitsSession(row)) this.onOpen(row);
       },
       onProject:(key:string) => this.onRoute('project',key), onTree:(key:string) => this.onRoute('project_tree',key),
       onMachine:(tree:ProjectWorktree) => this.onRoute('machine_projects',JSON.stringify([tree.group,tree.manager,tree.machine])),

@@ -206,6 +206,9 @@ export class DemoRepository extends HubRepository {
       [id, id, DEMO_MACHINE, DEMO_MANAGER, title, state, status, cwd, '/demo/ReleaseDesk', cwd, branch, branch, 'ReleaseDesk', 'live',
         cloneRecord(capabilities), 'demo:pane-' + id, title, launcher, model, lastText, false, false, false, true, '2026-11-27T09:00:00Z']);
     const changelog = session('demo-agent-changelog', 'Prepare the changelog', 'working', 'working', '/demo/ReleaseDesk', 'docs', 'codex', 'gpt-5.3-codex', 'Drafting v2.4 changelog & verifying diffs...');
+    const coverageId = 'demo-agent-changelog@coverage';
+    changelog['subagents'] = [demoRecord(['id', 'session_id', 'description', 'running', 'status', 'last_text'],
+      ['coverage', coverageId, 'Check release-note coverage', false, 'done', 'Each change has a release note.'])];
     const changelogCaps = Wire.object(changelog, 'capabilities');
     changelogCaps['queue_send_now'] = true;
     changelog['capabilities'] = changelogCaps;
@@ -266,6 +269,10 @@ export class DemoRepository extends HubRepository {
       this.toolUseItem('Bash', 'demo-changelog-test', demoRecord(['command', 'description'], ['npm test -- release-gate', 'Run release-gate checks'])),
       this.toolResultItem('demo-changelog-test', '42 passed, 0 failed (1.4s)'),
       this.item('assistant', 'The local draft groups the sample changes by feature and fix.\n\n### Highlights\n- **Foldable Workbench**: side-by-side Pulse, Code, and Machines panes\n- **Liquid Glass**: borderless inset-grouped cards across light & dark schemes\n\n### Fixes\n- Normalized per-core load labels (`Load 2.4 · 0.2/core`)\n- Prevented duplicate row subtitles on narrow screens\n\n```typescript\nexport interface ReleaseGateCheck {\n  readonly suite: string;\n  readonly passed: number;\n  readonly skipped: number;\n}\n\nexport function verifyReleaseGate(checks: readonly ReleaseGateCheck[]): boolean {\n  return checks.length > 0 && checks.every((item) => item.passed > 0 && item.skipped === 0);\n}\n```')
+    ]);
+    this.transcripts.set(this.transcriptKey(DEMO_MACHINE, coverageId), [
+      this.item('user', 'Compare /demo/ReleaseDesk/CHANGELOG.md with the release checklist and list any missing entries.'),
+      this.item('assistant', 'Checked the changelog against the release checklist. Each change has a release note.')
     ]);
     this.transcripts.set(this.transcriptKey(DEMO_MACHINE, 'demo-agent-notes'), [
       this.item('user', 'Summarize the architectural notes in `/demo/Notes`.'),

@@ -1824,7 +1824,9 @@ export class ClientModel {
   }
   private projectMessages(items: readonly TranscriptItem[], running: boolean): ChatMessage[] {
     const target = this.target();
-    const messages = projectTranscriptRows(items, running || !!this.transcript?.liveActive, this.transcript?.liveTools, Wire.text(this.sessionRow().data(), 'agent'),
+    const session = this.sessionRow().data();
+    const delegated = Wire.text(session, 'source_kind') === 'subagent_transcript';
+    const messages = projectTranscriptRows(items, running || !!this.transcript?.liveActive, this.transcript?.liveTools, Wire.text(session, 'agent'),
       (action: string): string => tr('next_step_' + action),
       (): number => this.connected ? this.transcript?.turnStartedBefore(items[0]?.seq ?? 0) ?? 0 : 0).map((row): ChatMessage => {
       if (row.kind === 'work') {
@@ -1845,8 +1847,9 @@ export class ClientModel {
       } else if (row.kind === 'event' || (row.kind === 'input' && isAgentInput(item))) {
         message.role = 'event'; message.event = item;
       } else if (row.kind === 'input') {
+        message.taskBrief = delegated;
         message.userTextClipped = Number(item.full_size) > 0 || item.question_replies_cut === true;
-        const display = messageDisplay(item.text || ''), content = parseMessageContent(display.text, message.userTextClipped);
+        const display = messageDisplay(item.text || ''), content = parseMessageContent(display.text, message.userTextClipped, !delegated);
         message.role = 'user'; message.text = content.text; message.source = display.sources;
         const expanded = message.userTextClipped ? this.expandedAttachments.get(item.id) : undefined;
         const same = expanded && expanded.history === (this.transcript?.historyKey || '') && expanded.seq === item.seq &&
@@ -1933,7 +1936,7 @@ export class ClientModel {
     const data = await repo.call(path, 'GET', {}, '', admitted);
     const item = data as Object as TranscriptItem;
     if (!admitted() || item.id !== message.itemId || item.role !== 'user' || item.kind !== 'text' || !item.text) throw new Error('request_updated');
-    const content = parseMessageContent(messageDisplay(displayQuestionReply(item).text || '').text);
+    const content = parseMessageContent(messageDisplay(displayQuestionReply(item).text || '').text, false, !message.taskBrief);
     if (partial && (content.images.length || content.files.length)) {
       this.expandedAttachments.set(partial.id, { attachmentOnly:!content.text, history, seq:partial.seq, at:message.at, preview:displayQuestionReply(partial).text || '',
         images:content.images, files:content.files });

@@ -11459,6 +11459,18 @@
     {
       "name": "session_tools_terminal_unavailable",
       "value": "Terminal unavailable"
+    },
+    {
+      "name": "relation_task_instructions",
+      "value": "Task instructions"
+    },
+    {
+      "name": "relation_related",
+      "value": "Related"
+    },
+    {
+      "name": "agent_family_owner",
+      "value": "{kind} from {parent}"
     }
   ]
 }

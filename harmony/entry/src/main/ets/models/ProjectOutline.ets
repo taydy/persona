@@ -21,6 +21,32 @@ export class ProjectLine {
   }
 }
 
+/** Expand after repository filtering and folding so children stay with their visible parent. */
+export function expandProjectSessions(lines: ProjectLine[], children: (parent: ProjectAgent) => ProjectAgent[]): ProjectLine[] {
+  const result: ProjectLine[] = [];
+  for (const line of lines) {
+    result.push(line);
+    if (line.kind !== 'session' || !line.agent) continue;
+    const members = children(line.agent);
+    if (!members.length) continue;
+    const last = line.last;
+    if (last) {
+      // The base outline is cached across toggles. Only its displayed terminal parent needs a different lower edge.
+      const parent = new ProjectLine('session', line.agent.row.key(), line.project, line.level, line.tree, line.agent);
+      parent.key = line.key;
+      parent.first = line.first;
+      parent.paneName = line.paneName;
+      parent.starter = line.starter;
+      result[result.length - 1] = parent;
+    }
+    for (const child of members) {
+      result.push(new ProjectLine('session', child.row.key(), line.project, line.level + 1, line.tree, child));
+    }
+    result[result.length - 1].last = last;
+  }
+  return result;
+}
+
 export class ProjectHost {
   key: string;
   name: string;

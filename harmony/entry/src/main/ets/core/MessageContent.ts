@@ -93,7 +93,7 @@ const imageNotes: RegExp[] = [
   /[\t ]*（我从手机发来了图片，请用 Read 查看：([^）]*)）\s*$/g
 ];
 
-export function parseMessageContent(raw: string, clipped: boolean = false): MessageContent {
+export function parseMessageContent(raw: string, clipped: boolean = false, inferFileReferences: boolean = true): MessageContent {
   const message = codexFileMessage(raw, clipped);
   const desktop = message.images.length > 0 || message.files.length > 0;
   const parts = contentParts(message.text);
@@ -114,6 +114,7 @@ export function parseMessageContent(raw: string, clipped: boolean = false): Mess
   for (const part of parts) {
     if (part.literal) continue;
     if (!desktop && message.images.length) part.text = part.text.replace(/\[Image #\d+\][\t ]*/g, '');
+    if (!inferFileReferences) continue;
     const pattern = /(^|[^\w/:.\-~])(~(?:\/[\w.@+\-]+)+\/?|\/[\w.@+\-]+(?:\/[\w.@+\-]+)+\/?|[\w.@\-]+(?:\/[\w.@+\-]+)+\.[A-Za-z][A-Za-z0-9]{0,7})(?![\w/\-])/g;
     let match: RegExpExecArray | null;
     while (inferred.length < 6 && (match = pattern.exec(part.text)) !== null) {

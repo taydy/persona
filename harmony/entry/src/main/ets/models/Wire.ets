@@ -270,6 +270,7 @@ export class ChatMessage {
   imageIds: string[] = [];
   itemId: string = '';
   userTextClipped: boolean = false;
+  taskBrief: boolean = false;
   sourceFingerprint: string = '';
   ownerTarget: string = '';
   imagePaths: string[] = [];

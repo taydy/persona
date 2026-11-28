@@ -8,7 +8,7 @@ const source = readFileSync(new URL('../entry/src/main/ets/components/AgentListP
 const rowBindingSource = readFileSync(new URL('../entry/src/main/ets/models/RowBinding.ets', import.meta.url), 'utf8');
 const rowBindingCode = stripTypeScriptTypes(rowBindingSource.replace(/@ObservedV2\s*/g, '').replace(/@Trace\s*/g, '').replace(/\bexport\s+/g, ''));
 const { reconcileBoundRows } = new Function(rowBindingCode + '\nreturn { reconcileBoundRows };')();
-const { agentRowPreview, agentRowTone, runningSubagents } = await import('../entry/src/main/ets/core/AgentRowPreview.ts');
+const { agentFamilySummary, agentRowPreview, agentRowTone, runningSubagents } = await import('../entry/src/main/ets/core/AgentRowPreview.ts');
 
 function block(start, name) {
   const body = source.indexOf('{', start);
@@ -45,13 +45,15 @@ const BoundAgentRow = new Function('AgentRowPresentation', 'return ' + stripType
 const BoundAgentGroup = new Function('return ' + stripTypeScriptTypes(classCode('BoundAgentGroup')) + ';')();
 
 function pageClass(wire, translate) {
-  return new Function('BoundAgentRow', 'AgentRowPresentation', 'BoundAgentGroup', 'Wire', 'tr', 'Colors', 'reconcileBoundRows',
-    'agentRowPreview', 'agentRowTone', 'runningSubagents', 'herdrTabName',
-    stripTypeScriptTypes('class Page {\n' + ['isRowSelected','syncRowBindings', 'bindAgentRows', 'updateAgentRowPresentation', 'rowTime', 'rowStatus', 'rowStatusColor', 'needsStatusLabel', 'rowPlace','rowSpoken','subagentLine','rowTitle']
+  const familyClass = stripTypeScriptTypes(block(source.indexOf('class BoundAgentFamily {'), 'BoundAgentFamily'));
+  const BoundAgentFamily = new Function('return ' + familyClass)();
+  return new Function('BoundAgentRow', 'AgentRowPresentation', 'BoundAgentGroup', 'BoundAgentFamily', 'Wire', 'tr', 'Colors', 'reconcileBoundRows',
+    'agentRowPreview', 'agentRowTone', 'runningSubagents', 'herdrTabName', 'agentFamilySummary',
+    stripTypeScriptTypes('class Page {\n' + ['isRowSelected','syncRowBindings','syncFamilyBindings', 'bindAgentRows', 'updateAgentRowPresentation', 'rowTime', 'rowStatus', 'rowStatusColor', 'needsStatusLabel', 'rowPlace','rowSpoken','subagentLine','rowTitle']
       .map(methodCode).join('\n') + '\n}\n') + '\nreturn Page;')(
-        BoundAgentRow, AgentRowPresentation, BoundAgentGroup, wire, translate,
+        BoundAgentRow, AgentRowPresentation, BoundAgentGroup, BoundAgentFamily, wire, translate,
         { needs: 'needs', working: 'working', unread: 'unread', secondary: 'secondary' }, reconcileBoundRows,
-        agentRowPreview, agentRowTone, runningSubagents, herdrTabName);
+        agentRowPreview, agentRowTone, runningSubagents, herdrTabName, agentFamilySummary);
 }
 
 function methodsClass(names, globals) {
@@ -490,9 +492,9 @@ test('choosing an Agents filter fades its fill and reveals the actual chip by th
 
 test('Needs You surfaces follow the visible oldest-first order as the decisions change', () => {
   const getter=block(source.indexOf('  @Computed get orderedNeedsRows'), 'orderedNeedsRows').replace('@Computed ', '');
-  const methods=['displayRows','startsSurface','endsSurface'].map(methodCode).join('\n');
+  const methods=['displayRows','startsSurface','endsSurface','familySortRow'].map(methodCode).join('\n');
   const Page=new Function('return '+stripTypeScriptTypes('class Page {\n'+getter+'\n'+methods+'\n}'))();
-  const page=new Page(), a={first:true,last:false,bound:{value:{waiting:20}}}, b={first:false,last:true,bound:{value:{waiting:10}}};
+  const page=new Page(), a={first:true,last:false,presentation:{indented:false},bound:{value:{waiting:20}}}, b={first:false,last:true,presentation:{indented:false},bound:{value:{waiting:10}}};
   const group={value:{id:'state/needs'},rows:[a,b]};
   page.groupBindings=[group];page.compactRoot=true;page.rail=false;
   page.decisions={waitingSince:(_,row)=>row.waiting};
@@ -565,6 +567,40 @@ test('herdrTabName is projected once per raw update and rowTitle toggles cleanly
   assert.match(railBlock, /this\.rowTitle\(binding\)/);
   assert.doesNotMatch(railBlock, /binding\.bound\.value\.title/);
 });
+
+
+test('disclosing one family projects only its new children and preserves unrelated group bindings', () => {
+  const { page } = fixture();
+  const sessions = Array.from({length: 1200}, (_, i) => row({title: 'Session ' + i}, {id: String(i)}));
+  const parent = sessions[0], child = row({title: 'Child'}, {id:'child'});
+  const groups = [{id:'space/a', rows:sessions.slice(0,600)}, {id:'space/b', rows:sessions.slice(600)}];
+  const workspace = { ...family, groups, expandedFamilies:new Set(), isMuted:()=>false, visibleRows:()=>sessions,
+    groupingMode:'space', expandedChildren(r) { return this.expandedFamilies.has(r.key()) ? this.foldedChildren(r) : []; },
+    foldedChildren:r=>r===parent ? [child] : [], relations:{root:r=>r===child ? parent : undefined, kind:()=> 'subtask'},
+    displayRows(group) { return group===groups[0] && this.expandedFamilies.has(parent.key())
+      ? [parent,child,...group.rows.slice(1)] : group.rows; } };
+  page.workspace=workspace;
+  Object.assign(page.model,{scope:()=> 'test',profile:{id:'test',manager:'local'}});
+  page.groupBindings=[]; page.groupBindingSequence=0; page.taskRowsByKey=new Map();
+  const projected=[];
+  const project=page.updateAgentRowPresentation.bind(page);
+  page.updateAgentRowPresentation=(view,r)=>{projected.push(r);project(view,r);};
+  page.syncRowBindings();
+  const [affected,unrelated]=page.groupBindings, originalParent=affected.rows[0], stableRows=unrelated.rows;
+  projected.length=0;
+  workspace.expandedFamilies=new Set([parent.key()]);
+  page.syncFamilyBindings();
+  assert.deepEqual(projected,[child]);
+  assert.equal(affected.rows[0],originalParent);
+  assert.equal(affected.rows[1].bound.value,child);
+  projected.length=0;
+  workspace.expandedFamilies=new Set();
+  page.syncFamilyBindings();
+  assert.deepEqual(projected,[]);
+  assert.equal(affected.rows.length,600);
+  assert.equal(unrelated.rows,stableRows);
+});
+
 
 test('the computer filter shows the live or remembered name while its roster loads',()=>{
   const Page=methodsClass(['machineLabel'],{tr:key=>key});

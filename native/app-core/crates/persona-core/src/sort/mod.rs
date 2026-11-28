@@ -204,6 +204,9 @@ pub struct Settings {
     /// Include matches for each quick-filter button, independently of the active button and kept selection.
     #[serde(default)]
     pub include_filter_counts: bool,
+    /// Scoped child ID to displayed parent ID for clients that nest matching sessions.
+    #[serde(default)]
+    pub filter_families: StdHashMap<String, String>,
     /// Paged spaces whose hub totals may not have arrived yet. Missing totals are zero, not local-window counts.
     #[serde(default)]
     pub bounded_spaces: BTreeSet<String>,
@@ -240,7 +243,7 @@ pub enum Grouping {
     Machine,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Deserialize)]
 pub enum Quick {
     #[serde(rename = "all")]
     All,
@@ -871,7 +874,10 @@ fn project_impl(input: &Input, oldest_first: bool) -> Projection {
         .then(|| tab_rows(&unpinned, &groups, &input.settings));
     Projection {
         counts,
-        filter_counts: input.settings.include_filter_counts.then(|| filter_counts(&base)),
+        filter_counts: input
+            .settings
+            .include_filter_counts
+            .then(|| filter_counts(&base, &input.settings.filter_families)),
         groups,
         rows,
         unread_shown,
@@ -915,13 +921,17 @@ fn quick_matches(row: &Row, quick: Quick) -> bool {
     }
 }
 
-fn filter_counts(base: &[Row]) -> Counts {
+fn filter_counts(base: &[Row], families: &StdHashMap<String, String>) -> Counts {
     let mut totals = Counts::default();
+    let mut seen = HashSet::new();
     for row in base {
-        totals.needs_you += usize::from(quick_matches(row, Quick::NeedsYou));
-        totals.unread += usize::from(quick_matches(row, Quick::Unread));
-        totals.working += usize::from(quick_matches(row, Quick::Working));
-        totals.background_waiting += usize::from(quick_matches(row, Quick::BackgroundWaiting));
+        let owner = families.get(&row.id).unwrap_or(&row.id);
+        let mut count =
+            |quick| usize::from(quick_matches(row, quick) && (families.is_empty() || seen.insert((owner, quick))));
+        totals.needs_you += count(Quick::NeedsYou);
+        totals.unread += count(Quick::Unread);
+        totals.working += count(Quick::Working);
+        totals.background_waiting += count(Quick::BackgroundWaiting);
     }
     totals
 }
